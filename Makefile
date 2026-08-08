@@ -49,7 +49,17 @@ IMLIB2_LIB  = -Llib/imlib2 -lfreetype -lbz2 -lpng16 -lz -lImlib2
 OBJ	= $(C_SRC:%.c=$(BUILDDIR)/%.c.o) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.o) $(IMG:%.png=$(BUILDDIR)/%.png.o)
 DEP	= $(C_SRC:%.c=$(BUILDDIR)/%.c.d) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.d)
 
-DFLAGS	= $(INCLUDE) -D_7ZIP_ST -DPACKAGE_VERSION=\"1.3.3\" -DHAVE_LROUND -DHAVE_STDINT_H -DHAVE_STDLIB_H -DHAVE_SYS_PARAM_H -DENABLE_64_BIT_WORDS=0 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -DVDATE=\"`date +"%y%m%d"`\"
+ifneq ($(origin VDATE),command line)
+$(error VDATE must be supplied as six ASCII YYMMDD digits)
+endif
+override stage_a0_shell_quote = '$(subst ','"'"',$(1))'
+override STAGE_A0_VDATE := $(value VDATE)
+override VDATE_VALID := $(shell LC_ALL=C; export LC_ALL; VDATE=$(call stage_a0_shell_quote,$(STAGE_A0_VDATE)); export VDATE; [[ "$$VDATE" =~ ^[0-9]{6}$$ ]] && printf valid)
+ifneq ($(VDATE_VALID),valid)
+$(error VDATE must be supplied as six ASCII YYMMDD digits)
+endif
+override VDATE := $(STAGE_A0_VDATE)
+DFLAGS	= $(INCLUDE) -D_7ZIP_ST -DPACKAGE_VERSION=\"1.3.3\" -DHAVE_LROUND -DHAVE_STDINT_H -DHAVE_STDLIB_H -DHAVE_SYS_PARAM_H -DENABLE_64_BIT_WORDS=0 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -DVDATE=\"$(VDATE)\"
 CFLAGS	= $(DFLAGS) -Wall -Wextra -Wno-strict-aliasing -Wno-stringop-overflow -Wno-stringop-truncation -Wno-format-truncation -Wno-psabi -Wno-restrict -c
 LFLAGS	= -lc -lstdc++ -lm -lrt $(IMLIB2_LIB) -Llib/bluetooth -lbluetooth -lpthread
 
