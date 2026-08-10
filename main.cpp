@@ -19,76 +19,49 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <stdlib.h>
-#include <unistd.h>
+#include "runtime/mister_runtime_internal.hpp"
+
 #include <stdio.h>
-#include <sched.h>
-#include <inttypes.h>
-#include <ctype.h>
-#include <string.h>
-#include "menu.h"
-#include "user_io.h"
-#include "input.h"
-#include "frame_timer.h"
-#include "fpga_io.h"
-#include "scheduler.h"
-#include "osd.h"
-#include "offload.h"
 
 const char *version = "$VER:" VDATE;
 
+static int mister_runtime_fail(MisterRuntime *runtime)
+{
+	MisterStatus status = MisterRuntime_Status(runtime);
+	fprintf(stderr,
+		"MiSTer runtime failed: state=%u primary_error=%u cleanup_error=%u\n",
+		status.state, status.primary_error, status.cleanup_error);
+	MisterRuntime_Stop(runtime);
+	MisterStatus stopped_status = MisterRuntime_Status(runtime);
+	if (stopped_status.state == MISTER_RUNTIME_EXIT_REQUIRED) return 1;
+	return 1;
+}
+
 int main(int argc, char *argv[])
 {
-	// Always pin main worker process to core #1 as core #0 is the
-	// hardware interrupt handler in Linux.  This reduces idle latency
-	// in the main loop by about 6-7x.
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	CPU_SET(1, &set);
-	sched_setaffinity(0, sizeof(set), &set);
+	MisterLaunch launch = {};
+	launch.abi_version = MISTER_RUNTIME_ABI_VERSION;
+	launch.struct_size = sizeof(launch);
+	launch.core_path = argc > 1 ? argv[1] : "";
+	launch.xml_path = argc > 2 ? argv[2] : nullptr;
 
-	offload_start();
-
-	fpga_io_init();
-
-	DISKLED_OFF;
-
-	printf("\nMinimig by Dennis van Weeren");
-	printf("\nARM Controller by Jakub Bednarski");
-	printf("\nMiSTer code by Sorgelig\n\n");
-
-	printf("Version %s\n\n", version + 5);
-
-	if (argc > 1) printf("Core path: %s\n", argv[1]);
-	if (argc > 2) printf("XML path: %s\n", argv[2]);
-
-	if (!is_fpga_ready(1))
-	{
-		printf("\nGPI[31]==1. FPGA is uninitialized or incompatible core loaded.\n");
-		printf("Quitting. Bye bye...\n");
-		exit(0);
+	MisterRuntime *runtime = MisterRuntime_Create(MisterRuntime_LegacyPlatform());
+	if (!runtime) {
+		fputs("MiSTer runtime create failed\n", stderr);
+		return 1;
+	}
+	if (!MisterRuntime_Start(runtime)) {
+		return mister_runtime_fail(runtime);
+	}
+	if (argc > 1 && argv[1][0] == '\0') {
+		printf("Core path: %s\n", argv[1]);
+	}
+	if (!MisterRuntime_Load(runtime, &launch)) {
+		return mister_runtime_fail(runtime);
 	}
 
-	FindStorage();
-	user_io_init((argc > 1) ? argv[1] : "",(argc > 2) ? argv[2] : NULL);
-
-#ifdef USE_SCHEDULER
-	scheduler_init();
-	scheduler_run();
-#else
-	while (1)
-	{
-		if (!is_fpga_ready(1))
-		{
-			fpga_wait_to_reset();
-		}
-
-		user_io_poll();
-		frame_timer();
-		input_poll(0);
-		HandleUI();
-		OsdUpdate();
+	while (MisterRuntime_Status(runtime).state == MISTER_RUNTIME_RUNNING) {
+		MisterRuntime_Tick(runtime);
 	}
-#endif
-	return 0;
+	return mister_runtime_fail(runtime);
 }

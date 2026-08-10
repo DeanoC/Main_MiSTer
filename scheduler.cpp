@@ -69,26 +69,48 @@ static void scheduler_schedule(void)
 	}
 }
 
-void scheduler_init(void)
+bool scheduler_init(void)
 {
 	const unsigned int co_stack_size = 262144 * sizeof(void*);
 
+	co_scheduler = co_active();
+	co_last = nullptr;
+	if (!co_scheduler) return false;
+
 	co_poll = co_create(co_stack_size, scheduler_co_poll);
+	if (!co_poll)
+	{
+		co_ui = nullptr;
+		co_scheduler = nullptr;
+		return false;
+	}
+
 	co_ui = co_create(co_stack_size, scheduler_co_ui);
+	if (!co_ui)
+	{
+		co_delete(co_poll);
+		co_poll = nullptr;
+		co_ui = nullptr;
+		co_scheduler = nullptr;
+		return false;
+	}
+
+	return true;
+}
+
+bool scheduler_step(void)
+{
+	if (!co_scheduler || !co_poll || !co_ui) return false;
+
+	scheduler_schedule();
+	return true;
 }
 
 void scheduler_run(void)
 {
-	co_scheduler = co_active();
-
-	for (;;)
+	while (scheduler_step())
 	{
-		scheduler_schedule();
 	}
-
-	co_delete(co_ui);
-	co_delete(co_poll);
-	co_delete(co_scheduler);
 }
 
 void scheduler_yield(void)

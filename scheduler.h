@@ -3,7 +3,8 @@
 
 #define USE_SCHEDULER
 
-void scheduler_init(void);
+bool scheduler_init(void);
+bool scheduler_step(void);
 void scheduler_run(void);
 void scheduler_yield(void);
 

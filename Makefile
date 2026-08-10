@@ -1,12 +1,16 @@
 # makefile to fail if any command in pipe is failed.
 SHELL = /bin/bash -o pipefail
 
-MAKEFLAGS += "-j $(shell nproc)"
+JOBS ?= $(shell nproc)
+MAKEFLAGS += -j $(JOBS)
 
 # using gcc version 10.2.1
 BASE    = arm-none-linux-gnueabihf
 
-CC      = $(BASE)-gcc
+CC      := $(BASE)-gcc
+CXX     := $(BASE)-g++
+AR      := $(BASE)-ar
+NM      := $(BASE)-nm
 LD      = $(BASE)-ld
 STRIP   = $(BASE)-strip
 
@@ -38,7 +42,20 @@ C_SRC =   $(wildcard *.c) \
           $(wildcard ./lib/libchdr/*.c) \
           lib/libco/arm.c
 
-CPP_SRC = $(wildcard *.cpp) \
+RUNTIME_SRC = runtime/mister_runtime.cpp runtime/mister_runtime_legacy.cpp
+RUNTIME_OBJ = $(RUNTIME_SRC:%.cpp=$(BUILDDIR)/%.cpp.o)
+RUNTIME_DEP = $(RUNTIME_SRC:%.cpp=$(BUILDDIR)/%.cpp.d)
+RUNTIME_ARCHIVE = $(BUILDDIR)/libmister-runtime.a
+RUNTIME_HEADERS = runtime/mister_runtime.h runtime/mister_runtime_internal.hpp
+RUNTIME_C99_SMOKE_OBJECT = $(BUILDDIR)/runtime-smoke/mister_runtime_c99_smoke.o
+RUNTIME_CPP14_SMOKE_OBJECT = $(BUILDDIR)/runtime-smoke/mister_runtime_cpp14_smoke.o
+RUNTIME_C99_SMOKE = $(BUILDDIR)/runtime-smoke/mister_runtime_c99_smoke
+RUNTIME_CPP14_SMOKE = $(BUILDDIR)/runtime-smoke/mister_runtime_cpp14_smoke
+RUNTIME_PUBLIC_SYMBOLS = MisterRuntime_ABIVersion MisterRuntime_Create \
+	MisterRuntime_Start MisterRuntime_Tick MisterRuntime_Load MisterRuntime_Status \
+	MisterRuntime_Stop MisterRuntime_Destroy
+
+CPP_SRC = $(filter-out $(RUNTIME_SRC),$(wildcard *.cpp)) \
           $(wildcard ./lib/serial_server/library/*.cpp) \
           $(wildcard ./support/*/*.cpp)
 
@@ -47,7 +64,8 @@ IMG =     $(wildcard *.png)
 IMLIB2_LIB  = -Llib/imlib2 -lfreetype -lbz2 -lpng16 -lz -lImlib2
 
 OBJ	= $(C_SRC:%.c=$(BUILDDIR)/%.c.o) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.o) $(IMG:%.png=$(BUILDDIR)/%.png.o)
-DEP	= $(C_SRC:%.c=$(BUILDDIR)/%.c.d) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.d)
+DEP	= $(C_SRC:%.c=$(BUILDDIR)/%.c.d) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.d) \
+	$(RUNTIME_DEP)
 
 ifneq ($(origin VDATE),command line)
 $(error VDATE must be supplied as six ASCII YYMMDD digits)
@@ -75,25 +93,65 @@ ifeq ($(PROFILING),1)
 	DFLAGS += -DPROFILING
 endif
 
-$(BUILDDIR)/$(PRJ): $(OBJ)
+$(BUILDDIR)/$(PRJ): $(OBJ) $(RUNTIME_ARCHIVE)
 	$(Q)$(info $@)
-	$(Q)$(CC) -o $@ $+ $(LFLAGS)
+	$(Q)$(CXX) -o $@ $+ $(LFLAGS)
 	$(Q)cp $@ $@.elf
 ifneq ($(DEBUG),1)
 	$(Q)$(STRIP) $@
 endif
 
-.PHONY: clean
+.PHONY: clean check-runtime-archive
 clean:
 	$(Q)rm -rf bin
 
+check-runtime-archive: $(RUNTIME_ARCHIVE) $(RUNTIME_C99_SMOKE) \
+	$(RUNTIME_CPP14_SMOKE)
+	$(Q)expected_members='mister_runtime.cpp.o mister_runtime_legacy.cpp.o'; \
+	actual_members="$$($(AR) t $(RUNTIME_ARCHIVE) | tr '\n' ' ' | sed 's/ $$//')"; \
+	test "$$actual_members" = "$$expected_members"
+	$(Q)for symbol in $(RUNTIME_PUBLIC_SYMBOLS); do \
+		count="$$($(NM) -g --defined-only $(RUNTIME_ARCHIVE) | awk -v symbol="$$symbol" '$$3 == symbol { count++ } END { print count + 0 }')"; \
+		test "$$count" = 1 || { echo "runtime symbol $$symbol count $$count" >&2; exit 1; }; \
+	done
+
 $(BUILDDIR)/%.c.o: %.c
 	$(Q)$(info $<)
+	$(Q)mkdir -p $(dir $@)
 	$(Q)$(CC) $(CFLAGS) -std=gnu99 -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
 
 $(BUILDDIR)/%.cpp.o: %.cpp
 	$(Q)$(info $<)
-	$(Q)$(CC) $(CFLAGS) -std=gnu++14 -Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
+$(RUNTIME_OBJ): $(RUNTIME_HEADERS)
+
+$(BUILDDIR)/runtime/%.cpp.o: runtime/%.cpp
+	$(Q)$(info $<)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -fno-exceptions -fno-rtti -Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
+$(RUNTIME_ARCHIVE): $(RUNTIME_OBJ)
+	$(Q)$(info $@)
+	$(Q)$(AR) rcsD $@ $^
+
+$(RUNTIME_C99_SMOKE_OBJECT): tests/mister_runtime_c99_smoke.c \
+	runtime/mister_runtime.h | $(BUILDDIR)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CC) $(CFLAGS) -std=c99 -pedantic-errors -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
+$(RUNTIME_CPP14_SMOKE_OBJECT): tests/mister_runtime_cpp14_smoke.cpp \
+	runtime/mister_runtime.h | $(BUILDDIR)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -fno-exceptions -fno-rtti \
+		-Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
+$(RUNTIME_C99_SMOKE): $(RUNTIME_C99_SMOKE_OBJECT) $(RUNTIME_ARCHIVE)
+	$(Q)$(CXX) -o $@ $^
+
+$(RUNTIME_CPP14_SMOKE): $(RUNTIME_CPP14_SMOKE_OBJECT) $(RUNTIME_ARCHIVE)
+	$(Q)$(CXX) -o $@ $^
 
 $(BUILDDIR)/%.png.o: %.png
 	$(Q)$(info $<)
@@ -112,5 +170,11 @@ $(BUILDDIR)/%.cpp.d: %.cpp
 	$(Q)$(info $< >> $@)
 	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $*.cpp.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
 
+$(BUILDDIR)/runtime/%.cpp.d: runtime/%.cpp
+	@mkdir -p $(dir $@)
+	$(Q)$(CXX) $(DFLAGS) -MM $< -MT $@ -MT $(BUILDDIR)/runtime/$*.cpp.o \
+		-MF $@ 2>&1 | $(OUTPUT_FILTER)
+
 # Ensure correct time stamp
-$(BUILDDIR)/main.cpp.o: $(filter-out $(BUILDDIR)/main.cpp.o, $(OBJ))
+$(BUILDDIR)/main.cpp.o: $(RUNTIME_HEADERS) \
+	$(filter-out $(BUILDDIR)/main.cpp.o, $(OBJ))
