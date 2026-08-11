@@ -161,16 +161,59 @@ public:
 	virtual bool AfterCommit(const std::string& phase) = 0;
 };
 
+// These codes are the portable coordinator-to-transport contract.  They are
+// deliberately independent of wire parsing and platform/ABI result enums.
+enum class CoordinatorCode {
+	none,
+	invalid_request,
+	busy,
+	not_ready,
+	stale_admission,
+	stale_generation,
+	in_progress,
+	operation_replay,
+	operation_unknown,
+	interrupted,
+	deadline,
+	recovery_required,
+	unsupported_mode,
+	owner_not_found,
+	internal,
+};
+
+// This is the exact canonical wire Snapshot object, never a durable state
+// record.  A false value means no checksum-valid snapshot is available.
+struct CoordinatorSnapshot {
+	bool valid;
+	std::string canonical;
+	CoordinatorSnapshot() : valid(false) {}
+};
+
+struct MutationReply {
+	enum class Kind { terminal, in_progress, rejected } kind;
+	CoordinatorCode code;
+	std::string operation_id;
+	std::string request_digest;
+	bool ok;
+	CoordinatorSnapshot snapshot;
+	uint64_t resulting_sequence;
+	MutationReply()
+		: kind(Kind::rejected), code(CoordinatorCode::internal), ok(false),
+		  resulting_sequence(0) {}
+};
+
 class Coordinator {
 public:
 	struct OperationStatus {
 		enum Kind { unknown, in_flight, completed } kind;
+		CoordinatorCode code;
 		bool ok;
 		std::string request_digest;
 		std::string error;
 		std::string snapshot;
 		uint64_t resulting_sequence;
-		OperationStatus() : kind(unknown), ok(false), resulting_sequence(0) {}
+		OperationStatus() : kind(unknown), code(CoordinatorCode::operation_unknown),
+			ok(false), resulting_sequence(0) {}
 	};
 	typedef LifecycleOwner Owner;
 	struct Terminal {
@@ -181,6 +224,11 @@ public:
 		std::string snapshot;
 		uint64_t sequence;
 	};
+	struct Admission {
+		enum Kind { newly_recorded, terminal_replay, in_progress_replay, rejected } kind;
+		CoordinatorCode code;
+		Admission() : kind(rejected), code(CoordinatorCode::internal) {}
+	};
 	Coordinator();
 	Coordinator(const std::string& state_directory, const BackendFence* fence,
 		LifecyclePlatform* platform = 0, CommitCrashInjector* crash_injector = 0,
@@ -188,7 +236,10 @@ public:
 	bool ready() const;
 	ErrorClass Initialize(uint64_t backend_epoch);
 	ErrorClass Admit(const std::string& request);
+	MutationReply ExecuteMutation(const std::string& request);
 	ErrorClass Execute(const std::string& request);
+	CoordinatorSnapshot snapshot() const;
+	static const char* ProtocolCode(CoordinatorCode code);
 	OperationStatus operation_status(const std::string& operation_id) const;
 	uint64_t sequence() const;
 	const std::string& canonical_state() const;
@@ -213,6 +264,12 @@ private:
 		std::string* operation_id, std::string* digest, Owner* candidate,
 		Owner* requested_owner, uint64_t* expected_sequence,
 		LaunchMetadata* launch, std::string* content_lease) const;
+	Admission AdmitParsed(const std::string& operation, const std::string& operation_id,
+		const std::string& digest, const Owner& candidate, const Owner& requested_owner,
+		uint64_t expected_sequence, const std::string& content_lease);
+	ErrorClass ExecuteAdmitted(const std::string& operation, const std::string& operation_id,
+		const std::string& digest, const Owner& candidate, const Owner& requested_owner,
+		const LaunchMetadata& launch, const std::string& content_lease);
 	uint32_t Remaining(uint64_t deadline_at) const;
 	LifecycleResult NeutralLive(uint32_t resource_mask, uint64_t deadline_at,
 		uint64_t cleanup_started);

@@ -9,6 +9,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -40,11 +41,13 @@ struct FakePlatform : public fogcast::LifecyclePlatform {
 	bool fail_destroy = false;
 	bool fail_reset = false;
 	bool neutral = true;
+	MisterResult prove_result = MISTER_RESULT_OK;
 	bool main_absent = true;
 	unsigned int stateless_attempt_while_live = 0;
 	uint64_t* mutable_now = 0;
 	uint64_t advance_start = 0;
 	uint64_t advance_stop = 0;
+	uint64_t advance_prove = 0;
 	uint64_t advance_neutral = 0;
 	uint64_t advance_reset = 0;
 	unsigned int incomplete_stops = 0;
@@ -60,8 +63,10 @@ struct FakePlatform : public fogcast::LifecyclePlatform {
 	fogcast::LifecycleResult ProveNeutral(uint32_t mask, uint32_t deadline) override {
 		Called();
 		actions.push_back("neutral"); deadlines.push_back(deadline);
+		if (mutable_now) *mutable_now += advance_prove;
 		fogcast::LifecycleResult result(neutral && (active_mask & mask) == 0 ?
 			MISTER_RESULT_OK : MISTER_RESULT_CLEANUP_INCOMPLETE);
+		if (prove_result != MISTER_RESULT_OK) result.call_result = prove_result;
 		result.neutral_mask = result == MISTER_RESULT_OK ? mask : 0;
 		result.observed_mask = active_mask & mask;
 		return result;
@@ -183,6 +188,56 @@ struct FakePlatform : public fogcast::LifecyclePlatform {
 struct FakeClock : public fogcast::MonotonicClock {
 	uint64_t now = 0;
 	uint64_t NowMs() override { return now; }
+};
+
+struct MutableFenceSyscalls : public fogcast::FenceSyscalls {
+	fogcast::FenceFileInfo file, temporary, directory;
+	fogcast::PathProbe file_probe = fogcast::PathProbe::missing;
+	fogcast::PathProbe temporary_probe = fogcast::PathProbe::missing;
+	std::string bytes, temporary_bytes;
+	size_t read_offset = 0;
+	unsigned int read_opens = 0, deny_on_read_open = 0;
+	MutableFenceSyscalls() {
+		directory.type = fogcast::FenceFileInfo::Type::directory; directory.owner = 1; directory.permissions = 0700;
+	}
+	uint64_t EffectiveUser() override { return 1; }
+	fogcast::PathProbe Probe(const std::string& path, fogcast::FenceFileInfo* info) override {
+		if (path.find(".tmp") != std::string::npos) { if (temporary_probe == fogcast::PathProbe::present && info) *info = temporary; return temporary_probe; }
+		if (path.find("backend-fence.json") != std::string::npos) { if (file_probe == fogcast::PathProbe::present && info) *info = file; return file_probe; }
+		if (info) *info = directory; return fogcast::PathProbe::present;
+	}
+	int OpenReadNoFollow(const std::string&) override {
+		++read_opens; read_offset = 0;
+		return file_probe == fogcast::PathProbe::present && (deny_on_read_open == 0 || read_opens < deny_on_read_open) ? 12 : -1;
+	}
+	int OpenTemporaryNoFollow(const std::string&) override {
+		if (temporary_probe != fogcast::PathProbe::missing) return -1;
+		temporary_probe = fogcast::PathProbe::present; temporary.type = fogcast::FenceFileInfo::Type::regular;
+		temporary.owner = 1; temporary.permissions = 0600; temporary_bytes.clear(); return 10;
+	}
+	int OpenDirectory(const std::string&) override { return 11; }
+	bool Fstat(int fd, fogcast::FenceFileInfo* info) override {
+		if (!info) return false;
+		if (fd == 12) { *info = file; return true; }
+		if (fd == 10) { temporary.size = temporary_bytes.size(); *info = temporary; return true; }
+		return false;
+	}
+	std::ptrdiff_t Read(int fd, char* out, size_t size) override {
+		if (fd != 12 || read_offset >= bytes.size()) return -1;
+		const size_t count = bytes.size() - read_offset < size ? bytes.size() - read_offset : size;
+		memcpy(out, bytes.data() + read_offset, count); read_offset += count; return static_cast<std::ptrdiff_t>(count);
+	}
+	std::ptrdiff_t Write(int fd, const char* value, size_t size) override {
+		if (fd != 10) return -1; temporary_bytes.append(value, size); return static_cast<std::ptrdiff_t>(size);
+	}
+	bool Fchmod(int fd, uint32_t mode) override { if (fd != 10) return false; temporary.permissions = mode; return true; }
+	bool Fsync(int fd) override { return fd == 10 || fd == 11; }
+	bool Rename(const std::string&, const std::string&) override {
+		file_probe = fogcast::PathProbe::present; file = temporary; file.size = temporary_bytes.size(); bytes = temporary_bytes;
+		temporary_probe = fogcast::PathProbe::missing; return true;
+	}
+	bool Unlink(const std::string&) override { temporary_probe = fogcast::PathProbe::missing; temporary_bytes.clear(); return true; }
+	bool Close(int fd) override { return fd == 10 || fd == 11 || fd == 12; }
 };
 
 struct FakeCrash : public fogcast::CommitCrashInjector {
@@ -734,9 +789,11 @@ void TestLaunchCrashMatrix() {
 		platform.actions.clear();
 		const fogcast::ErrorClass crashed = coordinator.Execute(
 			IdleLaunch(coordinator.sequence(), NumericOperationId(100 + i).c_str()));
-		if (crashed != fogcast::ErrorClass::transition)
-			fprintf(stderr, "crash phase %s returned %d\n", phases[i], static_cast<int>(crashed));
-		assert(crashed == fogcast::ErrorClass::transition);
+		const bool terminal_commit = std::string(phases[i]) == "active" ||
+			std::string(phases[i]) == "terminal";
+		// The compatibility wrapper deliberately reports protocol success once
+		// the terminal row is durable, even if the process dies immediately after.
+		assert(crashed == (terminal_commit ? fogcast::ErrorClass::ok : fogcast::ErrorClass::transition));
 		AssertContains(crash.commits, phases[i]);
 		AssertExclusiveOwnerShape(coordinator);
 		fogcast::StateRecord transitional;
@@ -943,7 +1000,8 @@ void TestReplacementAndFailureCrashMatrix() {
 		fogcast::Coordinator coordinator(directory, &fence, &platform, &crash);
 		assert(coordinator.Initialize(7) == fogcast::ErrorClass::ok);
 		assert(coordinator.Execute(IdleLaunch(coordinator.sequence(), NumericOperationId(370 + i).c_str())) ==
-			fogcast::ErrorClass::transition);
+			(std::string(failure_phases[i]) == "failed" ? fogcast::ErrorClass::ok :
+				fogcast::ErrorClass::transition));
 		AssertContains(crash.commits, failure_phases[i]);
 		platform.fail_reset = false;
 		platform.actions.clear();
@@ -1362,10 +1420,364 @@ void TestMandatoryCoordinatorSourceGuards() {
 	assert(source.find("Commit(\"failed\", candidate, candidate, candidate") != std::string::npos);
 }
 
+void TestTypedMutationDispositionApi() {
+	// Break caught: collapsing typed dispositions into ErrorClass makes the
+	// private daemon either repeat lifecycle policy or lose replay semantics.
+	const struct { fogcast::CoordinatorCode code; const char* wire; } codes[] = {
+		{fogcast::CoordinatorCode::none, 0},
+		{fogcast::CoordinatorCode::invalid_request, "INVALID_REQUEST"},
+		{fogcast::CoordinatorCode::busy, "BUSY"},
+		{fogcast::CoordinatorCode::not_ready, "NOT_READY"},
+		{fogcast::CoordinatorCode::stale_admission, "STALE_ADMISSION"},
+		{fogcast::CoordinatorCode::stale_generation, "STALE_GENERATION"},
+		{fogcast::CoordinatorCode::in_progress, "IN_PROGRESS"},
+		{fogcast::CoordinatorCode::operation_replay, "OPERATION_REPLAY"},
+		{fogcast::CoordinatorCode::operation_unknown, "OPERATION_UNKNOWN"},
+		{fogcast::CoordinatorCode::interrupted, "INTERRUPTED"},
+		{fogcast::CoordinatorCode::deadline, "DEADLINE"},
+		{fogcast::CoordinatorCode::recovery_required, "RECOVERY_REQUIRED"},
+		{fogcast::CoordinatorCode::unsupported_mode, "UNSUPPORTED_MODE"},
+		{fogcast::CoordinatorCode::owner_not_found, "OWNER_NOT_FOUND"},
+		{fogcast::CoordinatorCode::internal, "INTERNAL"},
+	};
+	for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); ++i) {
+		const char* const mapped = fogcast::Coordinator::ProtocolCode(codes[i].code);
+		assert((codes[i].wire == 0 && mapped == 0) || (codes[i].wire != 0 && mapped != 0 &&
+			std::string(mapped) == codes[i].wire));
+	}
+
+	fogcast::Coordinator cold;
+	assert(!cold.snapshot().valid);
+	const fogcast::MutationReply invalid = cold.ExecuteMutation("{");
+	assert(invalid.kind == fogcast::MutationReply::Kind::rejected);
+	assert(invalid.code == fogcast::CoordinatorCode::invalid_request);
+	assert(invalid.operation_id.empty() && invalid.request_digest.empty());
+	assert(!invalid.snapshot.valid && invalid.resulting_sequence == 0);
+	assert(cold.Execute("{") == fogcast::ErrorClass::schema);
+	assert(cold.operation_status("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").code ==
+		fogcast::CoordinatorCode::operation_unknown);
+}
+
+void TestTypedMutationDispositionBehavior() {
+	char directory[] = "/tmp/fogcast-coordinator-typed-api-XXXXXX";
+	assert(mkdtemp(directory) != 0);
+	fogcast::BackendFence fence(directory);
+	assert(fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform platform;
+	fogcast::Coordinator coordinator(directory, &fence, &platform);
+	const std::string request = IdleLaunch(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae01");
+	assert(coordinator.ExecuteMutation(request).code == fogcast::CoordinatorCode::not_ready);
+	assert(coordinator.Initialize(7) == fogcast::ErrorClass::ok);
+
+	// Break caught: a coordinator must return the wire Snapshot rather than its
+	// durable StateRecord, which would expose replay/store-only fields.
+	const fogcast::CoordinatorSnapshot initial = coordinator.snapshot();
+	assert(initial.valid && initial.canonical.find("\"record_version\"") == std::string::npos);
+	assert(initial.canonical.find("\"ledger\"") == std::string::npos);
+	assert(initial.canonical.find("\"sequence\":1") == 1);
+	std::string launch_mode = request;
+	launch_mode.replace(launch_mode.find("\"generation\":42}"), sizeof("\"generation\":42}") - 1,
+		"\"generation\":42,\"mode\":\"host_cast\"}");
+	std::string unknown_key = request.substr(0, request.size() - 1) + ",\"unexpected\":true}";
+	std::string host_cast = request;
+	host_cast.replace(host_cast.find("\"operation\":\"launch\""), sizeof("\"operation\":\"launch\"") - 1,
+		"\"operation\":\"host_cast\"");
+	std::string update = request;
+	update.replace(update.find("\"operation\":\"launch\""), sizeof("\"operation\":\"launch\"") - 1,
+		"\"operation\":\"update\"");
+	std::string remote_input = request;
+	remote_input.replace(remote_input.find("\"operation\":\"launch\""), sizeof("\"operation\":\"launch\"") - 1,
+		"\"operation\":\"remote_input\"");
+	const std::string invalid_before = coordinator.canonical_state();
+	const std::string invalid_requests[] = {launch_mode, unknown_key, host_cast, update, remote_input};
+	for (size_t i = 0; i < sizeof(invalid_requests) / sizeof(invalid_requests[0]); ++i) {
+		platform.actions.clear();
+		const fogcast::MutationReply rejected = coordinator.ExecuteMutation(invalid_requests[i]);
+		assert(rejected.kind == fogcast::MutationReply::Kind::rejected &&
+			rejected.code == fogcast::CoordinatorCode::invalid_request &&
+			rejected.operation_id.empty() && rejected.request_digest.empty());
+		assert(coordinator.canonical_state() == invalid_before && platform.actions.empty());
+	}
+
+	const std::string before_stale = coordinator.canonical_state();
+	platform.actions.clear();
+	const fogcast::MutationReply stale = coordinator.ExecuteMutation(
+		IdleLaunch(coordinator.sequence() + 1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae02"));
+	assert(stale.kind == fogcast::MutationReply::Kind::rejected &&
+		stale.code == fogcast::CoordinatorCode::stale_admission && stale.snapshot.valid);
+	assert(coordinator.canonical_state() == before_stale && platform.actions.empty());
+
+	platform.actions.clear();
+	const fogcast::MutationReply completed = coordinator.ExecuteMutation(request);
+	assert(completed.kind == fogcast::MutationReply::Kind::terminal && completed.ok &&
+		completed.code == fogcast::CoordinatorCode::none && completed.operation_id ==
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae01" && completed.request_digest == WireDigest(request) &&
+		completed.snapshot.valid && completed.resulting_sequence == coordinator.sequence());
+	assert(completed.snapshot.canonical.find("\"record_version\"") == std::string::npos);
+	assert(!platform.actions.empty());
+	const std::string after_completed = coordinator.canonical_state();
+	platform.actions.clear();
+	const fogcast::MutationReply replay = coordinator.ExecuteMutation(request);
+	assert(replay.kind == fogcast::MutationReply::Kind::terminal && replay.ok &&
+		replay.code == fogcast::CoordinatorCode::none && replay.snapshot.canonical ==
+		completed.snapshot.canonical && replay.resulting_sequence == completed.resulting_sequence);
+	assert(coordinator.canonical_state() == after_completed && platform.actions.empty());
+
+	std::string changed = request;
+	changed.replace(changed.find("synthetic-game"), sizeof("synthetic-game") - 1, "other-game");
+	const fogcast::MutationReply replay_changed = coordinator.ExecuteMutation(changed);
+	assert(replay_changed.kind == fogcast::MutationReply::Kind::rejected &&
+		replay_changed.code == fogcast::CoordinatorCode::operation_replay);
+	assert(coordinator.canonical_state() == after_completed && platform.actions.empty());
+
+	const std::string same_generation = ActiveLaunchSameOwner(coordinator.sequence(),
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae03");
+	const fogcast::MutationReply stale_generation = coordinator.ExecuteMutation(same_generation);
+	assert(stale_generation.code == fogcast::CoordinatorCode::stale_generation &&
+		coordinator.canonical_state() == after_completed && platform.actions.empty());
+	const fogcast::MutationReply stale_live_owner = coordinator.ExecuteMutation(OwnerRequest("stop",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae08", coordinator.sequence(),
+		"0123456789abcdef0123456789abcdef", 43));
+	assert(stale_live_owner.code == fogcast::CoordinatorCode::stale_admission &&
+		coordinator.canonical_state() == after_completed && platform.actions.empty());
+	assert(fence.Commit(fogcast::BackendFence::Record(2, "native_quiescing", 7)) ==
+		fogcast::ErrorClass::ok);
+	const fogcast::MutationReply blocked_replay = coordinator.ExecuteMutation(request);
+	assert(blocked_replay.kind == fogcast::MutationReply::Kind::rejected &&
+		blocked_replay.code == fogcast::CoordinatorCode::not_ready &&
+		coordinator.canonical_state() == after_completed && platform.actions.empty());
+
+	const fogcast::Coordinator::OperationStatus completed_status = coordinator.operation_status(
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae01");
+	assert(completed_status.kind == fogcast::Coordinator::OperationStatus::completed &&
+		completed_status.code == fogcast::CoordinatorCode::none && completed_status.ok);
+
+	char flight_directory[] = "/tmp/fogcast-coordinator-typed-flight-XXXXXX";
+	assert(mkdtemp(flight_directory) != 0);
+	fogcast::BackendFence flight_fence(flight_directory);
+	assert(flight_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform flight_platform;
+	fogcast::Coordinator flight(flight_directory, &flight_fence, &flight_platform);
+	assert(flight.Initialize(7) == fogcast::ErrorClass::ok);
+	const std::string in_flight_request = IdleLaunch(flight.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae04");
+	assert(flight.Admit(in_flight_request) == fogcast::ErrorClass::ok);
+	const std::string flight_state = flight.canonical_state();
+	flight_platform.actions.clear();
+	const fogcast::MutationReply in_progress = flight.ExecuteMutation(in_flight_request);
+	assert(in_progress.kind == fogcast::MutationReply::Kind::in_progress &&
+		in_progress.code == fogcast::CoordinatorCode::in_progress && in_progress.snapshot.valid &&
+		in_progress.resulting_sequence == 0 && flight_platform.actions.empty());
+	assert(flight.canonical_state() == flight_state);
+	const fogcast::MutationReply busy = flight.ExecuteMutation(
+		IdleLaunch(flight.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae05"));
+	assert(busy.kind == fogcast::MutationReply::Kind::rejected && busy.code ==
+		fogcast::CoordinatorCode::busy && flight_platform.actions.empty());
+	std::string changed_flight = in_flight_request;
+	changed_flight.replace(changed_flight.find("synthetic-game"), sizeof("synthetic-game") - 1, "other-game");
+	assert(flight.ExecuteMutation(changed_flight).code == fogcast::CoordinatorCode::operation_replay);
+	assert(flight.operation_status("aaaaaaaaaaaaaaaaaaaaaaaaaaaaae04").code ==
+		fogcast::CoordinatorCode::in_progress);
+
+	char idle_directory[] = "/tmp/fogcast-coordinator-typed-idle-XXXXXX";
+	assert(mkdtemp(idle_directory) != 0);
+	fogcast::BackendFence idle_fence(idle_directory);
+	assert(idle_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform idle_platform;
+	fogcast::Coordinator idle(idle_directory, &idle_fence, &idle_platform);
+	assert(idle.Initialize(7) == fogcast::ErrorClass::ok);
+	idle_platform.actions.clear();
+	const std::string idle_before = idle.canonical_state();
+	const std::string stop_without_owner = std::string("{\"protocol\":1,\"request_id\":17,\"operation_id\":\"") +
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae06\",\"operation\":\"stop\",\"owner\":null,\"precondition\":{\"sequence\":" +
+		std::to_string(idle.sequence()) + ",\"owner\":null},\"body\":{}}";
+	// Protocol-v1 deliberately rejects owner:null for stop before coordinator
+	// dispatch; OWNER_NOT_FOUND remains a reserved stable wire mapping.
+	const fogcast::MutationReply owner_missing = idle.ExecuteMutation(stop_without_owner);
+	assert(owner_missing.code == fogcast::CoordinatorCode::invalid_request &&
+		idle.canonical_state() == idle_before && idle_platform.actions.empty());
+	assert(idle.Execute(stop_without_owner) == fogcast::ErrorClass::schema);
+	const fogcast::MutationReply absent_owner = idle.ExecuteMutation(OwnerRequest("stop",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae07", idle.sequence(), "0123456789abcdef0123456789abcdef", 42));
+	assert(absent_owner.code == fogcast::CoordinatorCode::stale_admission &&
+		idle.canonical_state() == idle_before && idle_platform.actions.empty());
+}
+
+void TestTypedTerminalCodesAndWrapper() {
+	char shutdown_directory[] = "/tmp/fogcast-coordinator-typed-shutdown-XXXXXX";
+	assert(mkdtemp(shutdown_directory) != 0);
+	fogcast::BackendFence shutdown_fence(shutdown_directory);
+	assert(shutdown_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform shutdown_platform;
+	fogcast::Coordinator shutdown(shutdown_directory, &shutdown_fence, &shutdown_platform);
+	assert(shutdown.Initialize(7) == fogcast::ErrorClass::ok);
+	shutdown_platform.actions.clear(); shutdown_platform.neutral = false;
+	const std::string shutdown_request = IdleRequest("shutdown", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0e",
+		shutdown.sequence());
+	const fogcast::MutationReply shutdown_failure = shutdown.ExecuteMutation(shutdown_request);
+	assert(shutdown_failure.kind == fogcast::MutationReply::Kind::terminal && !shutdown_failure.ok &&
+		shutdown_failure.code == fogcast::CoordinatorCode::recovery_required &&
+		shutdown_failure.snapshot.valid && shutdown_failure.resulting_sequence > 0);
+	assert(shutdown.operation_status("aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0e").code ==
+		fogcast::CoordinatorCode::recovery_required);
+	assert(shutdown.Execute(shutdown_request) == fogcast::ErrorClass::ok);
+	assert(shutdown.phase() == "failed" && shutdown_failure.snapshot.canonical.find("\"phase\":\"failed\"") !=
+		std::string::npos);
+	shutdown_platform.actions.clear();
+	const fogcast::MutationReply blocked_launch = shutdown.ExecuteMutation(
+		IdleLaunch(shutdown.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae10"));
+	assert(blocked_launch.kind == fogcast::MutationReply::Kind::rejected &&
+		blocked_launch.code == fogcast::CoordinatorCode::recovery_required && shutdown_platform.actions.empty());
+	shutdown_platform.neutral = true;
+	const fogcast::MutationReply recovered_shutdown = shutdown.ExecuteMutation(IdleRequest("recover",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae11", shutdown.sequence(), "failed"));
+	assert(recovered_shutdown.kind == fogcast::MutationReply::Kind::terminal && recovered_shutdown.ok &&
+		recovered_shutdown.code == fogcast::CoordinatorCode::none && shutdown.phase() == "idle");
+
+	char shutdown_platform_deadline_directory[] = "/tmp/fogcast-coordinator-typed-shutdown-platform-deadline-XXXXXX";
+	assert(mkdtemp(shutdown_platform_deadline_directory) != 0);
+	fogcast::BackendFence shutdown_platform_deadline_fence(shutdown_platform_deadline_directory);
+	assert(shutdown_platform_deadline_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakeClock platform_deadline_clock;
+	FakePlatform platform_deadline_platform;
+	platform_deadline_platform.mutable_now = &platform_deadline_clock.now;
+	fogcast::Coordinator shutdown_platform_deadline(shutdown_platform_deadline_directory,
+		&shutdown_platform_deadline_fence, &platform_deadline_platform, 0, &platform_deadline_clock);
+	assert(shutdown_platform_deadline.Initialize(7) == fogcast::ErrorClass::ok);
+	platform_deadline_platform.prove_result = MISTER_RESULT_DEADLINE;
+	const fogcast::MutationReply early_platform_deadline = shutdown_platform_deadline.ExecuteMutation(
+		IdleRequest("shutdown", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae13", shutdown_platform_deadline.sequence()));
+	assert(early_platform_deadline.kind == fogcast::MutationReply::Kind::terminal &&
+		!early_platform_deadline.ok && early_platform_deadline.code ==
+		fogcast::CoordinatorCode::recovery_required && early_platform_deadline.snapshot.valid &&
+		platform_deadline_clock.now < 10000 && shutdown_platform_deadline.phase() == "failed");
+
+	char shutdown_deadline_directory[] = "/tmp/fogcast-coordinator-typed-shutdown-deadline-XXXXXX";
+	assert(mkdtemp(shutdown_deadline_directory) != 0);
+	fogcast::BackendFence shutdown_deadline_fence(shutdown_deadline_directory);
+	assert(shutdown_deadline_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakeClock shutdown_clock;
+	FakePlatform shutdown_deadline_platform;
+	shutdown_deadline_platform.mutable_now = &shutdown_clock.now;
+	fogcast::Coordinator shutdown_deadline(shutdown_deadline_directory, &shutdown_deadline_fence,
+		&shutdown_deadline_platform, 0, &shutdown_clock);
+	assert(shutdown_deadline.Initialize(7) == fogcast::ErrorClass::ok);
+	shutdown_deadline_platform.advance_prove = 10001;
+	const fogcast::MutationReply shutdown_elapsed = shutdown_deadline.ExecuteMutation(
+		IdleRequest("shutdown", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0f", shutdown_deadline.sequence()));
+	assert(shutdown_elapsed.kind == fogcast::MutationReply::Kind::terminal && !shutdown_elapsed.ok &&
+		shutdown_elapsed.code == fogcast::CoordinatorCode::deadline && shutdown_elapsed.snapshot.valid &&
+		shutdown_elapsed.resulting_sequence > 0);
+	assert(shutdown_deadline.operation_status("aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0f").code ==
+		fogcast::CoordinatorCode::deadline);
+	assert(shutdown_deadline.phase() == "failed" &&
+		shutdown_elapsed.snapshot.canonical.find("\"phase\":\"failed\"") != std::string::npos);
+
+	char recovery_directory[] = "/tmp/fogcast-coordinator-typed-recovery-XXXXXX";
+	assert(mkdtemp(recovery_directory) != 0);
+	fogcast::BackendFence recovery_fence(recovery_directory);
+	assert(recovery_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform recovery_platform;
+	fogcast::Coordinator recovery(recovery_directory, &recovery_fence, &recovery_platform);
+	assert(recovery.Initialize(7) == fogcast::ErrorClass::ok);
+	assert(recovery.ExecuteMutation(IdleLaunch(recovery.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae09")).ok);
+	recovery_platform.fail_stop = true;
+	const std::string stop = OwnerRequest("stop", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0a",
+		recovery.sequence(), "0123456789abcdef0123456789abcdef", 42);
+	const fogcast::MutationReply recovery_required = recovery.ExecuteMutation(stop);
+	assert(recovery_required.kind == fogcast::MutationReply::Kind::terminal && !recovery_required.ok &&
+		recovery_required.code == fogcast::CoordinatorCode::recovery_required &&
+		recovery_required.snapshot.valid && recovery_required.resulting_sequence > 0);
+	assert(recovery.operation_status("aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0a").code ==
+		fogcast::CoordinatorCode::recovery_required);
+	assert(recovery.Execute(stop) == fogcast::ErrorClass::ok);
+
+	char internal_directory[] = "/tmp/fogcast-coordinator-typed-internal-XXXXXX";
+	assert(mkdtemp(internal_directory) != 0);
+	fogcast::BackendFence internal_fence(internal_directory);
+	assert(internal_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform internal_platform;
+	internal_platform.fail_create = true;
+	fogcast::Coordinator internal(internal_directory, &internal_fence, &internal_platform);
+	assert(internal.Initialize(7) == fogcast::ErrorClass::ok);
+	const fogcast::MutationReply internal_failure = internal.ExecuteMutation(
+		IdleLaunch(internal.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0b"));
+	assert(internal_failure.kind == fogcast::MutationReply::Kind::terminal && !internal_failure.ok &&
+		internal_failure.code == fogcast::CoordinatorCode::internal && internal_failure.snapshot.valid);
+	assert(internal.Execute(IdleLaunch(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0b")) == fogcast::ErrorClass::ok);
+
+	char deadline_directory[] = "/tmp/fogcast-coordinator-typed-deadline-XXXXXX";
+	assert(mkdtemp(deadline_directory) != 0);
+	fogcast::BackendFence deadline_fence(deadline_directory);
+	assert(deadline_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakeClock clock;
+	FakePlatform deadline_platform;
+	deadline_platform.mutable_now = &clock.now;
+	FakeCrash delay;
+	delay.mutable_now = &clock.now;
+	delay.advance_recorded = 16000;
+	fogcast::Coordinator deadline(deadline_directory, &deadline_fence, &deadline_platform, &delay, &clock);
+	assert(deadline.Initialize(7) == fogcast::ErrorClass::ok);
+	const fogcast::MutationReply elapsed = deadline.ExecuteMutation(
+		IdleLaunch(deadline.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0c"));
+	assert(elapsed.kind == fogcast::MutationReply::Kind::terminal && !elapsed.ok &&
+		elapsed.code == fogcast::CoordinatorCode::deadline && elapsed.snapshot.valid);
+
+	char interrupted_directory[] = "/tmp/fogcast-coordinator-typed-interrupted-XXXXXX";
+	assert(mkdtemp(interrupted_directory) != 0);
+	fogcast::BackendFence interrupted_fence(interrupted_directory);
+	assert(interrupted_fence.Commit(fogcast::BackendFence::Record(1, "native", 7)) == fogcast::ErrorClass::ok);
+	FakePlatform interrupted_platform;
+	fogcast::Coordinator interrupted(interrupted_directory, &interrupted_fence, &interrupted_platform);
+	assert(interrupted.Initialize(7) == fogcast::ErrorClass::ok);
+	const std::string interrupted_request = IdleLaunch(interrupted.sequence(),
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0d");
+	assert(interrupted.Admit(interrupted_request) == fogcast::ErrorClass::ok);
+	interrupted_platform.actions.clear();
+	fogcast::Coordinator resumed(interrupted_directory, &interrupted_fence, &interrupted_platform);
+	assert(resumed.Initialize(7) == fogcast::ErrorClass::ok);
+	const fogcast::Coordinator::OperationStatus interrupted_status = resumed.operation_status(
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaae0d");
+	assert(interrupted_status.kind == fogcast::Coordinator::OperationStatus::completed &&
+		interrupted_status.code == fogcast::CoordinatorCode::interrupted && !interrupted_status.ok);
+}
+
+void TestTypedFenceChangesDuringAdmission() {
+	// Break caught: a fence that changes after typed precheck but before the
+	// legacy admission check must fail closed as NOT_READY, not INTERNAL.
+	MutableFenceSyscalls syscalls;
+	fogcast::BackendFence fence("fence", &syscalls);
+	assert(fence.Commit(fogcast::BackendFence::Record(1, "legacy", 1)) == fogcast::ErrorClass::ok);
+	assert(fence.Commit(fogcast::BackendFence::Record(2, "transitioning", 1)) == fogcast::ErrorClass::ok);
+	assert(fence.Commit(fogcast::BackendFence::Record(3, "native", 2)) == fogcast::ErrorClass::ok);
+	char directory[] = "/tmp/fogcast-coordinator-fence-race-XXXXXX";
+	assert(mkdtemp(directory) != 0);
+	FakePlatform platform;
+	fogcast::Coordinator coordinator(directory, &fence, &platform);
+	assert(coordinator.Initialize(2) == fogcast::ErrorClass::ok);
+	syscalls.read_opens = 0; syscalls.deny_on_read_open = 2;
+	platform.actions.clear();
+	const std::string before = coordinator.canonical_state();
+	const std::string request = IdleLaunch(coordinator.sequence(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae12");
+	const fogcast::MutationReply admitted = coordinator.ExecuteMutation(request);
+	assert(admitted.kind == fogcast::MutationReply::Kind::terminal && admitted.ok && syscalls.read_opens == 1);
+	assert(coordinator.canonical_state() != before && !platform.actions.empty());
+	syscalls.read_opens = 0; syscalls.deny_on_read_open = 1; platform.actions.clear();
+	const std::string after = coordinator.canonical_state();
+	const fogcast::MutationReply rejected = coordinator.ExecuteMutation(request);
+	assert(rejected.kind == fogcast::MutationReply::Kind::rejected &&
+		rejected.code == fogcast::CoordinatorCode::not_ready && rejected.snapshot.valid &&
+		syscalls.read_opens == 1);
+	assert(coordinator.canonical_state() == after && platform.actions.empty());
+}
+
 }  // namespace
 
 int main()
 {
+	TestTypedMutationDispositionApi();
+	TestTypedMutationDispositionBehavior();
+	TestTypedTerminalCodesAndWrapper();
+	TestTypedFenceChangesDuringAdmission();
 	TestTypedLifecycleContractExists();
 	TestCleanupDeadlineBudgetSelection();
 	TestLifecycleResultRetainsObserveDeadline();

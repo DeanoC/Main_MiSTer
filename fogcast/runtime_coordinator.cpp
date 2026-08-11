@@ -185,6 +185,38 @@ std::string ErrorCode(const detail::Token* token) {
 	return Text(detail::Member(*token, "code"), &result) ? result : std::string();
 }
 
+CoordinatorCode CoordinatorCodeFromTerminal(const std::string& value) {
+	if (value.empty()) return CoordinatorCode::none;
+	if (value == "INTERRUPTED") return CoordinatorCode::interrupted;
+	if (value == "DEADLINE") return CoordinatorCode::deadline;
+	if (value == "RECOVERY_REQUIRED") return CoordinatorCode::recovery_required;
+	if (value == "UNSUPPORTED_MODE") return CoordinatorCode::unsupported_mode;
+	if (value == "OWNER_NOT_FOUND") return CoordinatorCode::owner_not_found;
+	if (value == "STALE_GENERATION") return CoordinatorCode::stale_generation;
+	if (value == "STALE_ADMISSION") return CoordinatorCode::stale_admission;
+	return CoordinatorCode::internal;
+}
+
+CoordinatorSnapshot SnapshotFromCanonical(const std::string& record) {
+	CoordinatorSnapshot result;
+	detail::Token root;
+	if (record.empty() || detail::ScanV1Json(record, 256 * 1024, &root) != ErrorClass::ok ||
+		root.kind != detail::Token::Kind::object) return result;
+	static const char* const fields[] = {"sequence", "backend_epoch", "phase", "mode", "owner",
+		"release_owner", "candidate", "leases", "content_lease", "observed_core", "capabilities",
+		"last_error"};
+	std::string snapshot("{");
+	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+		const detail::Token* field = detail::Member(root, fields[i]);
+		if (!field) return CoordinatorSnapshot();
+		if (i) snapshot += ',';
+		snapshot += std::string("\"") + fields[i] + "\":" + detail::Encode(*field);
+	}
+	result.valid = true;
+	result.canonical = snapshot + '}';
+	return result;
+}
+
 }  // namespace
 
 uint32_t CleanupDeadlineBudget(uint32_t resource_mask, uint64_t global_deadline,
@@ -809,7 +841,7 @@ ErrorClass Coordinator::Release(const Owner& old_owner, const Owner& candidate,
 	if (result != ErrorClass::ok) return result;
 	result = Commit("releasing", old_owner, old_owner, candidate, launch.expected_core, content_lease, "transitioning", std::string(), 0);
 	if (result != ErrorClass::ok) return result;
-	if (!platform_) return Unwind(candidate, operation_id, digest, "INTERNAL");
+	if (!platform_) return Unwind(candidate, operation_id, digest, "RECOVERY_REQUIRED");
 	if (old_owner.present) {
 		const LiveHandleState handle = platform_->live_handle_state();
 		const LifecycleResult cleanup = handle == LiveHandleState::live ?
@@ -851,19 +883,43 @@ ErrorClass Coordinator::Release(const Owner& old_owner, const Owner& candidate,
 }
 
 ErrorClass Coordinator::Admit(const std::string& request) {
-	if (!ready_) return ErrorClass::transition;
 	std::string operation, operation_id, digest, content_lease;
 	LaunchMetadata launch;
 	Owner candidate, requested;
 	uint64_t expected_sequence = 0;
 	if (!ParseMutation(request, &operation, &operation_id, &digest, &candidate, &requested,
 		&expected_sequence, &launch, &content_lease)) return ErrorClass::schema;
-	if (shutdown_) return ErrorClass::transition;
-	for (size_t i = 0; i < ledger_.size(); ++i) if (ledger_[i].operation_id == operation_id)
-		return ledger_[i].digest == digest ? ErrorClass::ok : ErrorClass::transition;
-	if (!in_flight_id_.empty()) return in_flight_id_ == operation_id && in_flight_digest_ == digest ? ErrorClass::transition : ErrorClass::transition;
-	if (!PhaseAllows(operation) || !FenceAllows(operation) || expected_sequence != state_.sequence || !SameOwner(requested, owner_)) return ErrorClass::transition;
-	if (operation == "launch" && SameOwner(candidate, owner_)) return ErrorClass::transition;
+	const Admission admission = AdmitParsed(operation, operation_id, digest, candidate, requested,
+		expected_sequence, content_lease);
+	return admission.kind == Admission::newly_recorded || admission.kind == Admission::terminal_replay ?
+		ErrorClass::ok : ErrorClass::transition;
+}
+
+Coordinator::Admission Coordinator::AdmitParsed(const std::string& operation,
+	const std::string& operation_id, const std::string& digest, const Owner& candidate,
+	const Owner& requested, uint64_t expected_sequence, const std::string& content_lease) {
+	Admission admission;
+	(void)content_lease;
+	if (!ready_ || shutdown_ || !FenceAllows(operation)) { admission.code = CoordinatorCode::not_ready; return admission; }
+	for (size_t i = 0; i < ledger_.size(); ++i) if (ledger_[i].operation_id == operation_id) {
+		admission.kind = ledger_[i].digest == digest ? Admission::terminal_replay : Admission::rejected;
+		admission.code = ledger_[i].digest == digest ? CoordinatorCode::none : CoordinatorCode::operation_replay;
+		return admission;
+	}
+	if (!in_flight_id_.empty()) {
+		admission.kind = in_flight_id_ == operation_id && in_flight_digest_ == digest ?
+			Admission::in_progress_replay : Admission::rejected;
+		admission.code = admission.kind == Admission::in_progress_replay ? CoordinatorCode::in_progress :
+			(in_flight_id_ == operation_id ? CoordinatorCode::operation_replay : CoordinatorCode::busy);
+		return admission;
+	}
+	if (expected_sequence != state_.sequence || !SameOwner(requested, owner_)) { admission.code = CoordinatorCode::stale_admission; return admission; }
+	if (operation == "launch" && SameOwner(candidate, owner_)) { admission.code = CoordinatorCode::stale_generation; return admission; }
+	if (operation == "stop" && !owner_.present) { admission.code = CoordinatorCode::owner_not_found; return admission; }
+	if (operation == "shutdown" && (owner_.present || state_.phase != "idle")) { admission.code = CoordinatorCode::stale_admission; return admission; }
+	if (state_.phase == "failed" && (operation == "launch" || operation == "stop")) { admission.code = CoordinatorCode::recovery_required; return admission; }
+	if (state_.phase != "idle" && state_.phase != "active" && state_.phase != "failed") { admission.code = CoordinatorCode::busy; return admission; }
+	if (!PhaseAllows(operation)) { admission.code = CoordinatorCode::stale_admission; return admission; }
 	// The recorded commit is itself inside the operation's absolute budget: a
 	// crash hook or durable store delay cannot manufacture a fresh lifecycle
 	// window after admission.
@@ -878,31 +934,38 @@ ErrorClass Coordinator::Admit(const std::string& request) {
 	// this exact boundary.
 	std::string retained_error;
 	detail::Token root;
-	if (detail::ScanV1Json(state_.canonical, 256 * 1024, &root) != ErrorClass::ok)
-		return ErrorClass::schema;
+	if (detail::ScanV1Json(state_.canonical, 256 * 1024, &root) != ErrorClass::ok) return admission;
 	retained_error = ErrorCode(detail::Member(root, "last_error"));
-	return Commit(state_.phase, owner_, release_owner_, candidate_,
-		expected_core_, content_lease_, "recorded", retained_error, 0);
+	if (Commit(state_.phase, owner_, release_owner_, candidate_, expected_core_, content_lease_,
+		"recorded", retained_error, 0) != ErrorClass::ok) return admission;
+	admission.kind = Admission::newly_recorded;
+	admission.code = CoordinatorCode::none;
+	return admission;
 }
 
-ErrorClass Coordinator::Execute(const std::string& request) {
-	std::string operation, operation_id, digest, content_lease;
-	LaunchMetadata launch;
-	Owner candidate, requested;
-	uint64_t expected_sequence = 0;
-	if (!ParseMutation(request, &operation, &operation_id, &digest, &candidate, &requested,
-		&expected_sequence, &launch, &content_lease)) return ErrorClass::schema;
-	const ErrorClass admitted = Admit(request);
-	if (admitted != ErrorClass::ok) return admitted;
-	// A retained terminal is returned by the server layer without replaying a
-	// lifecycle.  This portable layer has no wire response, so it reports OK.
-	if (in_flight_id_.empty()) return ErrorClass::ok;
+ErrorClass Coordinator::ExecuteAdmitted(const std::string& operation,
+	const std::string& operation_id, const std::string& digest, const Owner& candidate,
+	const Owner& requested, const LaunchMetadata& launch, const std::string& content_lease) {
+	(void)requested;
 	if (operation == "launch") return Release(owner_, candidate, operation_id, digest, launch, content_lease);
 	const Owner none;
 	if (operation == "shutdown") {
-		if (owner_.present || state_.phase != "idle" || !platform_ ||
-			platform_->ProveNeutral(kAllResources, Remaining(operation_deadline_)) != LifecycleResult::ok)
+		if (owner_.present || state_.phase != "idle")
 			return ErrorClass::transition;
+		std::string terminal_error;
+		if (!platform_ || Remaining(operation_deadline_) == 0) {
+			terminal_error = Remaining(operation_deadline_) == 0 ? "DEADLINE" : "RECOVERY_REQUIRED";
+		} else {
+			const LifecycleResult neutral = platform_->ProveNeutral(kAllResources,
+				Remaining(operation_deadline_));
+			if (Remaining(operation_deadline_) == 0) terminal_error = "DEADLINE";
+			else if (neutral != LifecycleResult::ok) terminal_error = "RECOVERY_REQUIRED";
+		}
+		if (!terminal_error.empty()) {
+			Terminal failure = {operation_id, digest, false, terminal_error, std::string(), 0};
+			return Commit("failed", none, none, none, std::string(), std::string(), std::string(),
+				terminal_error, &failure);
+		}
 		Terminal success = {operation_id, digest, true, std::string(), std::string(), 0};
 		const ErrorClass result = Commit("idle", none, none, none, std::string(), std::string(), std::string(), std::string(), &success);
 		if (result == ErrorClass::ok) shutdown_ = true;
@@ -927,10 +990,89 @@ ErrorClass Coordinator::Execute(const std::string& request) {
 	return Commit("idle", none, none, none, std::string(), std::string(), std::string(), std::string(), &success);
 }
 
+CoordinatorSnapshot Coordinator::snapshot() const { return SnapshotFromCanonical(state_.canonical); }
+
+const char* Coordinator::ProtocolCode(CoordinatorCode code) {
+	switch (code) {
+	case CoordinatorCode::none: return 0;
+	case CoordinatorCode::invalid_request: return "INVALID_REQUEST";
+	case CoordinatorCode::busy: return "BUSY";
+	case CoordinatorCode::not_ready: return "NOT_READY";
+	case CoordinatorCode::stale_admission: return "STALE_ADMISSION";
+	case CoordinatorCode::stale_generation: return "STALE_GENERATION";
+	case CoordinatorCode::in_progress: return "IN_PROGRESS";
+	case CoordinatorCode::operation_replay: return "OPERATION_REPLAY";
+	case CoordinatorCode::operation_unknown: return "OPERATION_UNKNOWN";
+	case CoordinatorCode::interrupted: return "INTERRUPTED";
+	case CoordinatorCode::deadline: return "DEADLINE";
+	case CoordinatorCode::recovery_required: return "RECOVERY_REQUIRED";
+	case CoordinatorCode::unsupported_mode: return "UNSUPPORTED_MODE";
+	case CoordinatorCode::owner_not_found: return "OWNER_NOT_FOUND";
+	case CoordinatorCode::internal: return "INTERNAL";
+	}
+	return "INTERNAL";
+}
+
+MutationReply Coordinator::ExecuteMutation(const std::string& request) {
+	MutationReply reply;
+	std::string operation, operation_id, digest, content_lease;
+	LaunchMetadata launch;
+	Owner candidate, requested;
+	uint64_t expected_sequence = 0;
+	if (!ParseMutation(request, &operation, &operation_id, &digest, &candidate, &requested,
+		&expected_sequence, &launch, &content_lease)) {
+		reply.code = CoordinatorCode::invalid_request;
+		return reply;
+	}
+	reply.operation_id = operation_id;
+	reply.request_digest = digest;
+	reply.snapshot = snapshot();
+	const Admission admission = AdmitParsed(operation, operation_id, digest, candidate, requested,
+		expected_sequence, content_lease);
+	if (admission.kind == Admission::terminal_replay) {
+		for (size_t i = 0; i < ledger_.size(); ++i) if (ledger_[i].operation_id == operation_id) {
+			const Terminal& terminal = ledger_[i];
+		reply.kind = MutationReply::Kind::terminal;
+		reply.ok = terminal.ok;
+		reply.code = terminal.ok ? CoordinatorCode::none : CoordinatorCodeFromTerminal(terminal.error);
+		reply.snapshot.valid = !terminal.snapshot.empty();
+		reply.snapshot.canonical = terminal.snapshot;
+		reply.resulting_sequence = terminal.sequence;
+		return reply;
+	}
+	}
+	if (admission.kind == Admission::in_progress_replay) { reply.kind = MutationReply::Kind::in_progress; reply.code = admission.code; return reply; }
+	if (admission.kind != Admission::newly_recorded) { reply.code = admission.code; reply.snapshot = snapshot(); return reply; }
+	const ErrorClass result = ExecuteAdmitted(operation, operation_id, digest, candidate, requested,
+		launch, content_lease);
+	for (size_t i = 0; i < ledger_.size(); ++i) {
+		const Terminal& terminal = ledger_[i];
+		if (terminal.operation_id != operation_id) continue;
+		reply.kind = MutationReply::Kind::terminal;
+		reply.ok = terminal.ok;
+		reply.code = terminal.ok ? CoordinatorCode::none : CoordinatorCodeFromTerminal(terminal.error);
+		reply.snapshot.valid = !terminal.snapshot.empty();
+		reply.snapshot.canonical = terminal.snapshot;
+		reply.resulting_sequence = terminal.sequence;
+		return reply;
+	}
+	(void)result;
+	reply.code = CoordinatorCode::internal;
+	reply.snapshot = snapshot();
+	return reply;
+}
+
+ErrorClass Coordinator::Execute(const std::string& request) {
+	const MutationReply reply = ExecuteMutation(request);
+	if (reply.kind == MutationReply::Kind::terminal) return ErrorClass::ok;
+	return reply.code == CoordinatorCode::invalid_request ? ErrorClass::schema : ErrorClass::transition;
+}
+
 Coordinator::OperationStatus Coordinator::operation_status(const std::string& operation_id) const {
 	OperationStatus status;
 	if (!in_flight_id_.empty() && in_flight_id_ == operation_id) {
 		status.kind = OperationStatus::in_flight;
+		status.code = CoordinatorCode::in_progress;
 		status.request_digest = in_flight_digest_;
 		return status;
 	}
@@ -938,6 +1080,7 @@ Coordinator::OperationStatus Coordinator::operation_status(const std::string& op
 		if (ledger_[i].operation_id != operation_id) continue;
 		status.kind = OperationStatus::completed;
 		status.ok = ledger_[i].ok;
+		status.code = ledger_[i].ok ? CoordinatorCode::none : CoordinatorCodeFromTerminal(ledger_[i].error);
 		status.request_digest = ledger_[i].digest;
 		status.error = ledger_[i].error;
 		status.snapshot = ledger_[i].snapshot;
