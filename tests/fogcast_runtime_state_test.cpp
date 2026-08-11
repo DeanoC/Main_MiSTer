@@ -214,6 +214,25 @@ int main() {
 	assert(fogcast::ParseStateRecord(idle_origin, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
 	std::string idle_releasing = Checksummed(ReplaceOnce(idle_origin, "\"phase\":\"intent\"", "\"phase\":\"releasing\""));
 	assert(fogcast::ParseStateRecord(idle_releasing, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	// Releasing has four distinct approved shapes: existing and idle-origin
+	// launches retain a candidate; release-only and recovery/drain do not.
+	std::string existing_launch_releasing = Checksummed(ReplaceOnce(transitional, "\"phase\":\"intent\"", "\"phase\":\"releasing\""));
+	assert(fogcast::ParseStateRecord(existing_launch_releasing, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	std::string release_only = ReplaceOnce(active_raw, "\"phase\":\"active\"", "\"phase\":\"releasing\"");
+	release_only = ReplaceOnce(release_only, "\"mode\":\"fpga_native\"", "\"mode\":\"recovering\"");
+	release_only = ReplaceOnce(release_only, "\"release_owner\":null", "\"release_owner\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"generation\":42,\"mode\":\"fpga_native\"}");
+	release_only = ReplaceOnce(release_only, "\"in_flight\":null", "\"in_flight\":{\"operation_id\":\"fedcba9876543210fedcba9876543210\",\"request_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"stage\":\"transitioning\"}");
+	release_only = Checksummed(release_only);
+	assert(fogcast::ParseStateRecord(release_only, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	std::string recovery_releasing = ReplaceOnce(idle_raw, "\"phase\":\"idle\"", "\"phase\":\"releasing\"");
+	recovery_releasing = ReplaceOnce(recovery_releasing, "\"mode\":\"idle\"", "\"mode\":\"recovering\"");
+	recovery_releasing = ReplaceOnce(recovery_releasing, "\"in_flight\":null", "\"in_flight\":{\"operation_id\":\"fedcba9876543210fedcba9876543210\",\"request_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"stage\":\"transitioning\"}");
+	recovery_releasing = Checksummed(recovery_releasing);
+	assert(fogcast::ParseStateRecord(recovery_releasing, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	std::string release_mismatched_owner = Checksummed(ReplaceOnce(release_only, "\"release_owner\":{\"session\":\"0123456789abcdef0123456789abcdef\"", "\"release_owner\":{\"session\":\"fedcba9876543210fedcba9876543210\""));
+	assert(fogcast::ParseStateRecord(release_mismatched_owner, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::schema);
+	std::string recovery_with_lease = Checksummed(ReplaceOnce(recovery_releasing, "\"leases\":[]", "\"leases\":[{}]"));
+	assert(fogcast::ParseStateRecord(recovery_with_lease, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::schema);
 	std::string mixed_origin = Checksummed(ReplaceOnce(idle_origin, "\"release_owner\":null", "\"release_owner\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"generation\":42,\"mode\":\"fpga_native\"}"));
 	assert(fogcast::ParseStateRecord(mixed_origin, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::schema);
 	std::string transferred = ReplaceOnce(active_raw, "\"phase\":\"active\"", "\"phase\":\"transferred\"");

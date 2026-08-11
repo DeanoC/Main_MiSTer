@@ -179,7 +179,9 @@ ErrorClass ValidatePhase(const detail::Token& root) {
 		if (owner->kind == detail::Token::Kind::null_value) { if (release_owner->kind != detail::Token::Kind::null_value || !leases->array.empty() || content_lease->kind != detail::Token::Kind::null_value) return ErrorClass::schema; }
 		else if (release_owner->kind != detail::Token::Kind::object || !Same(owner, release_owner) || !CompleteLeases(leases) || content_lease->kind != detail::Token::Kind::object) return ErrorClass::schema;
 	} else if (phase->text == "releasing") {
-		if (mode->text != "recovering" || candidate->kind != detail::Token::Kind::object) return ErrorClass::schema;
+		// Releasing covers launch/replacement handoff and release-only
+		// stop/recover.  Unlike intent, its candidate is optional.
+		if (mode->text != "recovering") return ErrorClass::schema;
 		if (owner->kind == detail::Token::Kind::null_value) { if (release_owner->kind != detail::Token::Kind::null_value || !leases->array.empty() || content_lease->kind != detail::Token::Kind::null_value) return ErrorClass::schema; }
 		else if (release_owner->kind != detail::Token::Kind::object || !Same(owner, release_owner) || !CompleteLeases(leases) || content_lease->kind != detail::Token::Kind::object) return ErrorClass::schema;
 	} else if (phase->text == "no_owner") {

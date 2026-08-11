@@ -182,6 +182,25 @@ int main() {
 	assert(fogcast::ParseWire(failed_idle_status, &canonical, &digest) == fogcast::ErrorClass::schema);
 	std::string failed_status = ReplaceAll(failed_idle_status, "\"mode\":\"idle\"", "\"mode\":\"failed\"");
 	assert(fogcast::ParseWire(failed_status, &canonical, &digest) == fogcast::ErrorClass::ok);
+	// Snapshot release shapes mirror the persisted state validator.  These are
+	// already normatively ordered response/terminal snapshots.
+	std::string wire_existing_launch = ReplaceOnce(launch_response, "\"phase\":\"active\"", "\"phase\":\"releasing\"");
+	wire_existing_launch = ReplaceOnce(wire_existing_launch, "\"mode\":\"fpga_native\"", "\"mode\":\"recovering\"");
+	wire_existing_launch = ReplaceOnce(wire_existing_launch, "\"release_owner\":null", "\"release_owner\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"generation\":42,\"mode\":\"fpga_native\"}");
+	wire_existing_launch = ReplaceOnce(wire_existing_launch, "\"candidate\":null", "\"candidate\":{\"session\":\"fedcba9876543210fedcba9876543210\",\"generation\":43,\"mode\":\"fpga_native\"}");
+	assert(fogcast::ParseWire(wire_existing_launch, &canonical, &digest) == fogcast::ErrorClass::ok);
+	std::string wire_release_only = ReplaceOnce(launch_response, "\"phase\":\"active\"", "\"phase\":\"releasing\"");
+	wire_release_only = ReplaceOnce(wire_release_only, "\"mode\":\"fpga_native\"", "\"mode\":\"recovering\"");
+	wire_release_only = ReplaceOnce(wire_release_only, "\"release_owner\":null", "\"release_owner\":{\"session\":\"0123456789abcdef0123456789abcdef\",\"generation\":42,\"mode\":\"fpga_native\"}");
+	assert(fogcast::ParseWire(wire_release_only, &canonical, &digest) == fogcast::ErrorClass::ok);
+	std::string wire_idle_launch = ReplaceAll(health_response, "\"phase\":\"idle\"", "\"phase\":\"releasing\"");
+	wire_idle_launch = ReplaceAll(wire_idle_launch, "\"mode\":\"idle\"", "\"mode\":\"recovering\"");
+	wire_idle_launch = ReplaceOnce(wire_idle_launch, "\"candidate\":null", "\"candidate\":{\"session\":\"fedcba9876543210fedcba9876543210\",\"generation\":43,\"mode\":\"fpga_native\"}");
+	assert(fogcast::ParseWire(wire_idle_launch, &canonical, &digest) == fogcast::ErrorClass::ok);
+	const std::string wire_recovery_releasing = ReplaceAll(ReplaceAll(health_response, "\"phase\":\"idle\"", "\"phase\":\"releasing\""), "\"mode\":\"idle\"", "\"mode\":\"recovering\"");
+	assert(fogcast::ParseWire(wire_recovery_releasing, &canonical, &digest) == fogcast::ErrorClass::ok);
+	assert(fogcast::ParseWire(ReplaceOnce(wire_release_only, "\"release_owner\":{\"session\":\"0123456789abcdef0123456789abcdef\"", "\"release_owner\":{\"session\":\"fedcba9876543210fedcba9876543210\""), &canonical, &digest) == fogcast::ErrorClass::schema);
+	assert(fogcast::ParseWire(ReplaceOnce(wire_recovery_releasing, "\"leases\":[]", "\"leases\":[{}]"), &canonical, &digest) == fogcast::ErrorClass::schema);
 	// The replay window retains exactly 64 operation identities.  It must reject
 	// an altered in-window replay, then evict the oldest only on entry 65.
 	fogcast::ReplayTracker replay_window;

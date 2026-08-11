@@ -440,8 +440,11 @@ bool SnapshotShape(const detail::Token& snapshot, ErrorClass* error) {
 	const bool same_candidate = owner_present && candidate_present && detail::Encode(*owner) == detail::Encode(*candidate);
 	if (phase == "idle" && (mode != "idle" || owner_present || !IsNull(release_owner) || candidate_present || !empty)) { *error = ErrorClass::schema; return false; }
 	if (phase == "active" && (mode != "fpga_native" || !owner_present || !IsNull(release_owner) || candidate_present || !full)) { *error = ErrorClass::schema; return false; }
-	if ((phase == "intent" || phase == "releasing") &&
+	if (phase == "intent" &&
 		(mode != "recovering" || !candidate_present ||
+		 (owner_present ? (!same_release || !full) : (!IsNull(release_owner) || !empty)))) { *error = ErrorClass::schema; return false; }
+	if (phase == "releasing" &&
+		(mode != "recovering" ||
 		 (owner_present ? (!same_release || !full) : (!IsNull(release_owner) || !empty)))) { *error = ErrorClass::schema; return false; }
 	if (phase == "no_owner" && (mode != "recovering" || owner_present || !IsNull(release_owner) || !empty)) { *error = ErrorClass::schema; return false; }
 	if (phase == "transferred" && (mode != "recovering" || !owner_present || !IsNull(release_owner) || !same_candidate || !full)) { *error = ErrorClass::schema; return false; }
