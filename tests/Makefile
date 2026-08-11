@@ -29,6 +29,11 @@ SCHEDULER_TEST_OBJECT = $(HOST_TEST_DIR)/scheduler_step_test.o
 SCHEDULER_FAILURE_TEST_OBJECT = $(HOST_TEST_DIR)/scheduler_init_failure_test.o
 SCHEDULER_OBJECT = $(HOST_TEST_DIR)/scheduler.o
 HOST_LIBCO_OBJECT = $(HOST_TEST_DIR)/host_libco.o
+FOGCAST_PROTOCOL_TEST_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_protocol_test.o
+FOGCAST_STATE_TEST_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_state_test.o
+FOGCAST_PROTOCOL_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_protocol.o
+FOGCAST_STATE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_state.o
+FOGCAST_STORE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_store_linux.o
 HOST_TEST_INCLUDE = $(if $(filter Darwin,$(shell uname -s)),-Itests/include)
 HOST_EXIT_COMPAT = $(if $(filter Darwin,$(shell uname -s)),,-D_Exit=_exit)
 SCHEDULER_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) $(HOST_TEST_INCLUDE)
@@ -39,7 +44,19 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean test-runtime-smoke test-runtime test-scheduler test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize
+.PHONY: clean test-runtime-smoke test-runtime test-scheduler test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize
+
+test-fogcast-protocol: $(HOST_TEST_DIR)/fogcast_runtime_protocol_test
+	$(HOST_TEST_DIR)/fogcast_runtime_protocol_test
+
+test-fogcast-state: $(HOST_TEST_DIR)/fogcast_runtime_state_test
+	$(HOST_TEST_DIR)/fogcast_runtime_state_test
+
+test-fogcast-protocol-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/protocol-sanitize HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-fogcast-protocol
+
+test-fogcast-state-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/state-sanitize HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-fogcast-state
 
 test-runtime-smoke: $(HOST_TEST_DIR)/mister_runtime_c99_smoke \
 	$(HOST_TEST_DIR)/mister_runtime_cpp14_smoke
@@ -83,6 +100,27 @@ test-runtime-v2-production-sanitize:
 
 $(HOST_TEST_DIR):
 	mkdir -p $@
+
+$(FOGCAST_PROTOCOL_TEST_OBJECT): tests/fogcast_runtime_protocol_test.cpp fogcast/runtime_protocol.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(FOGCAST_STATE_TEST_OBJECT): tests/fogcast_runtime_state_test.cpp fogcast/runtime_state.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(FOGCAST_PROTOCOL_OBJECT): fogcast/runtime_protocol.cpp fogcast/runtime_protocol.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(FOGCAST_STATE_OBJECT): fogcast/runtime_state.cpp fogcast/runtime_state.hpp fogcast/runtime_protocol.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(FOGCAST_STORE_OBJECT): fogcast/runtime_store_linux.cpp fogcast/runtime_store.hpp fogcast/runtime_state.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(HOST_TEST_DIR)/fogcast_runtime_protocol_test: $(FOGCAST_PROTOCOL_TEST_OBJECT) $(FOGCAST_PROTOCOL_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/fogcast_runtime_state_test: $(FOGCAST_STATE_TEST_OBJECT) $(FOGCAST_STATE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT) $(FOGCAST_STORE_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(RUNTIME_OBJECT): runtime/mister_runtime.cpp runtime/mister_runtime.h \
 	runtime/mister_runtime_internal.hpp | $(HOST_TEST_DIR)
