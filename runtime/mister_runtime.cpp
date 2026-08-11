@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 struct MisterRuntime {
+	uint32_t generation;
 	MisterPlatform platform;
 	uint32_t state;
 	uint32_t last_error;
@@ -70,6 +71,7 @@ extern "C" MisterRuntime *MisterRuntime_Create(const MisterPlatform *platform)
 		return nullptr;
 	}
 
+	runtime->generation = MISTER_RUNTIME_GENERATION_V1;
 	runtime->platform = *platform;
 	runtime->state = MISTER_RUNTIME_CREATED;
 	runtime->capability_flags = platform->capability_flags &
@@ -79,7 +81,7 @@ extern "C" MisterRuntime *MisterRuntime_Create(const MisterPlatform *platform)
 
 extern "C" bool MisterRuntime_Start(MisterRuntime *runtime)
 {
-	if (runtime == nullptr) {
+	if (MisterRuntime_ReadGeneration(runtime) != MISTER_RUNTIME_GENERATION_V1) {
 		return false;
 	}
 	if (runtime->state != MISTER_RUNTIME_CREATED) {
@@ -101,7 +103,7 @@ extern "C" bool MisterRuntime_Start(MisterRuntime *runtime)
 
 extern "C" void MisterRuntime_Tick(MisterRuntime *runtime)
 {
-	if (runtime == nullptr) {
+	if (MisterRuntime_ReadGeneration(runtime) != MISTER_RUNTIME_GENERATION_V1) {
 		return;
 	}
 	if (runtime->state != MISTER_RUNTIME_RUNNING) {
@@ -123,7 +125,7 @@ extern "C" void MisterRuntime_Tick(MisterRuntime *runtime)
 extern "C" bool MisterRuntime_Load(MisterRuntime *runtime,
 	const MisterLaunch *launch)
 {
-	if (runtime == nullptr) {
+	if (MisterRuntime_ReadGeneration(runtime) != MISTER_RUNTIME_GENERATION_V1) {
 		return false;
 	}
 	if (runtime->state != MISTER_RUNTIME_READY) {
@@ -149,7 +151,7 @@ extern "C" bool MisterRuntime_Load(MisterRuntime *runtime,
 
 extern "C" MisterStatus MisterRuntime_Status(const MisterRuntime *runtime)
 {
-	if (runtime == nullptr) {
+	if (MisterRuntime_ReadGeneration(runtime) != MISTER_RUNTIME_GENERATION_V1) {
 		return mister_runtime_null_status();
 	}
 
@@ -167,7 +169,7 @@ extern "C" MisterStatus MisterRuntime_Status(const MisterRuntime *runtime)
 
 extern "C" void MisterRuntime_Stop(MisterRuntime *runtime)
 {
-	if (runtime == nullptr) {
+	if (MisterRuntime_ReadGeneration(runtime) != MISTER_RUNTIME_GENERATION_V1) {
 		return;
 	}
 
@@ -210,7 +212,8 @@ extern "C" void MisterRuntime_Stop(MisterRuntime *runtime)
 
 extern "C" bool MisterRuntime_Destroy(MisterRuntime **runtime)
 {
-	if (runtime == nullptr || *runtime == nullptr) {
+	if (runtime == nullptr || *runtime == nullptr ||
+		MisterRuntime_ReadGeneration(*runtime) != MISTER_RUNTIME_GENERATION_V1) {
 		return false;
 	}
 	if ((*runtime)->state != MISTER_RUNTIME_CREATED &&

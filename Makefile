@@ -42,18 +42,25 @@ C_SRC =   $(wildcard *.c) \
           $(wildcard ./lib/libchdr/*.c) \
           lib/libco/arm.c
 
-RUNTIME_SRC = runtime/mister_runtime.cpp runtime/mister_runtime_legacy.cpp
+RUNTIME_SRC = runtime/mister_runtime.cpp runtime/mister_runtime_v2.cpp runtime/mister_runtime_legacy.cpp
 RUNTIME_OBJ = $(RUNTIME_SRC:%.cpp=$(BUILDDIR)/%.cpp.o)
 RUNTIME_DEP = $(RUNTIME_SRC:%.cpp=$(BUILDDIR)/%.cpp.d)
 RUNTIME_ARCHIVE = $(BUILDDIR)/libmister-runtime.a
 RUNTIME_HEADERS = runtime/mister_runtime.h runtime/mister_runtime_internal.hpp
 RUNTIME_C99_SMOKE_OBJECT = $(BUILDDIR)/runtime-smoke/mister_runtime_c99_smoke.o
 RUNTIME_CPP14_SMOKE_OBJECT = $(BUILDDIR)/runtime-smoke/mister_runtime_cpp14_smoke.o
+RUNTIME_V2_C99_SMOKE_OBJECT = $(BUILDDIR)/runtime-smoke/mister_runtime_v2_c99_smoke.o
+RUNTIME_V2_CPP14_SMOKE_OBJECT = $(BUILDDIR)/runtime-smoke/mister_runtime_v2_cpp14_smoke.o
 RUNTIME_C99_SMOKE = $(BUILDDIR)/runtime-smoke/mister_runtime_c99_smoke
 RUNTIME_CPP14_SMOKE = $(BUILDDIR)/runtime-smoke/mister_runtime_cpp14_smoke
+RUNTIME_V2_C99_SMOKE = $(BUILDDIR)/runtime-smoke/mister_runtime_v2_c99_smoke
+RUNTIME_V2_CPP14_SMOKE = $(BUILDDIR)/runtime-smoke/mister_runtime_v2_cpp14_smoke
 RUNTIME_PUBLIC_SYMBOLS = MisterRuntime_ABIVersion MisterRuntime_Create \
 	MisterRuntime_Start MisterRuntime_Tick MisterRuntime_Load MisterRuntime_Status \
-	MisterRuntime_Stop MisterRuntime_Destroy
+	MisterRuntime_Stop MisterRuntime_Destroy MisterRuntime_ABIVersionV2 \
+	MisterRuntime_CreateV2 MisterRuntime_StartV2 MisterRuntime_LoadV2 \
+	MisterRuntime_TickV2 MisterRuntime_ObserveV2 MisterRuntime_StatusV2 \
+	MisterRuntime_StopV2 MisterRuntime_DestroyV2 MisterRuntime_RecoverPlatformV2
 
 CPP_SRC = $(filter-out $(RUNTIME_SRC),$(wildcard *.cpp)) \
           $(wildcard ./lib/serial_server/library/*.cpp) \
@@ -106,8 +113,8 @@ clean:
 	$(Q)rm -rf bin
 
 check-runtime-archive: $(RUNTIME_ARCHIVE) $(RUNTIME_C99_SMOKE) \
-	$(RUNTIME_CPP14_SMOKE)
-	$(Q)expected_members='mister_runtime.cpp.o mister_runtime_legacy.cpp.o'; \
+	$(RUNTIME_CPP14_SMOKE) $(RUNTIME_V2_C99_SMOKE) $(RUNTIME_V2_CPP14_SMOKE)
+	$(Q)expected_members='mister_runtime.cpp.o mister_runtime_v2.cpp.o mister_runtime_legacy.cpp.o'; \
 	actual_members="$$($(AR) t $(RUNTIME_ARCHIVE) | tr '\n' ' ' | sed 's/ $$//')"; \
 	test "$$actual_members" = "$$expected_members"
 	$(Q)for symbol in $(RUNTIME_PUBLIC_SYMBOLS); do \
@@ -132,6 +139,11 @@ $(BUILDDIR)/runtime/%.cpp.o: runtime/%.cpp
 	$(Q)mkdir -p $(dir $@)
 	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -fno-exceptions -fno-rtti -Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
 
+$(BUILDDIR)/runtime/mister_runtime_v2.cpp.o: runtime/mister_runtime_v2.cpp
+	$(Q)$(info $<)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -fno-rtti -Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
 $(RUNTIME_ARCHIVE): $(RUNTIME_OBJ)
 	$(Q)$(info $@)
 	$(Q)$(AR) rcsD $@ $^
@@ -147,10 +159,27 @@ $(RUNTIME_CPP14_SMOKE_OBJECT): tests/mister_runtime_cpp14_smoke.cpp \
 	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -fno-exceptions -fno-rtti \
 		-Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
 
+$(RUNTIME_V2_C99_SMOKE_OBJECT): tests/mister_runtime_v2_c99_smoke.c \
+	runtime/mister_runtime.h | $(BUILDDIR)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CC) $(CFLAGS) -std=c99 -pedantic-errors -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
+$(RUNTIME_V2_CPP14_SMOKE_OBJECT): tests/mister_runtime_v2_cpp14_smoke.cpp \
+	runtime/mister_runtime.h | $(BUILDDIR)
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CXX) $(CFLAGS) -std=gnu++14 -fno-exceptions -fno-rtti \
+		-Wno-class-memaccess -o $@ -c $< 2>&1 | $(OUTPUT_FILTER)
+
 $(RUNTIME_C99_SMOKE): $(RUNTIME_C99_SMOKE_OBJECT) $(RUNTIME_ARCHIVE)
 	$(Q)$(CXX) -o $@ $^
 
 $(RUNTIME_CPP14_SMOKE): $(RUNTIME_CPP14_SMOKE_OBJECT) $(RUNTIME_ARCHIVE)
+	$(Q)$(CXX) -o $@ $^
+
+$(RUNTIME_V2_C99_SMOKE): $(RUNTIME_V2_C99_SMOKE_OBJECT) $(RUNTIME_ARCHIVE)
+	$(Q)$(CXX) -o $@ $^
+
+$(RUNTIME_V2_CPP14_SMOKE): $(RUNTIME_V2_CPP14_SMOKE_OBJECT) $(RUNTIME_ARCHIVE)
 	$(Q)$(CXX) -o $@ $^
 
 $(BUILDDIR)/%.png.o: %.png
