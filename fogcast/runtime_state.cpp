@@ -185,7 +185,7 @@ ErrorClass ValidatePhase(const detail::Token& root) {
 		if (owner->kind == detail::Token::Kind::null_value) { if (release_owner->kind != detail::Token::Kind::null_value || !leases->array.empty() || content_lease->kind != detail::Token::Kind::null_value) return ErrorClass::schema; }
 		else if (release_owner->kind != detail::Token::Kind::object || !Same(owner, release_owner) || !CompleteLeases(leases) || content_lease->kind != detail::Token::Kind::object) return ErrorClass::schema;
 	} else if (phase->text == "no_owner") {
-		if (mode->text != "recovering" || owner->kind != detail::Token::Kind::null_value || release_owner->kind != detail::Token::Kind::null_value || !leases->array.empty() || content_lease->kind != detail::Token::Kind::null_value) return ErrorClass::schema;
+		if (mode->text != "recovering" || owner->kind != detail::Token::Kind::null_value || release_owner->kind != detail::Token::Kind::null_value || candidate->kind != detail::Token::Kind::null_value || !leases->array.empty() || content_lease->kind != detail::Token::Kind::null_value || detail::Member(root, "observed_core")->kind != detail::Token::Kind::null_value) return ErrorClass::schema;
 	} else if (phase->text == "transferred") {
 		if (mode->text != "recovering" || owner->kind != detail::Token::Kind::object || release_owner->kind != detail::Token::Kind::null_value || candidate->kind != detail::Token::Kind::object || !Same(owner, candidate) || !CompleteLeases(leases) || content_lease->kind != detail::Token::Kind::object) return ErrorClass::schema;
 	} else if (phase->text == "unwinding") {
@@ -265,10 +265,27 @@ ErrorClass ParseStateRecord(const std::string& bytes, StateRecord* record,
 	result = ValidateInflight(detail::Member(root, "in_flight"));
 	if (result != ErrorClass::ok) return result;
 	const detail::Token* in_flight = detail::Member(root, "in_flight");
+	const detail::Token* owner = detail::Member(root, "owner");
+	const detail::Token* release_owner = detail::Member(root, "release_owner");
+	const detail::Token* candidate = detail::Member(root, "candidate");
+	const detail::Token* leases = detail::Member(root, "leases");
 	const std::string& phase_name = detail::Member(root, "phase")->text;
 	const bool transitional = phase_name == "intent" || phase_name == "releasing" ||
 		phase_name == "no_owner" || phase_name == "transferred" || phase_name == "unwinding";
-	if (transitional && in_flight->kind != detail::Token::Kind::object) return ErrorClass::schema;
+	const bool release_only = phase_name == "releasing" &&
+		owner->kind == detail::Token::Kind::object &&
+		release_owner->kind == detail::Token::Kind::object && Same(owner, release_owner) &&
+		candidate->kind == detail::Token::Kind::null_value && CompleteLeases(leases) &&
+		content_lease->kind == detail::Token::Kind::object;
+	const bool no_owner_checkpoint = phase_name == "no_owner" &&
+		owner->kind == detail::Token::Kind::null_value &&
+		release_owner->kind == detail::Token::Kind::null_value &&
+		candidate->kind == detail::Token::Kind::null_value && leases->array.empty() &&
+		content_lease->kind == detail::Token::Kind::null_value &&
+		detail::Member(root, "observed_core")->kind == detail::Token::Kind::null_value;
+	if (transitional && in_flight->kind != detail::Token::Kind::object &&
+		!(in_flight->kind == detail::Token::Kind::null_value &&
+			(release_only || no_owner_checkpoint))) return ErrorClass::schema;
 	result = ValidateLedger(detail::Member(root, "ledger"), sequence,
 		in_flight->kind == detail::Token::Kind::object);
 	if (result != ErrorClass::ok) return result;
@@ -292,6 +309,35 @@ ErrorClass ParseStateRecord(const std::string& bytes, StateRecord* record,
 	record->canonical = *canonical;
 	record->digest = *digest;
 	return ErrorClass::ok;
+}
+
+ErrorClass ReencodeStateIdentity(const std::string& source, uint64_t new_sequence,
+	uint64_t new_epoch, StateRecord* result) {
+	if (!result) return ErrorClass::schema;
+	if (new_sequence == 0 || new_epoch == 0 ||
+		new_sequence > 0x7fffffffffffffffULL || new_epoch > 0x7fffffffffffffffULL)
+		return ErrorClass::bounds;
+	StateRecord authenticated;
+	std::string canonical;
+	std::string digest;
+	const ErrorClass parsed = ParseStateRecord(source, &authenticated, &canonical, &digest);
+	if (parsed != ErrorClass::ok) return parsed;
+	detail::Token root;
+	if (detail::ScanV1Json(source, 256 * 1024, &root) != ErrorClass::ok ||
+		!ExactTopLevel(root)) return ErrorClass::schema;
+	for (size_t i = 0; i < root.object.size(); ++i) {
+		if (root.object[i].first == "sequence") root.object[i].second.text = std::to_string(new_sequence);
+		if (root.object[i].first == "backend_epoch") root.object[i].second.text = std::to_string(new_epoch);
+	}
+	detail::Token without_checksum = root;
+	without_checksum.object.pop_back();
+	const std::string reencoded = detail::Encode(without_checksum);
+	const std::string rehashed = Sha256Hex(reencoded);
+	root.object.back().second.text = rehashed;
+	const std::string bytes = detail::Encode(root);
+	std::string final_canonical;
+	std::string final_digest;
+	return ParseStateRecord(bytes, result, &final_canonical, &final_digest);
 }
 
 }  // namespace fogcast

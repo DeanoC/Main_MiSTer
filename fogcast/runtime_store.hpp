@@ -10,6 +10,10 @@
 
 namespace fogcast {
 
+// Absence is an explicitly narrow state: only state.json missing from a
+// verified service-owned directory may create the initial durable record.
+enum class StateLoadStatus { loaded, not_found, invalid };
+
 // The Linux store owns policy; this narrow seam makes write/fsync/rename
 // failures deterministic without weakening the production path.
 class StoreSyscalls {
@@ -24,7 +28,7 @@ public:
 class StateStore {
 public:
 	explicit StateStore(const std::string& directory, const StoreSyscalls* syscalls = 0);
-	ErrorClass Load(StateRecord* record) const;
+	StateLoadStatus Load(StateRecord* record) const;
 	ErrorClass Commit(const StateRecord& record) const;
 
 private:

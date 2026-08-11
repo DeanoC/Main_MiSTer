@@ -51,28 +51,34 @@ bool WriteAll(const StoreSyscalls& syscalls, int file, const std::string& bytes)
 
 StateStore::StateStore(const std::string& directory, const StoreSyscalls* syscalls) : directory_(directory), syscalls_(syscalls ? syscalls : &DefaultSyscalls()) {}
 
-ErrorClass StateStore::Load(StateRecord* record) const {
-	if (!record || !SecureDirectory(directory_)) return ErrorClass::schema;
+StateLoadStatus StateStore::Load(StateRecord* record) const {
+	if (!record || !SecureDirectory(directory_)) return StateLoadStatus::invalid;
 	const std::string path = directory_ + "/state.json";
 	const int file = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-	if (file < 0) return ErrorClass::schema;
-	struct stat status;
-	if (fstat(file, &status) != 0 || !SecureRegularFile(status) || status.st_size < 1 || status.st_size > 256 * 1024) {
+	if (file < 0) return errno == ENOENT ? StateLoadStatus::not_found : StateLoadStatus::invalid;
+	struct stat before;
+	if (fstat(file, &before) != 0 || !SecureRegularFile(before) || before.st_size < 1 ||
+		before.st_size > 256 * 1024) {
 		close(file);
-		return ErrorClass::schema;
+		return StateLoadStatus::invalid;
 	}
 	std::string bytes;
-	bytes.resize(static_cast<size_t>(status.st_size));
+	bytes.resize(static_cast<size_t>(before.st_size));
 	size_t offset = 0;
 	while (offset < bytes.size()) {
 		const ssize_t got = read(file, &bytes[offset], bytes.size() - offset);
-		if (got <= 0) { close(file); return ErrorClass::schema; }
+		if (got <= 0) { close(file); return StateLoadStatus::invalid; }
 		offset += static_cast<size_t>(got);
 	}
-	if (close(file) != 0) return ErrorClass::schema;
+	struct stat after;
+	const bool unchanged = fstat(file, &after) == 0 && SecureRegularFile(after) &&
+		after.st_dev == before.st_dev && after.st_ino == before.st_ino &&
+		after.st_size == before.st_size;
+	if (close(file) != 0 || !unchanged) return StateLoadStatus::invalid;
 	std::string canonical;
 	std::string digest;
-	return ParseStateRecord(bytes, record, &canonical, &digest);
+	return ParseStateRecord(bytes, record, &canonical, &digest) == ErrorClass::ok ?
+		StateLoadStatus::loaded : StateLoadStatus::invalid;
 }
 
 ErrorClass StateStore::Commit(const StateRecord& record) const {
@@ -89,11 +95,10 @@ ErrorClass StateStore::Commit(const StateRecord& record) const {
 	const std::string temporary = directory_ + "/state.json.tmp";
 	struct stat old;
 	if (lstat(temporary.c_str(), &old) == 0 || (errno != ENOENT && errno != ENOTDIR)) return ErrorClass::schema;
-	if (lstat(path.c_str(), &old) == 0) {
-		if (!SecureRegularFile(old)) return ErrorClass::schema;
-		StateRecord previous;
-		if (Load(&previous) != ErrorClass::ok || record.sequence <= previous.sequence) return ErrorClass::schema;
-	} else if (errno != ENOENT && errno != ENOTDIR) return ErrorClass::schema;
+	StateRecord previous;
+	const StateLoadStatus predecessor = Load(&previous);
+	if (predecessor == StateLoadStatus::loaded && record.sequence <= previous.sequence) return ErrorClass::schema;
+	if (predecessor == StateLoadStatus::invalid) return ErrorClass::schema;
 	const int file = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
 	if (file < 0) return ErrorClass::schema;
 	struct stat temporary_status;

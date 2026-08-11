@@ -24,6 +24,12 @@ struct StateRecord {
 ErrorClass ParseStateRecord(const std::string& bytes, StateRecord* record,
 	std::string* canonical, std::string* digest);
 
+// Re-encode only the top-level durable identity fields after authenticating and
+// structurally parsing a complete record.  Historical ledger/snapshot tokens
+// are never searched or rewritten by decimal text.
+ErrorClass ReencodeStateIdentity(const std::string& source, uint64_t new_sequence,
+	uint64_t new_epoch, StateRecord* result);
+
 }  // namespace fogcast
 
 #endif

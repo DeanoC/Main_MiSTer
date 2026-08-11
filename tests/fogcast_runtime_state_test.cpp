@@ -224,6 +224,23 @@ int main() {
 	release_only = ReplaceOnce(release_only, "\"in_flight\":null", "\"in_flight\":{\"operation_id\":\"fedcba9876543210fedcba9876543210\",\"request_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"stage\":\"transitioning\"}");
 	release_only = Checksummed(release_only);
 	assert(fogcast::ParseStateRecord(release_only, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	// A release-only drain and the subsequent no-owner checkpoint deliberately
+	// have no operation to terminalize.  These are the only transitional null
+	// in-flight shapes; every candidate-bearing handoff still needs an identity.
+	std::string release_only_null = Checksummed(ReplaceOnce(release_only,
+		"\"in_flight\":{\"operation_id\":\"fedcba9876543210fedcba9876543210\",\"request_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"stage\":\"transitioning\"}",
+		"\"in_flight\":null"));
+	assert(fogcast::ParseStateRecord(release_only_null, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	// Rebuild from the known canonical idle form so the no-owner shape cannot
+	// accidentally retain an observed core or a content lease.
+	std::string no_owner_null = ReplaceOnce(idle_raw, "\"phase\":\"idle\"", "\"phase\":\"no_owner\"");
+	no_owner_null = ReplaceOnce(no_owner_null, "\"mode\":\"idle\"", "\"mode\":\"recovering\"");
+	no_owner_null = Checksummed(no_owner_null);
+	assert(fogcast::ParseStateRecord(no_owner_null, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+	std::string no_owner_candidate = Checksummed(ReplaceOnce(no_owner_null, "\"candidate\":null", "\"candidate\":{\"session\":\"fedcba9876543210fedcba9876543210\",\"generation\":43,\"mode\":\"fpga_native\"}"));
+	assert(fogcast::ParseStateRecord(no_owner_candidate, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::schema);
+	std::string release_null_candidate = Checksummed(ReplaceOnce(release_only_null, "\"candidate\":null", "\"candidate\":{\"session\":\"fedcba9876543210fedcba9876543210\",\"generation\":43,\"mode\":\"fpga_native\"}"));
+	assert(fogcast::ParseStateRecord(release_null_candidate, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::schema);
 	std::string recovery_releasing = ReplaceOnce(idle_raw, "\"phase\":\"idle\"", "\"phase\":\"releasing\"");
 	recovery_releasing = ReplaceOnce(recovery_releasing, "\"mode\":\"idle\"", "\"mode\":\"recovering\"");
 	recovery_releasing = ReplaceOnce(recovery_releasing, "\"in_flight\":null", "\"in_flight\":{\"operation_id\":\"fedcba9876543210fedcba9876543210\",\"request_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"stage\":\"transitioning\"}");
@@ -258,11 +275,36 @@ int main() {
 	terminal_equals_record = Checksummed(terminal_equals_record);
 	assert(fogcast::ParseStateRecord(terminal_equals_record, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::schema);
 
+	// Epoch adoption changes only the two top-level identity tokens.  In
+	// particular, historical rows whose decimal numbers happen to match either
+	// replacement value remain byte-for-byte intact.
+	fogcast::StateRecord reencoded;
+	assert(fogcast::ReencodeStateIdentity(ledger_raw, ledger_written.sequence + 1,
+		ledger_written.backend_epoch, &reencoded) == fogcast::ErrorClass::ok);
+	assert(reencoded.sequence == ledger_written.sequence + 1 &&
+		reencoded.backend_epoch == ledger_written.backend_epoch);
+	assert(reencoded.canonical.find("\"backend_epoch\":" +
+		std::to_string(ledger_written.backend_epoch) + ",\"sequence\":" +
+		std::to_string(ledger_written.sequence + 1)) != std::string::npos);
+	const size_t source_ledger = ledger_written.canonical.find("\"ledger\":");
+	const size_t result_ledger = reencoded.canonical.find("\"ledger\":");
+	assert(source_ledger != std::string::npos && result_ledger != std::string::npos);
+	assert(ledger_written.canonical.substr(source_ledger) == reencoded.canonical.substr(result_ledger));
+	std::string reencoded_bytes = reencoded.canonical.substr(0, reencoded.canonical.size() - 1) +
+		",\"sha256\":\"" + reencoded.digest + "\"}";
+	assert(fogcast::ParseStateRecord(reencoded_bytes, &probe, &ignored_canonical, &ignored_digest) == fogcast::ErrorClass::ok);
+
 	// Break caught: skipping secure, fsync-backed replacement can resurrect a
 	// stale owner after daemon restart, or allow an attacker-owned symlink.
 	char temporary[] = "/tmp/fogcast-state-XXXXXX";
 	assert(mkdtemp(temporary) != 0);
 	fogcast::StateStore store(temporary);
+	fogcast::StateRecord loaded;
+	// Break caught: a secure, empty service directory is the only absence that
+	// may permit initial state creation.  Null output, missing/unsafe roots,
+	// and every existing unreadable or malformed state are failures instead.
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::not_found);
+	assert(store.Load(0) == fogcast::StateLoadStatus::invalid);
 	fogcast::StateRecord written;
 	std::string state_canonical;
 	std::string state_digest;
@@ -275,15 +317,36 @@ int main() {
 	}
 	assert(written.sequence == 21);
 	assert(store.Commit(written) == fogcast::ErrorClass::ok);
-	fogcast::StateRecord loaded;
-	assert(store.Load(&loaded) == fogcast::ErrorClass::ok);
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::loaded);
 	assert(loaded.sequence == written.sequence);
 	const std::string record_path = std::string(temporary) + "/state.json";
 	const std::string prior_bytes = ReadFile(record_path);
 	std::string bad_checksum = prior_bytes;
 	bad_checksum[bad_checksum.size() - 3] = bad_checksum[bad_checksum.size() - 3] == '0' ? '1' : '0';
 	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << bad_checksum; }
-	assert(store.Load(&loaded) == fogcast::ErrorClass::checksum);
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
+	// Break caught: commit must not replace a corrupt predecessor, even when its
+	// proposed successor is valid and monotonically sequenced.
+	assert(store.Commit(ledger_written) == fogcast::ErrorClass::schema);
+	assert(ReadFile(record_path) == bad_checksum);
+	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << prior_bytes; }
+	// Break caught: an existing file is never indistinguishable from initial
+	// absence.  Even internally consistent but unsupported versions/sequences
+	// must block replacement.
+	const std::string bad_version = Checksummed(ReplaceOnce(prior_bytes,
+		"\"record_version\":1", "\"record_version\":2"));
+	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << bad_version; }
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
+	const std::string zero_sequence = Checksummed(RootSequence(prior_bytes, "0"));
+	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << zero_sequence; }
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
+	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << "{"; }
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
+	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << ""; }
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
+	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc);
+		output << std::string(256 * 1024 + 1, 'x'); }
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
 	{ std::ofstream output(record_path.c_str(), std::ios::binary | std::ios::trunc); output << prior_bytes; }
 	// A stale generation must never overwrite a newer durable commit.
 	assert(store.Commit(written) == fogcast::ErrorClass::schema);
@@ -292,16 +355,23 @@ int main() {
 	assert(store.Commit(tampered) == fogcast::ErrorClass::schema);
 	assert(ReadFile(record_path) == prior_bytes);
 	assert(chmod(record_path.c_str(), 0400) == 0);
-	assert(store.Load(&loaded) == fogcast::ErrorClass::schema);
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
 	assert(chmod(record_path.c_str(), 0600) == 0);
 	assert(chmod(temporary, 0755) == 0);
-	assert(store.Load(&loaded) == fogcast::ErrorClass::schema);
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
 	assert(chmod(temporary, 0700) == 0);
 	assert(unlink(record_path.c_str()) == 0);
 	assert(symlink("/dev/null", record_path.c_str()) == 0);
-	assert(store.Load(&loaded) == fogcast::ErrorClass::schema);
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
 	assert(unlink(record_path.c_str()) == 0);
+	assert(mkdir(record_path.c_str(), 0600) == 0);
+	assert(store.Load(&loaded) == fogcast::StateLoadStatus::invalid);
+	assert(rmdir(record_path.c_str()) == 0);
 	assert(rmdir(temporary) == 0);
+
+	char missing_root[] = "/tmp/fogcast-state-missing-XXXXXX";
+	assert(mkdtemp(missing_root) != 0 && rmdir(missing_root) == 0);
+	assert(fogcast::StateStore(missing_root).Load(&loaded) == fogcast::StateLoadStatus::invalid);
 
 	// A restrictive final mode must survive a maximally restrictive process
 	// umask.  The scope restores the process umask before any assertion can
@@ -320,7 +390,7 @@ int main() {
 		restrictive_commit = fogcast::StateStore(durable).Commit(written) == fogcast::ErrorClass::ok;
 		restrictive_mode = stat(durable_path.c_str(), &durable_status) == 0 && (durable_status.st_mode & 0777) == 0600;
 		fogcast::StateRecord restrictive_record;
-		restrictive_load = fogcast::StateStore(durable).Load(&restrictive_record) == fogcast::ErrorClass::ok && restrictive_record.sequence == written.sequence;
+		restrictive_load = fogcast::StateStore(durable).Load(&restrictive_record) == fogcast::StateLoadStatus::loaded && restrictive_record.sequence == written.sequence;
 	}
 	assert(restrictive_commit && restrictive_mode && restrictive_load);
 	const std::string durable_prior = ReadFile(durable_path);
