@@ -33,6 +33,8 @@ public:
 	virtual bool FailFirstPostBindEntryStat() { return false; }
 	virtual bool FailPostBindValidation() { return false; }
 	virtual bool InterruptPoll() { return false; }
+	// Models a signal after Poll's entry latch and before its blocking wait.
+	virtual bool RequestDrainAfterEntryLatch() { return false; }
 	// Each call models one interrupted transport syscall. Test hooks may return
 	// true once or repeatedly; production leaves both disabled.
 	virtual bool InterruptRead() { return false; }
@@ -52,6 +54,7 @@ struct RuntimeServerConfig {
 
 enum class ServerResult {
 	ok,
+	drained,
 	invalid_argument,
 	unsafe_parent,
 	unsafe_lock,
@@ -73,8 +76,8 @@ public:
 	// the verified parent and singleton lock before inspecting a socket. A
 	// non-ok result leaves no server-owned socket behind.
 	ServerResult Start();
-	// Serves one readiness interval.  It accepts and closes excess clients; a
-	// framed client stays sequential until it closes or violates the contract.
+	// Serves one readiness interval. After Start publishes descriptors, this
+	// never closes them: drained and fatal results transfer cleanup to main.
 	ServerResult Poll(uint32_t timeout_ms);
 	// Signal handlers call only this method's async-safe wake source in the
 	// process wrapper; it does not synthesize a coordinator mutation.

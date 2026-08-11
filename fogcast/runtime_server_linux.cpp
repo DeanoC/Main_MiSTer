@@ -61,6 +61,13 @@ public:
 			size != sizeof(credential)) return false;
 		*uid = static_cast<uint32_t>(credential.uid);
 		return true;
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+		uid_t peer_uid;
+		gid_t peer_gid;
+		if (getpeereid(descriptor, &peer_uid, &peer_gid) != 0) return false;
+		(void)peer_gid;
+		*uid = static_cast<uint32_t>(peer_uid);
+		return true;
 #else
 		(void)descriptor; (void)uid;
 		return false;
@@ -654,7 +661,13 @@ RuntimeServer::RuntimeServer(const RuntimeServerConfig& config, Coordinator* coo
 	ServerCredentials* credentials, ServerClock* clock, ServerTestHooks* test_hooks)
 	: state_(new State(config, coordinator, credentials, clock, test_hooks)) {}
 
-RuntimeServer::~RuntimeServer() { Close(); delete state_; }
+RuntimeServer::~RuntimeServer() {
+	if (state_->directory_fd >= 0 || state_->lock_fd >= 0 || state_->listener_fd >= 0 ||
+		state_->active_client_fd >= 0 || state_->wake_read_fd >= 0 ||
+		state_->wake_write_fd >= 0 || state_->worker.joinable() || state_->socket_retained)
+		Close();
+	delete state_;
+}
 
 bool RuntimeServer::ValidFrameLength(uint32_t length) { return length != 0 && length <= kFrameLimit; }
 
@@ -788,16 +801,19 @@ ServerResult RuntimeServer::Start() {
 	return ServerResult::ok;
 }
 
+static void LatchDrainRequest(RuntimeServer::State* state) {
+	std::lock_guard<std::mutex> lock(state->mutex);
+	if (state->drain_signal) { state->drain = true; state->drain_signal = 0; }
+}
+
 ServerResult RuntimeServer::Poll(uint32_t timeout_ms) {
 	if (state_->listener_fd < 0) return ServerResult::invalid_argument;
-	if (!VerifyConfiguredParent(state_)) { Close(); return ServerResult::unsafe_parent; }
-	if (!VerifyLock(state_)) { Close(); return ServerResult::unsafe_lock; }
-	if (!VerifySocketEntry(state_)) { Close(); return ServerResult::unsafe_socket; }
+	if (!VerifyConfiguredParent(state_)) return ServerResult::unsafe_parent;
+	if (!VerifyLock(state_)) return ServerResult::unsafe_lock;
+	if (!VerifySocketEntry(state_)) return ServerResult::unsafe_socket;
 	CollectWorkerResponse(state_);
-	{
-		std::lock_guard<std::mutex> lock(state_->mutex);
-		if (state_->drain_signal) { state_->drain = true; state_->drain_signal = 0; }
-	}
+	LatchDrainRequest(state_);
+	if (state_->test_hooks && state_->test_hooks->RequestDrainAfterEntryLatch()) RequestDrain();
 	if (state_->client_phase == State::ClientPhase::dispatch_wait) DispatchPayload(state_);
 	if (state_->active_client_fd >= 0 && state_->client_phase != State::ClientPhase::worker_wait &&
 		state_->client_phase != State::ClientPhase::dispatch_wait && state_->client_deadline != 0 &&
@@ -830,6 +846,9 @@ ServerResult RuntimeServer::Poll(uint32_t timeout_ms) {
 	}
 	if (ready > 0 && (items[2].revents & POLLIN) != 0) {
 		char bytes[64]; while (read(state_->wake_read_fd, bytes, sizeof(bytes)) > 0) {}
+		// The wake byte and signal flag form one notification. Re-latch after
+		// draining the edge so an arrival after the entry latch cannot be lost.
+		LatchDrainRequest(state_);
 	}
 	if (ready > 0 && (items[0].revents & POLLIN) != 0) AcceptAll(state_);
 	const short client_events = items[1].revents;
@@ -875,7 +894,7 @@ ServerResult RuntimeServer::Poll(uint32_t timeout_ms) {
 	// was given priority over the probe, and after any response can be sent.
 	if (drain_ready && !response_pending && state_->client_phase != State::ClientPhase::response_write &&
 		state_->client_phase != State::ClientPhase::worker_wait &&
-		state_->client_phase != State::ClientPhase::dispatch_wait) { Close(); return ServerResult::ok; }
+		state_->client_phase != State::ClientPhase::dispatch_wait) return ServerResult::drained;
 	return ServerResult::ok;
 }
 

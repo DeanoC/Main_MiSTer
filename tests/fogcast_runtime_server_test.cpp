@@ -51,9 +51,11 @@ struct FailFirstPostBindStat : public fogcast::ServerTestHooks {
 	uint64_t interrupt_advance_ms;
 	bool stall_send;
 	uint32_t send_budget;
+	bool request_drain_after_entry;
 	FailFirstPostBindStat() : fail_first(true), fail_validation(false), interrupt_poll(false),
 		interrupt_read_count(0), interrupt_send_count(0), interrupt_read_calls(0), interrupt_send_calls(0),
-		interrupt_clock(0), interrupt_advance_ms(0), stall_send(false), send_budget(0) {}
+		interrupt_clock(0), interrupt_advance_ms(0), stall_send(false), send_budget(0),
+		request_drain_after_entry(false) {}
 	bool FailFirstPostBindEntryStat() override {
 		if (!fail_first) return false;
 		fail_first = false;
@@ -87,6 +89,11 @@ struct FailFirstPostBindStat : public fogcast::ServerTestHooks {
 		const uint32_t allowed = requested < send_budget ? requested : send_budget;
 		send_budget -= allowed;
 		return allowed;
+	}
+	bool RequestDrainAfterEntryLatch() override {
+		if (!request_drain_after_entry) return false;
+		request_drain_after_entry = false;
+		return true;
 	}
 };
 
@@ -199,8 +206,15 @@ void PumpUntilReadable(fogcast::RuntimeServer* server, int client) {
 }
 
 void PumpUntilClosed(fogcast::RuntimeServer* server) {
-	for (unsigned int attempt = 0; attempt != 1000 && server->running(); ++attempt)
-		assert(server->Poll(1) == fogcast::ServerResult::ok);
+	bool drained = false;
+	for (unsigned int attempt = 0; attempt != 1000 && !drained; ++attempt) {
+		const fogcast::ServerResult result = server->Poll(1);
+		assert(result == fogcast::ServerResult::ok || result == fogcast::ServerResult::drained);
+		drained = result == fogcast::ServerResult::drained;
+	}
+	assert(drained);
+	assert(server->running());
+	server->Close();
 	assert(!server->running());
 }
 
@@ -266,6 +280,30 @@ int main() {
 	assert(fogcast::RuntimeServer::ValidFrameLength(1) == true);
 	assert(fogcast::RuntimeServer::ValidFrameLength(65536) == true);
 	assert(fogcast::RuntimeServer::ValidFrameLength(65537) == false);
+
+	// A drain arriving after Poll's entry latch must not lose its only wake
+	// edge and then wait for another external event.
+	const std::string latch_directory = TemporaryDirectory();
+	fogcast::BackendFence latch_fence(latch_directory);
+	assert(latch_fence.Commit(fogcast::BackendFence::Record(1, "native", 1)) == fogcast::ErrorClass::ok);
+	NeutralPlatform latch_platform;
+	fogcast::Coordinator latch_coordinator(latch_directory, &latch_fence, &latch_platform);
+	assert(latch_coordinator.Initialize(1) == fogcast::ErrorClass::ok);
+	fogcast::RuntimeServerConfig latch_config;
+	latch_config.parent_directory = latch_directory;
+	latch_config.service_uid = static_cast<uint32_t>(geteuid());
+	FailFirstPostBindStat latch_hook;
+	latch_hook.fail_first = false;
+	latch_hook.request_drain_after_entry = true;
+	fogcast::RuntimeServer latch_server(latch_config, &latch_coordinator, 0, 0, &latch_hook);
+	assert(latch_server.Start() == fogcast::ServerResult::ok);
+	assert(latch_server.Poll(100) == fogcast::ServerResult::ok);
+	assert(latch_server.Poll(100) == fogcast::ServerResult::drained);
+	latch_server.Close();
+	assert(unlink((latch_directory + "/fogcast-runtime.lock").c_str()) == 0);
+	assert(unlink((latch_directory + "/state.json").c_str()) == 0);
+	assert(unlink((latch_directory + "/backend-fence.json").c_str()) == 0);
+	assert(rmdir(latch_directory.c_str()) == 0);
 
 	// Break caught: accepting a parent, singleton lock, or socket alias leaves
 	// later pathname operations vulnerable to replacement before admission.
@@ -426,6 +464,7 @@ int main() {
 	assert(bind(replacement_fd, reinterpret_cast<const struct sockaddr*>(&replacement_address), sizeof(replacement_address)) == 0);
 	assert(umask(replacement_umask) == 0177);
 	assert(replaced_socket_server.Poll(0) == fogcast::ServerResult::unsafe_socket);
+	assert(replaced_socket_server.running());
 	replaced_socket_server.Close();
 	assert(lstat(replacement_path.c_str(), &post_bind_stat) == 0);
 	assert(S_ISSOCK(post_bind_stat.st_mode));
@@ -448,6 +487,8 @@ int main() {
 	const int replacement_lock_fd = open(lock_replacement_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
 	assert(replacement_lock_fd >= 0);
 	assert(lock_replacement_server.Poll(0) == fogcast::ServerResult::unsafe_lock);
+	assert(lock_replacement_server.running());
+	lock_replacement_server.Close();
 	assert(lstat(lock_replacement_path.c_str(), &post_bind_stat) == 0);
 	close(replacement_lock_fd);
 	assert(unlink(lock_replacement_path.c_str()) == 0);
@@ -465,6 +506,8 @@ int main() {
 	assert(rename(parent_replacement_directory.c_str(), moved_parent_directory.c_str()) == 0);
 	assert(mkdir(parent_replacement_directory.c_str(), 0700) == 0);
 	assert(parent_replacement_server.Poll(0) == fogcast::ServerResult::unsafe_parent);
+	assert(parent_replacement_server.running());
+	parent_replacement_server.Close();
 	assert(lstat((moved_parent_directory + "/" + parent_replacement_config.socket_name).c_str(), &post_bind_stat) != 0);
 	assert(unlink((moved_parent_directory + "/" + parent_replacement_config.lock_name).c_str()) == 0);
 	assert(rmdir(moved_parent_directory.c_str()) == 0);
@@ -696,10 +739,17 @@ int main() {
 	assert(idle_server.Poll(0) == fogcast::ServerResult::ok);
 	idle_server.RequestDrain();
 	WriteAll(drain_client, drain_frame.data(), drain_frame.size());
-	for (unsigned int attempt = 0; attempt != 20 && idle_server.running(); ++attempt)
-		assert(idle_server.Poll(10) == fogcast::ServerResult::ok);
+	bool idle_drained = false;
+	for (unsigned int attempt = 0; attempt != 20 && !idle_drained; ++attempt) {
+		const fogcast::ServerResult result = idle_server.Poll(10);
+		assert(result == fogcast::ServerResult::ok || result == fogcast::ServerResult::drained);
+		idle_drained = result == fogcast::ServerResult::drained;
+	}
+	assert(idle_drained);
 	assert(ReadFrame(drain_client).find("\"request_id\":6") != std::string::npos);
 	close(drain_client);
+	assert(idle_server.running());
+	idle_server.Close();
 	assert(!idle_server.running());
 	assert(lstat((idle_directory + "/" + idle_config.socket_name).c_str(), &socket_stat) != 0);
 	assert(unlink((idle_directory + "/" + idle_config.lock_name).c_str()) == 0);

@@ -40,6 +40,10 @@ FOGCAST_COORDINATOR_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_coordinator.o
 FOGCAST_FENCE_OBJECT = $(HOST_TEST_DIR)/fogcast_backend_fence_linux.o
 FOGCAST_SERVER_TEST_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_server_test.o
 FOGCAST_SERVER_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_server_linux.o
+FOGCAST_MAIN_TEST_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_main_test.o
+FOGCAST_MAIN_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_main.o
+FOGCAST_PLATFORM_FAKE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_platform_fake.o
+FOGCAST_PLATFORM_UNAVAILABLE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_platform_unavailable.o
 HOST_TEST_INCLUDE = $(if $(filter Darwin,$(shell uname -s)),-Itests/include)
 HOST_EXIT_COMPAT = $(if $(filter Darwin,$(shell uname -s)),,-D_Exit=_exit)
 SCHEDULER_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) $(HOST_TEST_INCLUDE)
@@ -50,7 +54,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean test-runtime-smoke test-runtime test-scheduler test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize
+.PHONY: clean test-runtime-smoke test-runtime test-scheduler test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 test-fogcast-protocol: $(HOST_TEST_DIR)/fogcast_runtime_protocol_test
 	$(HOST_TEST_DIR)/fogcast_runtime_protocol_test
@@ -78,6 +82,15 @@ test-fogcast-server: $(HOST_TEST_DIR)/fogcast_runtime_server_test
 
 test-fogcast-server-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/server-sanitize HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-fogcast-server
+
+test-fogcast-main: $(HOST_TEST_DIR)/fogcast_runtime_main_test \
+	$(HOST_TEST_DIR)/fogcast-runtime-host-test $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test
+	perl -e 'alarm 90; exec @ARGV' $(HOST_TEST_DIR)/fogcast_runtime_main_test \
+		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-host-test) \
+		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test)
+
+test-fogcast-main-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/main-sanitize HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-fogcast-main
 
 test-runtime-smoke: $(HOST_TEST_DIR)/mister_runtime_c99_smoke \
 	$(HOST_TEST_DIR)/mister_runtime_cpp14_smoke
@@ -155,6 +168,18 @@ $(FOGCAST_FENCE_OBJECT): fogcast/backend_fence_linux.cpp fogcast/backend_fence.h
 $(FOGCAST_SERVER_OBJECT): fogcast/runtime_server_linux.cpp fogcast/runtime_server.hpp fogcast/runtime_coordinator.hpp fogcast/runtime_protocol.hpp | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
 
+$(FOGCAST_MAIN_TEST_OBJECT): tests/fogcast_runtime_main_test.cpp fogcast/backend_fence.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(FOGCAST_MAIN_OBJECT): fogcast/runtime_main.cpp fogcast/runtime_platform_factory.hpp fogcast/runtime_server.hpp fogcast/runtime_coordinator.hpp fogcast/backend_fence.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DFOGCAST_RUNTIME_HOST_TEST -I. -c $< -o $@
+
+$(FOGCAST_PLATFORM_FAKE_OBJECT): fogcast/runtime_platform_fake.cpp fogcast/runtime_platform_factory.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DFOGCAST_RUNTIME_HOST_TEST -I. -c $< -o $@
+
+$(FOGCAST_PLATFORM_UNAVAILABLE_OBJECT): fogcast/runtime_platform_unavailable.cpp fogcast/runtime_platform_factory.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
 $(HOST_TEST_DIR)/fogcast_runtime_coordinator_test: $(FOGCAST_COORDINATOR_TEST_OBJECT) $(FOGCAST_COORDINATOR_OBJECT) $(FOGCAST_FENCE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT) $(FOGCAST_STATE_OBJECT) $(FOGCAST_STORE_OBJECT) $(RUNTIME_OBJECT) $(RUNTIME_V2_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
@@ -168,6 +193,19 @@ $(HOST_TEST_DIR)/fogcast_runtime_state_test: $(FOGCAST_STATE_TEST_OBJECT) $(FOGC
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(HOST_TEST_DIR)/fogcast_runtime_server_test: $(FOGCAST_SERVER_TEST_OBJECT) $(FOGCAST_SERVER_OBJECT) $(FOGCAST_COORDINATOR_OBJECT) $(FOGCAST_FENCE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT) $(FOGCAST_STATE_OBJECT) $(FOGCAST_STORE_OBJECT) $(RUNTIME_OBJECT) $(RUNTIME_V2_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+FOGCAST_MAIN_COMMON_OBJECTS = $(FOGCAST_MAIN_OBJECT) $(FOGCAST_SERVER_OBJECT) \
+	$(FOGCAST_COORDINATOR_OBJECT) $(FOGCAST_FENCE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT) \
+	$(FOGCAST_STATE_OBJECT) $(FOGCAST_STORE_OBJECT) $(RUNTIME_OBJECT) $(RUNTIME_V2_OBJECT)
+
+$(HOST_TEST_DIR)/fogcast-runtime-host-test: $(FOGCAST_MAIN_COMMON_OBJECTS) $(FOGCAST_PLATFORM_FAKE_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/fogcast-runtime-unavailable-test: $(FOGCAST_MAIN_COMMON_OBJECTS) $(FOGCAST_PLATFORM_UNAVAILABLE_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/fogcast_runtime_main_test: $(FOGCAST_MAIN_TEST_OBJECT) $(FOGCAST_FENCE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(RUNTIME_OBJECT): runtime/mister_runtime.cpp runtime/mister_runtime.h \

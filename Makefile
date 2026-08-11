@@ -1,7 +1,7 @@
 # makefile to fail if any command in pipe is failed.
 SHELL = /bin/bash -o pipefail
 
-JOBS ?= $(shell nproc)
+JOBS ?= $(shell command -v nproc >/dev/null 2>&1 && nproc || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 MAKEFLAGS += -j $(JOBS)
 
 # using gcc version 10.2.1
@@ -62,6 +62,13 @@ RUNTIME_PUBLIC_SYMBOLS = MisterRuntime_ABIVersion MisterRuntime_Create \
 	MisterRuntime_TickV2 MisterRuntime_ObserveV2 MisterRuntime_StatusV2 \
 	MisterRuntime_StopV2 MisterRuntime_DestroyV2 MisterRuntime_RecoverPlatformV2
 
+FOGCAST_RUNTIME_SRC = fogcast/runtime_main.cpp fogcast/runtime_server_linux.cpp \
+	fogcast/runtime_coordinator.cpp fogcast/backend_fence_linux.cpp \
+	fogcast/runtime_protocol.cpp fogcast/runtime_state.cpp \
+	fogcast/runtime_store_linux.cpp fogcast/runtime_platform_unavailable.cpp
+FOGCAST_RUNTIME_OBJ = $(FOGCAST_RUNTIME_SRC:%.cpp=$(BUILDDIR)/%.cpp.o)
+FOGCAST_RUNTIME_DEP = $(FOGCAST_RUNTIME_SRC:%.cpp=$(BUILDDIR)/%.cpp.d)
+
 CPP_SRC = $(filter-out $(RUNTIME_SRC),$(wildcard *.cpp)) \
           $(wildcard ./lib/serial_server/library/*.cpp) \
           $(wildcard ./support/*/*.cpp)
@@ -72,7 +79,7 @@ IMLIB2_LIB  = -Llib/imlib2 -lfreetype -lbz2 -lpng16 -lz -lImlib2
 
 OBJ	= $(C_SRC:%.c=$(BUILDDIR)/%.c.o) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.o) $(IMG:%.png=$(BUILDDIR)/%.png.o)
 DEP	= $(C_SRC:%.c=$(BUILDDIR)/%.c.d) $(CPP_SRC:%.cpp=$(BUILDDIR)/%.cpp.d) \
-	$(RUNTIME_DEP)
+	$(RUNTIME_DEP) $(FOGCAST_RUNTIME_DEP)
 
 ifneq ($(origin VDATE),command line)
 $(error VDATE must be supplied as six ASCII YYMMDD digits)
@@ -108,9 +115,39 @@ ifneq ($(DEBUG),1)
 	$(Q)$(STRIP) $@
 endif
 
-.PHONY: clean check-runtime-archive
+.PHONY: clean check-runtime-archive fogcast-runtime fogcast-runtime-host-test fogcast-runtime-dep-test
 clean:
 	$(Q)rm -rf bin
+
+fogcast-runtime: $(BUILDDIR)/fogcast-runtime
+
+fogcast-runtime-host-test:
+	$(Q)$(MAKE) -f tests/Makefile HOST_TEST_DIR=bin/fogcast-runtime-host-tests test-fogcast-main
+
+fogcast-runtime-dep-test:
+	$(Q)set -e; \
+	dep_root="$$(mktemp -d "$${TMPDIR:-/tmp}/fogcast-runtime-deps.XXXXXX")"; \
+	case "$${dep_root}" in */fogcast-runtime-deps.*) ;; *) exit 1 ;; esac; \
+	trap 'rm -rf -- "$${dep_root}"' EXIT; \
+	cp Makefile "$${dep_root}/"; cp -R fogcast runtime tests "$${dep_root}/"; \
+	cd "$${dep_root}"; \
+	$(MAKE) -s VDATE=$(VDATE) CXX=c++ CC=cc BUILDDIR=dep-bin RUNTIME_DEP= \
+		dep-bin/fogcast/runtime_main.cpp.d \
+		dep-bin/fogcast/runtime_server_linux.cpp.d \
+		dep-bin/fogcast/runtime_coordinator.cpp.d \
+		dep-bin/fogcast/runtime_platform_unavailable.cpp.d; \
+	check_rebuild() { \
+		object="$$1"; header="$$2"; touch "$${object}"; sleep 1; touch "$${header}"; \
+		code=0; $(MAKE) -s VDATE=$(VDATE) CXX=c++ CC=cc BUILDDIR=dep-bin RUNTIME_DEP= -q "$${object}" || code=$$?; \
+		test "$${code}" -eq 1 || { echo "dependency rebuild check failed: $${object} ($${code})" >&2; exit 1; }; \
+	}; \
+	check_rebuild dep-bin/fogcast/runtime_platform_unavailable.cpp.o fogcast/runtime_platform_factory.hpp; \
+	check_rebuild dep-bin/fogcast/runtime_server_linux.cpp.o fogcast/runtime_server.hpp; \
+	check_rebuild dep-bin/fogcast/runtime_coordinator.cpp.o fogcast/runtime_coordinator.hpp
+
+$(BUILDDIR)/fogcast-runtime: $(FOGCAST_RUNTIME_OBJ) $(RUNTIME_ARCHIVE)
+	$(Q)$(info $@)
+	$(Q)$(CXX) -o $@ $^ -lpthread -lrt
 
 check-runtime-archive: $(RUNTIME_ARCHIVE) $(RUNTIME_C99_SMOKE) \
 	$(RUNTIME_CPP14_SMOKE) $(RUNTIME_V2_C99_SMOKE) $(RUNTIME_V2_CPP14_SMOKE)
@@ -203,6 +240,11 @@ $(BUILDDIR)/runtime/%.cpp.d: runtime/%.cpp
 	@mkdir -p $(dir $@)
 	$(Q)$(CXX) $(DFLAGS) -MM $< -MT $@ -MT $(BUILDDIR)/runtime/$*.cpp.o \
 		-MF $@ 2>&1 | $(OUTPUT_FILTER)
+
+$(FOGCAST_RUNTIME_DEP): $(BUILDDIR)/fogcast/%.cpp.d: fogcast/%.cpp
+	@mkdir -p $(dir $@)
+	$(Q)$(CXX) $(DFLAGS) -std=gnu++14 -MM $< -MT $@ \
+		-MT $(BUILDDIR)/fogcast/$*.cpp.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
 
 # Ensure correct time stamp
 $(BUILDDIR)/main.cpp.o: $(RUNTIME_HEADERS) \
