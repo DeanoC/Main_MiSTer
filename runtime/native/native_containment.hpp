@@ -13,26 +13,45 @@ namespace native {
 
 class NativeContainmentIo {
 public:
+	class Access final {
+	public:
+		~Access() {}
+		Access(const Access &) = delete;
+		Access &operator=(const Access &) = delete;
+		uint64_t absolute_deadline_ms() const
+		{
+			return absolute_deadline_ms_;
+		}
+
+	private:
+		friend class NativeContainment;
+		explicit Access(uint64_t absolute_deadline_ms)
+			: absolute_deadline_ms_(absolute_deadline_ms) {}
+		uint64_t absolute_deadline_ms_;
+	};
+
 	virtual ~NativeContainmentIo() {}
 
 private:
 	friend class NativeContainment;
-	virtual Result WriteCoreReset(const HardwareLeaseView &view,
+	virtual Result WriteCoreReset(const Access &access,
 		uint32_t mask, uint32_t value) = 0;
-	virtual Result WriteInterfaceModule(const HardwareLeaseView &view,
+	virtual Result WriteInterfaceModule(const Access &access,
 		uint32_t value) = 0;
-	virtual Result WriteSdrPortControl(const HardwareLeaseView &view,
+	virtual Result WriteSdrPortControl(const Access &access,
 		uint32_t offset, uint32_t value) = 0;
-	virtual Result WriteBridgeReset(const HardwareLeaseView &view,
+	virtual Result WriteBridgeReset(const Access &access,
 		uint32_t value) = 0;
-	virtual Result WriteRemap(const HardwareLeaseView &view,
+	virtual Result WriteRemap(const Access &access,
 		uint32_t value) = 0;
-	virtual Result ReadCoreGpo(uint32_t *value) = 0;
-	virtual Result ReadInterfaceModule(uint32_t *value) = 0;
-	virtual Result ReadSdrPortControl(uint32_t offset, uint32_t *value) = 0;
-	virtual Result ReadBridgeReset(uint32_t *value) = 0;
-	virtual Result ReadRemap(uint32_t *value) = 0;
-	virtual Result ReleaseMappings(const HardwareLeaseView &view) = 0;
+	virtual Result ReadCoreGpo(const Access &access, uint32_t *value) = 0;
+	virtual Result ReadInterfaceModule(const Access &access,
+		uint32_t *value) = 0;
+	virtual Result ReadSdrPortControl(const Access &access, uint32_t offset,
+		uint32_t *value) = 0;
+	virtual Result ReadBridgeReset(const Access &access, uint32_t *value) = 0;
+	virtual Result ReadRemap(const Access &access, uint32_t *value) = 0;
+	virtual Result ReleaseMappings(const Access &access) = 0;
 };
 
 class NativeContainment final {
@@ -65,6 +84,8 @@ private:
 
 	HardwareBroker &broker_;
 	NativeContainmentIo &io_;
+	Values pending_release_values_;
+	std::unique_ptr<ContainmentResumeKey> pending_release_;
 };
 
 } // namespace native

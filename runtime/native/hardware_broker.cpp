@@ -955,6 +955,70 @@ Result HardwareBroker::ValidateContainmentBoundary(
 		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
 }
 
+Result HardwareBroker::MintContainmentResumeKey(
+	const HardwareLeaseView &view,
+	std::unique_ptr<ContainmentResumeKey> *key)
+{
+	if (key == nullptr || key->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->operation_kind != OperationKind::terminal_fpga_cleanup ||
+		active_lease_count_ != 1 || terminal_lease_count_ != 1)
+		return MISTER_RESULT_INVALID_STATE;
+	const bool cleanup =
+		registration->authority == LeaseAuthority::cleanup_epoch &&
+		registration->authority_identity == cleanup_identity_ &&
+		state_ == State::cleanup && cleanup_registered_;
+	const bool recovery =
+		registration->authority == LeaseAuthority::recovery_epoch &&
+		registration->authority_identity == recovery_identity_ &&
+		state_ == State::recovery && recovery_registered_ &&
+		!recovery_terminal_neutral_;
+	if (!cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+	std::unique_ptr<ContainmentResumeKey> minted(
+		new (std::nothrow) ContainmentResumeKey(*this,
+			registration->authority, registration->authority_identity,
+			cleanup ? generation_ : 0, lifetime_));
+	if (!minted) return MISTER_RESULT_PLATFORM;
+	*key = std::move(minted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::ValidateContainmentResumeKey(
+	const ContainmentResumeKey &key,
+	const OperationLease &terminal_lease)
+{
+	const std::shared_ptr<BrokerLifetime> key_lifetime = key.lifetime_.lock();
+	if (!key_lifetime || key.broker_ != this ||
+		key_lifetime.get() != lifetime_.get())
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		terminal_lease.registration_;
+	if (!hardware_transaction_active_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->lifetime.get() != key_lifetime.get() ||
+		registration->operation_kind != OperationKind::terminal_fpga_cleanup ||
+		registration->authority != key.authority_ ||
+		registration->authority_identity != key.authority_identity_ ||
+		active_lease_count_ != 1 || terminal_lease_count_ != 1)
+		return MISTER_RESULT_INVALID_STATE;
+	const bool cleanup = key.authority_ == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && cleanup_registered_ &&
+		cleanup_identity_ == key.authority_identity_ &&
+		generation_ == key.generation_;
+	const bool recovery = key.authority_ == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery && recovery_registered_ &&
+		recovery_identity_ == key.authority_identity_ &&
+		key.generation_ == 0 && !recovery_terminal_neutral_;
+	return cleanup || recovery ? MISTER_RESULT_OK :
+		MISTER_RESULT_INVALID_STATE;
+}
+
 Result HardwareBroker::StageContainmentEvidence(
 	const OperationLease &terminal_lease, uint32_t core_gpo,
 	uint32_t interface_module, uint32_t sdr_port_control,

@@ -47,6 +47,7 @@ class NativeInput;
 class NativeSpiBus;
 class NativeContainment;
 class NativeRecovery;
+class ContainmentResumeKey;
 enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
 struct OperationRegistration;
@@ -156,6 +157,30 @@ private:
 	bool registered_;
 };
 
+class ContainmentResumeKey final {
+public:
+	~ContainmentResumeKey() {}
+	ContainmentResumeKey(const ContainmentResumeKey &) = delete;
+	ContainmentResumeKey &operator=(const ContainmentResumeKey &) = delete;
+	ContainmentResumeKey(ContainmentResumeKey &&) = delete;
+	ContainmentResumeKey &operator=(ContainmentResumeKey &&) = delete;
+
+private:
+	friend class HardwareBroker;
+	friend class NativeContainment;
+	ContainmentResumeKey(HardwareBroker &broker, LeaseAuthority authority,
+		uint64_t authority_identity, PlatformGenerationId generation,
+		const std::shared_ptr<BrokerLifetime> &lifetime)
+		: broker_(&broker), lifetime_(lifetime), authority_(authority),
+		  authority_identity_(authority_identity), generation_(generation) {}
+
+	HardwareBroker *broker_;
+	std::weak_ptr<BrokerLifetime> lifetime_;
+	LeaseAuthority authority_;
+	uint64_t authority_identity_;
+	PlatformGenerationId generation_;
+};
+
 class HardwareBroker final {
 public:
 	explicit HardwareBroker(NativeClock &clock);
@@ -247,6 +272,10 @@ private:
 	Result ValidateRecoveryContainmentAuthority(const RecoveryEpoch &epoch,
 		const OperationLease &terminal_lease);
 	Result ValidateContainmentBoundary(const HardwareLeaseView &view);
+	Result MintContainmentResumeKey(const HardwareLeaseView &view,
+		std::unique_ptr<ContainmentResumeKey> *key);
+	Result ValidateContainmentResumeKey(const ContainmentResumeKey &key,
+		const OperationLease &terminal_lease);
 	Result StageContainmentEvidence(const OperationLease &terminal_lease,
 		uint32_t core_gpo, uint32_t interface_module,
 		uint32_t sdr_port_control, uint32_t bridge_reset, uint32_t remap,

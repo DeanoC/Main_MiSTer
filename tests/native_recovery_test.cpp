@@ -101,51 +101,52 @@ public:
 			advance_clock->SetNow(6000);
 		return calls == fail_at ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
 	}
-	Result WriteCoreReset(const HardwareLeaseView &, uint32_t mask,
+	Result WriteCoreReset(const Access &, uint32_t mask,
 		uint32_t value) override
 	{
 		assert(mask == 0xc0000000u && value == 0x40000000u);
 		++writes;
 		return Step();
 	}
-	Result WriteInterfaceModule(const HardwareLeaseView &, uint32_t value) override
+	Result WriteInterfaceModule(const Access &, uint32_t value) override
 	{
 		assert(value == 0); ++writes; return Step();
 	}
-	Result WriteSdrPortControl(const HardwareLeaseView &, uint32_t offset,
+	Result WriteSdrPortControl(const Access &, uint32_t offset,
 		uint32_t value) override
 	{
 		assert(offset == 0x5080u && value == 0); ++writes; return Step();
 	}
-	Result WriteBridgeReset(const HardwareLeaseView &, uint32_t value) override
+	Result WriteBridgeReset(const Access &, uint32_t value) override
 	{
 		assert(value == 7); ++writes; return Step();
 	}
-	Result WriteRemap(const HardwareLeaseView &, uint32_t value) override
+	Result WriteRemap(const Access &, uint32_t value) override
 	{
 		assert(value == 1); ++writes; return Step();
 	}
-	Result ReadCoreGpo(uint32_t *value) override
+	Result ReadCoreGpo(const Access &, uint32_t *value) override
 	{
 		++reads; const Result result = Step(); if (result == MISTER_RESULT_OK) *value = core; return result;
 	}
-	Result ReadInterfaceModule(uint32_t *value) override
+	Result ReadInterfaceModule(const Access &, uint32_t *value) override
 	{
 		++reads; const Result result = Step(); if (result == MISTER_RESULT_OK) *value = interface; return result;
 	}
-	Result ReadSdrPortControl(uint32_t offset, uint32_t *value) override
+	Result ReadSdrPortControl(const Access &, uint32_t offset,
+		uint32_t *value) override
 	{
 		assert(offset == 0x5080u); ++reads; const Result result = Step(); if (result == MISTER_RESULT_OK) *value = sdr; return result;
 	}
-	Result ReadBridgeReset(uint32_t *value) override
+	Result ReadBridgeReset(const Access &, uint32_t *value) override
 	{
 		++reads; const Result result = Step(); if (result == MISTER_RESULT_OK) *value = bridge; return result;
 	}
-	Result ReadRemap(uint32_t *value) override
+	Result ReadRemap(const Access &, uint32_t *value) override
 	{
 		++reads; const Result result = Step(); if (result == MISTER_RESULT_OK) *value = remap; return result;
 	}
-	Result ReleaseMappings(const HardwareLeaseView &) override
+	Result ReleaseMappings(const Access &) override
 	{
 		++releases; const Result result = Step(); return result == MISTER_RESULT_OK ? release_result : result;
 	}
