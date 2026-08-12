@@ -44,6 +44,10 @@ FOGCAST_MAIN_TEST_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_main_test.o
 FOGCAST_MAIN_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_main.o
 FOGCAST_PLATFORM_FAKE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_platform_fake.o
 FOGCAST_PLATFORM_UNAVAILABLE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_platform_unavailable.o
+RUNTIME_LINUX_V2_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2_test.o
+RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test.o
+RUNTIME_LINUX_V2_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2.o
+FOGCAST_STORAGE_PROBE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_storage_probe.o
 HOST_TEST_INCLUDE = $(if $(filter Darwin,$(shell uname -s)),-Itests/include)
 HOST_EXIT_COMPAT = $(if $(filter Darwin,$(shell uname -s)),,-D_Exit=_exit)
 SCHEDULER_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) $(HOST_TEST_INCLUDE)
@@ -54,7 +58,15 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean test-runtime-smoke test-runtime test-scheduler test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+
+stage-c0-software-test: test-runtime-v2 test-fogcast-protocol test-fogcast-state \
+	test-fogcast-coordinator test-fogcast-fence test-fogcast-server \
+	test-runtime-linux-v2 test-runtime-resource-teardown \
+	test-fogcast-protocol-sanitize test-fogcast-state-sanitize \
+	test-fogcast-coordinator-sanitize test-fogcast-server-sanitize \
+	test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize \
+	fogcast-runtime-storage-probe $(HOST_TEST_DIR)/fogcast-runtime
 
 test-fogcast-protocol: $(HOST_TEST_DIR)/fogcast_runtime_protocol_test
 	$(HOST_TEST_DIR)/fogcast_runtime_protocol_test
@@ -132,6 +144,26 @@ test-runtime-v2-production-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		$(HOST_TEST_DIR)/production-sanitize/mister_runtime_v2_production_sanitize
 
+test-runtime-linux-v2: $(HOST_TEST_DIR)/mister_runtime_linux_v2_test \
+	$(HOST_TEST_DIR)/fogcast-runtime-storage-probe
+	$(HOST_TEST_DIR)/mister_runtime_linux_v2_test \
+		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-storage-probe)
+
+test-runtime-resource-teardown: $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test
+	$(HOST_TEST_DIR)/mister_runtime_resource_teardown_test
+
+test-runtime-linux-v2-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/linux-v2-sanitize \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-runtime-linux-v2
+
+test-runtime-resource-teardown-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/resource-teardown-sanitize \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-runtime-resource-teardown
+
+fogcast-runtime-storage-probe: $(HOST_TEST_DIR)/fogcast-runtime-storage-probe
+
 $(HOST_TEST_DIR):
 	mkdir -p $@
 
@@ -180,6 +212,18 @@ $(FOGCAST_PLATFORM_FAKE_OBJECT): fogcast/runtime_platform_fake.cpp fogcast/runti
 $(FOGCAST_PLATFORM_UNAVAILABLE_OBJECT): fogcast/runtime_platform_unavailable.cpp fogcast/runtime_platform_factory.hpp | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
 
+$(RUNTIME_LINUX_V2_TEST_OBJECT): tests/mister_runtime_linux_v2_test.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT): tests/mister_runtime_resource_teardown_test.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(RUNTIME_LINUX_V2_OBJECT): runtime/mister_runtime_linux_v2.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(FOGCAST_STORAGE_PROBE_OBJECT): tests/fogcast_runtime_storage_probe.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
 $(HOST_TEST_DIR)/fogcast_runtime_coordinator_test: $(FOGCAST_COORDINATOR_TEST_OBJECT) $(FOGCAST_COORDINATOR_OBJECT) $(FOGCAST_FENCE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT) $(FOGCAST_STATE_OBJECT) $(FOGCAST_STORE_OBJECT) $(RUNTIME_OBJECT) $(RUNTIME_V2_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
@@ -203,6 +247,9 @@ $(HOST_TEST_DIR)/fogcast-runtime-host-test: $(FOGCAST_MAIN_COMMON_OBJECTS) $(FOG
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test: $(FOGCAST_MAIN_COMMON_OBJECTS) $(FOGCAST_PLATFORM_UNAVAILABLE_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/fogcast-runtime: $(FOGCAST_MAIN_COMMON_OBJECTS) $(FOGCAST_PLATFORM_UNAVAILABLE_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(HOST_TEST_DIR)/fogcast_runtime_main_test: $(FOGCAST_MAIN_TEST_OBJECT) $(FOGCAST_FENCE_OBJECT) $(FOGCAST_PROTOCOL_OBJECT)
@@ -318,6 +365,15 @@ $(HOST_TEST_DIR)/mister_runtime_v2_test: $(V2_TEST_OBJECT) $(RUNTIME_OBJECT) \
 
 $(HOST_TEST_DIR)/mister_runtime_v2_production_sanitize: $(C99_V2_PRODUCTION_SANITIZE_OBJECT) \
 	$(RUNTIME_PRODUCTION_OBJECT) $(RUNTIME_V2_PRODUCTION_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/mister_runtime_linux_v2_test: $(RUNTIME_LINUX_V2_TEST_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/mister_runtime_resource_teardown_test: $(RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/fogcast-runtime-storage-probe: $(FOGCAST_STORAGE_PROBE_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(HOST_TEST_DIR)/mister_runtime_wrapper_fixture: $(WRAPPER_FIXTURE_OBJECT) \
