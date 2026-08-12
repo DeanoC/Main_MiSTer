@@ -50,6 +50,9 @@ class NativeRecovery;
 enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
 struct OperationRegistration;
+namespace linux_native {
+class NativeFpgaProgrammer;
+}
 
 class HardwareLeaseView final {
 public:
@@ -61,9 +64,14 @@ private:
 	friend class HardwareBroker;
 	friend class NativeSpiBus;
 	friend class NativeContainment;
+	friend class linux_native::NativeFpgaProgrammer;
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
 	uint64_t RecordMutation();
+	Result RecordFpgaProgrammingMutation(size_t accepted_bytes,
+		uint64_t *mutation_sequence);
+	Result AuthorizeFpgaProgrammingProfile(
+		const NativeCoreProfile &profile) const;
 	uint64_t absolute_deadline_ms() const;
 
 	std::shared_ptr<OperationRegistration> registration_;
@@ -230,6 +238,10 @@ private:
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<HardwareLeaseView> *view);
 	uint64_t RecordMutation(const HardwareLeaseView &view);
+	Result RecordFpgaProgrammingMutation(const HardwareLeaseView &view,
+		size_t accepted_bytes, uint64_t *mutation_sequence);
+	Result AuthorizeFpgaProgrammingProfile(const HardwareLeaseView &view,
+		const NativeCoreProfile &profile);
 	Result ValidateCleanupContainmentAuthority(const CleanupEpoch &epoch,
 		const OperationLease &terminal_lease);
 	Result ValidateRecoveryContainmentAuthority(const RecoveryEpoch &epoch,

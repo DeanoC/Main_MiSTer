@@ -100,6 +100,33 @@ uint64_t HardwareLeaseView::RecordMutation()
 	return registration_->broker->RecordMutation(*this);
 }
 
+Result HardwareLeaseView::RecordFpgaProgrammingMutation(
+	size_t accepted_bytes, uint64_t *mutation_sequence)
+{
+	if (mutation_sequence == nullptr || accepted_bytes == 0)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	*mutation_sequence = 0;
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->RecordFpgaProgrammingMutation(*this,
+		accepted_bytes, mutation_sequence);
+}
+
+Result HardwareLeaseView::AuthorizeFpgaProgrammingProfile(
+	const NativeCoreProfile &profile) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->AuthorizeFpgaProgrammingProfile(*this,
+		profile);
+}
+
 uint64_t HardwareLeaseView::absolute_deadline_ms() const
 {
 	return registration_->absolute_deadline_ms;
@@ -824,6 +851,50 @@ uint64_t HardwareBroker::RecordMutation(const HardwareLeaseView &view)
 	if (containment_evidence_pending_) return 0;
 	if (mutation_sequence_ == UINT64_MAX) return 0;
 	return ++mutation_sequence_;
+}
+
+Result HardwareBroker::RecordFpgaProgrammingMutation(
+	const HardwareLeaseView &view, size_t accepted_bytes,
+	uint64_t *mutation_sequence)
+{
+	if (mutation_sequence == nullptr || accepted_bytes == 0)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	*mutation_sequence = 0;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::program_fpga ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		(state_ != State::active && state_ != State::quiescing))
+		return MISTER_RESULT_INVALID_STATE;
+	if (mutation_sequence_ == UINT64_MAX) return MISTER_RESULT_PLATFORM;
+	*mutation_sequence = ++mutation_sequence_;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::AuthorizeFpgaProgrammingProfile(
+	const HardwareLeaseView &view, const NativeCoreProfile &profile)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::program_fpga ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		registration->profile != &profile ||
+		(state_ != State::active && state_ != State::quiescing))
+		return MISTER_RESULT_INVALID_STATE;
+	return clock_.NowMs() >= registration->absolute_deadline_ms ?
+		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
 }
 
 Result HardwareBroker::ValidateCleanupContainmentAuthority(
