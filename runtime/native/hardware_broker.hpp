@@ -44,18 +44,22 @@ enum class OperationKind : uint8_t {
 
 class HardwareBroker;
 class OperationLease;
+class NativeSpiBus;
 struct BrokerLifetime;
 struct OperationRegistration;
 
 class HardwareLeaseView final {
 public:
+	~HardwareLeaseView();
 	HardwareLeaseView(const HardwareLeaseView &) = delete;
 	HardwareLeaseView &operator=(const HardwareLeaseView &) = delete;
 
 private:
 	friend class HardwareBroker;
+	friend class NativeSpiBus;
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
+	uint64_t RecordMutation();
 
 	std::shared_ptr<OperationRegistration> registration_;
 };
@@ -73,8 +77,11 @@ public:
 
 private:
 	friend class HardwareBroker;
+	friend class NativeSpiBus;
 	explicit OperationLease(
 		const std::shared_ptr<OperationRegistration> &registration);
+	Result AcquireHardwareLeaseView(
+		std::unique_ptr<HardwareLeaseView> *view) const;
 
 	std::shared_ptr<OperationRegistration> registration_;
 	OperationKind operation_kind_;
@@ -104,6 +111,30 @@ private:
 	bool registered_;
 };
 
+class RecoveryEpoch final {
+public:
+	~RecoveryEpoch();
+	RecoveryEpoch(const RecoveryEpoch &) = delete;
+	RecoveryEpoch &operator=(const RecoveryEpoch &) = delete;
+	RecoveryEpoch(RecoveryEpoch &&) = delete;
+	RecoveryEpoch &operator=(RecoveryEpoch &&) = delete;
+
+private:
+	friend class HardwareBroker;
+	RecoveryEpoch(HardwareBroker &broker, uint64_t identity,
+		uint32_t requested_resource_flags, uint64_t non_fpga_deadline_ms,
+		uint64_t fpga_deadline_ms,
+		const std::shared_ptr<BrokerLifetime> &lifetime);
+
+	HardwareBroker *broker_;
+	std::shared_ptr<BrokerLifetime> lifetime_;
+	uint64_t identity_;
+	uint32_t requested_resource_flags_;
+	uint64_t non_fpga_deadline_ms_;
+	uint64_t fpga_deadline_ms_;
+	bool registered_;
+};
+
 class HardwareBroker final {
 public:
 	explicit HardwareBroker(NativeClock &clock);
@@ -118,6 +149,7 @@ public:
 		std::unique_ptr<OperationLease> *lease);
 	Result Quiesce(PlatformGenerationId generation,
 		uint64_t absolute_deadline_ms);
+	Result LatchFailure(PlatformGenerationId generation);
 	Result BeginCleanup(PlatformGenerationId generation,
 		uint64_t non_fpga_deadline_ms, uint64_t fpga_deadline_ms,
 		std::unique_ptr<CleanupEpoch> *epoch);
@@ -130,10 +162,21 @@ public:
 		const OperationLease &terminal_lease);
 	Result Leave(PlatformGenerationId generation,
 		std::unique_ptr<CleanupEpoch> &&epoch);
+	Result BeginRecovery(uint32_t requested_resource_flags,
+		uint64_t non_fpga_deadline_ms, uint64_t fpga_deadline_ms,
+		std::unique_ptr<RecoveryEpoch> *epoch);
+	Result BeginRecoveryOperation(const RecoveryEpoch &epoch,
+		OperationKind operation_kind,
+		std::unique_ptr<OperationLease> *lease);
+	Result FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
+		MisterRecoveryObservationV2 *observation);
 
 private:
 	friend class OperationLease;
 	friend class CleanupEpoch;
+	friend class RecoveryEpoch;
+	friend class HardwareLeaseView;
+	friend class NativeSpiBus;
 	friend struct OperationRegistration;
 
 	enum class State : uint8_t {
@@ -141,15 +184,24 @@ private:
 		active,
 		quiescing,
 		cleanup,
-		terminal_neutral
+		terminal_neutral,
+		recovery
 	};
 
 	void ReleaseOperation(OperationRegistration &registration);
+	void ReleaseHardwareLeaseView(HardwareLeaseView &view);
 	void UnregisterCleanup(CleanupEpoch &epoch);
+	void UnregisterRecovery(RecoveryEpoch &epoch);
 	bool IsCurrentCleanup(const CleanupEpoch &epoch) const;
+	bool IsCurrentRecovery(const RecoveryEpoch &epoch) const;
 	static bool IsHardwareOperation(OperationKind operation_kind);
+	static bool IsRecoveryOperation(OperationKind operation_kind,
+		uint32_t requested_resource_flags);
 	static bool CleanupDeadline(OperationKind operation_kind,
 		const CleanupEpoch &epoch, uint64_t *absolute_deadline_ms);
+	static bool RecoveryDeadline(OperationKind operation_kind,
+		const RecoveryEpoch &epoch, uint64_t *absolute_deadline_ms);
+	uint64_t RecordMutation(const HardwareLeaseView &view);
 
 	NativeClock &clock_;
 	std::shared_ptr<BrokerLifetime> lifetime_;
@@ -161,6 +213,11 @@ private:
 	uint64_t cleanup_non_fpga_deadline_ms_;
 	uint64_t cleanup_fpga_deadline_ms_;
 	uint64_t terminal_lease_deadline_ms_;
+	uint64_t recovery_identity_;
+	uint32_t recovery_requested_resource_flags_;
+	uint64_t recovery_non_fpga_deadline_ms_;
+	uint64_t recovery_fpga_deadline_ms_;
+	uint64_t mutation_sequence_;
 	size_t active_lease_count_;
 	size_t terminal_lease_count_;
 	bool cleanup_registered_;
@@ -168,6 +225,9 @@ private:
 	bool quiesce_complete_;
 	bool quiesce_call_active_;
 	bool containment_receipt_current_;
+	bool recovery_registered_;
+	bool hardware_transaction_active_;
+	bool failure_latched_;
 };
 
 } // namespace native
