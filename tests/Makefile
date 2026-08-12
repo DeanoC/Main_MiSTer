@@ -48,6 +48,8 @@ RUNTIME_LINUX_V2_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2_test.o
 RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test.o
 RUNTIME_OFFLOAD_LIFECYCLE_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_offload_lifecycle_test.o
 OFFLOAD_TEST_OBJECT = $(HOST_TEST_DIR)/offload_test.o
+NATIVE_HARDWARE_BROKER_TEST_OBJECT = $(HOST_TEST_DIR)/native_hardware_broker_test.o
+NATIVE_HARDWARE_BROKER_OBJECT = $(HOST_TEST_DIR)/hardware_broker.o
 RUNTIME_LINUX_V2_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2.o
 FOGCAST_STORAGE_PROBE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_storage_probe.o
 HOST_TEST_INCLUDE = $(if $(filter Darwin,$(shell uname -s)),-Itests/include)
@@ -60,7 +62,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 stage-c0-software-test: test-runtime-v2 test-fogcast-protocol test-fogcast-state \
 	test-fogcast-coordinator test-fogcast-fence test-fogcast-server \
@@ -133,6 +135,14 @@ test-runtime-offload-lifecycle-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/offload-sanitize \
 		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
 		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-runtime-offload-lifecycle
+
+test-native-hardware-broker: $(HOST_TEST_DIR)/native_hardware_broker_test
+	$(HOST_TEST_DIR)/native_hardware_broker_test
+
+test-native-hardware-broker-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-broker-sanitize \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-hardware-broker
 
 test-runtime-legacy: $(HOST_TEST_DIR)/mister_runtime_legacy_test \
 	$(HOST_TEST_DIR)/mister_runtime_wrapper_fixture \
@@ -240,6 +250,14 @@ $(RUNTIME_OFFLOAD_LIFECYCLE_TEST_OBJECT): tests/mister_runtime_offload_lifecycle
 
 $(OFFLOAD_TEST_OBJECT): offload.cpp offload.h profiling.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -DOFFLOAD_TESTING -I. -c $< -o $@
+
+$(NATIVE_HARDWARE_BROKER_TEST_OBJECT): tests/native_hardware_broker_test.cpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
+
+$(NATIVE_HARDWARE_BROKER_OBJECT): runtime/native/hardware_broker.cpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
 
 $(RUNTIME_LINUX_V2_OBJECT): runtime/mister_runtime_linux_v2.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
@@ -397,6 +415,9 @@ $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test: $(RUNTIME_RESOURCE_TEARD
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(HOST_TEST_DIR)/mister_runtime_offload_lifecycle_test: $(RUNTIME_OFFLOAD_LIFECYCLE_TEST_OBJECT) $(OFFLOAD_TEST_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
+
+$(HOST_TEST_DIR)/native_hardware_broker_test: $(NATIVE_HARDWARE_BROKER_TEST_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(HOST_TEST_DIR)/fogcast-runtime-storage-probe: $(FOGCAST_STORAGE_PROBE_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)
