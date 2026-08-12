@@ -53,7 +53,33 @@ struct BrokerLifetime;
 struct OperationRegistration;
 namespace linux_native {
 class NativeFpgaProgrammer;
+class NativeInputAdapter;
+class NativeSchedulerAdapter;
+class NativeOffloadAdapter;
 }
+
+class ProcessOperationGuard final {
+public:
+	~ProcessOperationGuard();
+	ProcessOperationGuard(const ProcessOperationGuard &) = delete;
+	ProcessOperationGuard &operator=(const ProcessOperationGuard &) = delete;
+	ProcessOperationGuard(ProcessOperationGuard &&) = delete;
+	ProcessOperationGuard &operator=(ProcessOperationGuard &&) = delete;
+
+	uint64_t absolute_deadline_ms() const;
+
+private:
+	friend class HardwareBroker;
+	friend class OperationLease;
+	friend class linux_native::NativeInputAdapter;
+	friend class linux_native::NativeSchedulerAdapter;
+	friend class linux_native::NativeOffloadAdapter;
+	explicit ProcessOperationGuard(
+		const std::shared_ptr<OperationRegistration> &registration);
+	LeaseAuthority authority() const;
+	std::shared_ptr<OperationRegistration> registration_;
+	bool lifetime_registered_;
+};
 
 class HardwareLeaseView final {
 public:
@@ -93,12 +119,22 @@ private:
 	friend class HardwareBroker;
 	friend class NativeInput;
 	friend class NativeSpiBus;
+	friend class linux_native::NativeInputAdapter;
+	friend class linux_native::NativeSchedulerAdapter;
+	friend class linux_native::NativeOffloadAdapter;
 	explicit OperationLease(
 		const std::shared_ptr<OperationRegistration> &registration);
 	Result AcquireHardwareLeaseView(
 		std::unique_ptr<HardwareLeaseView> *view) const;
 	Result AcquireInputHardwareLeaseView(const NativeCoreProfile &profile,
 		std::unique_ptr<HardwareLeaseView> *view) const;
+	Result AcquireInputHardwareLeaseView(HardwareBroker &owner,
+		const NativeCoreProfile &profile,
+		std::unique_ptr<HardwareLeaseView> *view) const;
+	Result AcquireProcessOperationGuard(HardwareBroker &owner,
+		OperationKind required_operation_kind,
+		const NativeCoreProfile *required_profile,
+		std::unique_ptr<ProcessOperationGuard> *guard) const;
 
 	std::shared_ptr<OperationRegistration> registration_;
 };
@@ -231,6 +267,7 @@ private:
 	friend class CleanupEpoch;
 	friend class RecoveryEpoch;
 	friend class HardwareLeaseView;
+	friend class ProcessOperationGuard;
 	friend class NativeSpiBus;
 	friend class NativeContainment;
 	friend class NativeRecovery;
@@ -247,6 +284,7 @@ private:
 
 	void ReleaseOperation(OperationRegistration &registration);
 	void ReleaseHardwareLeaseView(HardwareLeaseView &view);
+	void ReleaseProcessOperationGuard(ProcessOperationGuard &guard);
 	void UnregisterCleanup(CleanupEpoch &epoch);
 	void UnregisterRecovery(RecoveryEpoch &epoch);
 	bool IsCurrentCleanup(const CleanupEpoch &epoch) const;
@@ -262,6 +300,10 @@ private:
 		OperationKind required_operation_kind,
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<HardwareLeaseView> *view);
+	Result AcquireProcessOperationGuardFor(const OperationLease &lease,
+		HardwareBroker &owner, OperationKind required_operation_kind,
+		const NativeCoreProfile *required_profile,
+		std::unique_ptr<ProcessOperationGuard> *guard);
 	uint64_t RecordMutation(const HardwareLeaseView &view);
 	Result RecordFpgaProgrammingMutation(const HardwareLeaseView &view,
 		size_t accepted_bytes, uint64_t *mutation_sequence);

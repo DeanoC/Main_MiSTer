@@ -60,6 +60,25 @@ bool NativeInput::GetDeliveredInput(size_t index,
 	return false;
 }
 
+Result NativeInput::SnapshotDeliveredInput(HardwareBroker &owner,
+	const NativeCoreProfile *profile, const OperationLease &lease,
+	DeliveredInput *values, bool *valid, size_t count) const
+{
+	if (profile == nullptr || values == nullptr || valid == nullptr ||
+		count < kNativePlayerCount) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::unique_ptr<HardwareLeaseView> view;
+	const Result result = lease.AcquireInputHardwareLeaseView(owner, *profile,
+		&view);
+	if (result != MISTER_RESULT_OK) return result;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (profile_ != nullptr && profile_ != profile) return MISTER_RESULT_UNSUPPORTED;
+	for (size_t player = 0; player < kNativePlayerCount; ++player) {
+		valid[player] = ledger_valid_[player];
+		values[player] = ledger_valid_[player] ? ledger_[player] : DeliveredInput{};
+	}
+	return MISTER_RESULT_OK;
+}
+
 void NativeInput::CommitReceipt(void *context,
 	const SpiReceipt &receipt) noexcept
 {

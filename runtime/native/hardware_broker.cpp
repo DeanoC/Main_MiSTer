@@ -11,12 +11,18 @@ namespace mister {
 namespace native {
 
 struct BrokerLifetime {
-	explicit BrokerLifetime(HardwareBroker *owner) : broker(owner) {}
+	explicit BrokerLifetime(HardwareBroker *owner)
+		: broker(owner), process_guard_count(0), destroying(false) {}
 
 	// Every call from an outliving token takes this mutex before the broker
 	// mutex. Broker code must never acquire this mutex while holding its own.
+	// Adapters acquire a process guard before their private state mutex and
+	// destroy that mutex guard before releasing the broker guard.
 	std::mutex mutex;
+	std::condition_variable process_guards_released;
 	HardwareBroker *broker;
+	size_t process_guard_count;
+	bool destroying;
 };
 
 struct OperationRegistration {
@@ -26,7 +32,8 @@ struct OperationRegistration {
 		const NativeCoreProfile *bound_profile)
 		: broker(&owner), lifetime(broker_lifetime), authority(lease_authority),
 		  authority_identity(identity), operation_kind(kind),
-		  absolute_deadline_ms(deadline_ms), profile(bound_profile), registered(false)
+		  absolute_deadline_ms(deadline_ms), profile(bound_profile),
+		  registered(false), process_guard_active(false)
 	{
 	}
 
@@ -46,6 +53,7 @@ struct OperationRegistration {
 	uint64_t absolute_deadline_ms;
 	const NativeCoreProfile *profile;
 	bool registered;
+	bool process_guard_active;
 };
 
 namespace {
@@ -82,6 +90,37 @@ HardwareLeaseView::HardwareLeaseView(
 	const std::shared_ptr<OperationRegistration> &registration)
 	: registration_(registration)
 {
+}
+
+ProcessOperationGuard::ProcessOperationGuard(
+	const std::shared_ptr<OperationRegistration> &registration)
+	: registration_(registration), lifetime_registered_(false)
+{
+}
+
+ProcessOperationGuard::~ProcessOperationGuard()
+{
+	if (!registration_ || !registration_->lifetime || !lifetime_registered_)
+		return;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker == registration_->broker) {
+		registration_->broker->ReleaseProcessOperationGuard(*this);
+	}
+	lifetime_registered_ = false;
+	if (registration_->lifetime->process_guard_count != 0)
+		--registration_->lifetime->process_guard_count;
+	registration_->lifetime->process_guards_released.notify_all();
+}
+
+uint64_t ProcessOperationGuard::absolute_deadline_ms() const
+{
+	return registration_ ? registration_->absolute_deadline_ms : 0;
+}
+
+LeaseAuthority ProcessOperationGuard::authority() const
+{
+	return registration_ ? registration_->authority :
+		LeaseAuthority::recovery_epoch;
 }
 
 HardwareLeaseView::~HardwareLeaseView()
@@ -164,6 +203,41 @@ Result OperationLease::AcquireInputHardwareLeaseView(
 		return MISTER_RESULT_INVALID_STATE;
 	return registration_->broker->AcquireHardwareLeaseViewFor(*this,
 		OperationKind::input, &profile, view);
+}
+
+Result OperationLease::AcquireInputHardwareLeaseView(HardwareBroker &owner,
+	const NativeCoreProfile &profile,
+	std::unique_ptr<HardwareLeaseView> *view) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->AcquireHardwareLeaseViewFor(*this,
+		OperationKind::input, &profile, view);
+}
+
+Result OperationLease::AcquireProcessOperationGuard(HardwareBroker &owner,
+	OperationKind required_operation_kind,
+	const NativeCoreProfile *required_profile,
+	std::unique_ptr<ProcessOperationGuard> *guard) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	if (registration_->lifetime->destroying)
+		return MISTER_RESULT_INVALID_STATE;
+	const Result result = registration_->broker->AcquireProcessOperationGuardFor(*this,
+		owner, required_operation_kind, required_profile, guard);
+	if (result == MISTER_RESULT_OK) {
+		++registration_->lifetime->process_guard_count;
+		(*guard)->lifetime_registered_ = true;
+	}
+	return result;
 }
 
 OperationKind OperationLease::operation_kind() const
@@ -256,7 +330,10 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 
 HardwareBroker::~HardwareBroker()
 {
-	std::lock_guard<std::mutex> lifetime_lock(lifetime_->mutex);
+	std::unique_lock<std::mutex> lifetime_lock(lifetime_->mutex);
+	lifetime_->destroying = true;
+	while (lifetime_->process_guard_count != 0)
+		lifetime_->process_guards_released.wait(lifetime_lock);
 	lifetime_->broker = nullptr;
 }
 
@@ -561,6 +638,49 @@ Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
 	return MISTER_RESULT_OK;
 }
 
+Result HardwareBroker::AcquireProcessOperationGuardFor(
+	const OperationLease &lease, HardwareBroker &owner,
+	OperationKind required_operation_kind,
+	const NativeCoreProfile *required_profile,
+	std::unique_ptr<ProcessOperationGuard> *guard)
+{
+	if (guard == nullptr || guard->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	if (&owner != this) return MISTER_RESULT_INVALID_STATE;
+	if (required_operation_kind != OperationKind::scheduler &&
+		required_operation_kind != OperationKind::offload &&
+		required_operation_kind != OperationKind::input_descriptors)
+		return MISTER_RESULT_INVALID_STATE;
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered ||
+		registration->broker != this || registration->process_guard_active ||
+		registration->operation_kind != required_operation_kind)
+		return MISTER_RESULT_INVALID_STATE;
+	if (required_profile != nullptr && registration->profile != required_profile)
+		return MISTER_RESULT_UNSUPPORTED;
+	const bool active_authority =
+		registration->authority == LeaseAuthority::active_generation &&
+		registration->authority_identity == generation_ && state_ == State::active;
+	const bool cleanup_authority =
+		registration->authority == LeaseAuthority::cleanup_epoch &&
+		registration->authority_identity == cleanup_identity_ &&
+		state_ == State::cleanup;
+	if (!active_authority && !cleanup_authority)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+
+	std::unique_ptr<ProcessOperationGuard> admitted(
+		new (std::nothrow) ProcessOperationGuard(registration));
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	registration->process_guard_active = true;
+	*guard = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
 Result HardwareBroker::ObserveContainment(const CleanupEpoch &epoch,
 	const OperationLease &terminal_lease)
 {
@@ -761,6 +881,14 @@ void HardwareBroker::ReleaseHardwareLeaseView(HardwareLeaseView &view)
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (!view.registration_ || view.registration_->broker != this) return;
 	hardware_transaction_active_ = false;
+	lease_released_.notify_all();
+}
+
+void HardwareBroker::ReleaseProcessOperationGuard(ProcessOperationGuard &guard)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!guard.registration_ || guard.registration_->broker != this) return;
+	guard.registration_->process_guard_active = false;
 	lease_released_.notify_all();
 }
 

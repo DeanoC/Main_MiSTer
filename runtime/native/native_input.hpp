@@ -61,6 +61,9 @@ public:
 
 	size_t ledger_size() const;
 	bool GetDeliveredInput(size_t index, DeliveredInput *snapshot) const;
+	Result SnapshotDeliveredInput(HardwareBroker &owner,
+		const NativeCoreProfile *profile, const OperationLease &lease,
+		DeliveredInput *values, bool *valid, size_t count) const;
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	void FailNextCommitForTest();
 #endif
