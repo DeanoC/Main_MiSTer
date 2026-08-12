@@ -56,6 +56,8 @@ NATIVE_CORE_PROFILE_TEST_OBJECT = $(HOST_TEST_DIR)/native_core_profile_test.o
 NATIVE_CORE_PROFILE_OBJECT = $(HOST_TEST_DIR)/native_core_profile.o
 NATIVE_INPUT_TEST_OBJECT = $(HOST_TEST_DIR)/native_input_test.o
 NATIVE_INPUT_OBJECT = $(HOST_TEST_DIR)/native_input.o
+NATIVE_LIFECYCLE_TEST_OBJECT = $(HOST_TEST_DIR)/native_lifecycle_test.o
+NATIVE_LIFECYCLE_OBJECT = $(HOST_TEST_DIR)/native_lifecycle.o
 RUNTIME_LINUX_V2_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2.o
 FOGCAST_STORAGE_PROBE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_storage_probe.o
 HOST_TEST_INCLUDE = $(if $(filter Darwin,$(shell uname -s)),-Itests/include)
@@ -68,7 +70,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-input test-native-input-sanitize test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 stage-c0-software-test: test-runtime-v2 test-fogcast-protocol test-fogcast-state \
 	test-fogcast-coordinator test-fogcast-fence test-fogcast-server \
@@ -169,6 +171,12 @@ test-native-input: $(HOST_TEST_DIR)/native_input_test
 
 test-native-input-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-input-sanitize-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-input
+
+test-native-lifecycle: $(HOST_TEST_DIR)/native_lifecycle_test
+	$(HOST_TEST_DIR)/native_lifecycle_test
+
+test-native-lifecycle-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-lifecycle-sanitize-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-lifecycle
 
 test-runtime-legacy: $(HOST_TEST_DIR)/mister_runtime_legacy_test \
 	$(HOST_TEST_DIR)/mister_runtime_wrapper_fixture \
@@ -328,10 +336,27 @@ $(NATIVE_INPUT_OBJECT): runtime/native/native_input.cpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
 
+$(NATIVE_LIFECYCLE_TEST_OBJECT): tests/native_lifecycle_test.cpp \
+	runtime/native/native_lifecycle.hpp runtime/native/native_resources.hpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp \
+	runtime/native/native_core_profile.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
+
+$(NATIVE_LIFECYCLE_OBJECT): runtime/native/native_lifecycle.cpp \
+	runtime/native/native_lifecycle.hpp runtime/native/native_resources.hpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp \
+	runtime/native/native_core_profile.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
+
 $(HOST_TEST_DIR)/native_input_test: $(NATIVE_INPUT_TEST_OBJECT) \
 	$(NATIVE_INPUT_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_SPI_BUS_OBJECT) \
 	$(NATIVE_HARDWARE_BROKER_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
+
+$(HOST_TEST_DIR)/native_lifecycle_test: $(NATIVE_LIFECYCLE_TEST_OBJECT) \
+	$(NATIVE_LIFECYCLE_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(RUNTIME_LINUX_V2_OBJECT): runtime/mister_runtime_linux_v2.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)

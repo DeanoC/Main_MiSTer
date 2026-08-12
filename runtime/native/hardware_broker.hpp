@@ -97,6 +97,9 @@ public:
 	CleanupEpoch &operator=(const CleanupEpoch &) = delete;
 	CleanupEpoch(CleanupEpoch &&) = delete;
 	CleanupEpoch &operator=(CleanupEpoch &&) = delete;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	uint64_t identity_for_test() const;
+#endif
 
 private:
 	friend class HardwareBroker;
@@ -152,6 +155,7 @@ public:
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result EnterFixtureForTest(const NativeCoreProfile &profile,
 		PlatformGenerationId *generation);
+	bool has_live_generation_for_test();
 #endif
 	Result Begin(PlatformGenerationId generation, OperationKind operation_kind,
 		uint64_t absolute_deadline_ms,

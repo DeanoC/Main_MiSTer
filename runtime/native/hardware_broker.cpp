@@ -166,6 +166,13 @@ CleanupEpoch::~CleanupEpoch()
 		broker_->UnregisterCleanup(*this);
 }
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+uint64_t CleanupEpoch::identity_for_test() const
+{
+	return identity_;
+}
+#endif
+
 RecoveryEpoch::RecoveryEpoch(HardwareBroker &broker, uint64_t identity,
 	uint32_t requested_resource_flags, uint64_t non_fpga_deadline_ms,
 	uint64_t fpga_deadline_ms,
@@ -281,6 +288,12 @@ Result HardwareBroker::EnterFixtureForTest(const NativeCoreProfile &profile,
 	failure_latched_ = false;
 	*generation = next_generation;
 	return MISTER_RESULT_OK;
+}
+
+bool HardwareBroker::has_live_generation_for_test()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return generation_ != 0;
 }
 #endif
 
