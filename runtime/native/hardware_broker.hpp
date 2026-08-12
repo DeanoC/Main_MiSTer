@@ -45,6 +45,9 @@ class HardwareBroker;
 class OperationLease;
 class NativeInput;
 class NativeSpiBus;
+class NativeContainment;
+class NativeRecovery;
+enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
 struct OperationRegistration;
 
@@ -57,6 +60,7 @@ public:
 private:
 	friend class HardwareBroker;
 	friend class NativeSpiBus;
+	friend class NativeContainment;
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
 	uint64_t RecordMutation();
@@ -124,6 +128,9 @@ public:
 	RecoveryEpoch &operator=(const RecoveryEpoch &) = delete;
 	RecoveryEpoch(RecoveryEpoch &&) = delete;
 	RecoveryEpoch &operator=(RecoveryEpoch &&) = delete;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	uint64_t identity_for_test() const;
+#endif
 
 private:
 	friend class HardwareBroker;
@@ -156,6 +163,8 @@ public:
 	Result EnterFixtureForTest(const NativeCoreProfile &profile,
 		PlatformGenerationId *generation);
 	bool has_live_generation_for_test();
+	uint64_t mutation_sequence_for_test();
+	uint64_t containment_receipt_sequence_for_test();
 #endif
 	Result Begin(PlatformGenerationId generation, OperationKind operation_kind,
 		uint64_t absolute_deadline_ms,
@@ -190,6 +199,8 @@ private:
 	friend class RecoveryEpoch;
 	friend class HardwareLeaseView;
 	friend class NativeSpiBus;
+	friend class NativeContainment;
+	friend class NativeRecovery;
 	friend struct OperationRegistration;
 
 	enum class State : uint8_t {
@@ -219,6 +230,38 @@ private:
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<HardwareLeaseView> *view);
 	uint64_t RecordMutation(const HardwareLeaseView &view);
+	Result ValidateCleanupContainmentAuthority(const CleanupEpoch &epoch,
+		const OperationLease &terminal_lease);
+	Result ValidateRecoveryContainmentAuthority(const RecoveryEpoch &epoch,
+		const OperationLease &terminal_lease);
+	Result ValidateContainmentBoundary(const HardwareLeaseView &view);
+	Result StageContainmentEvidence(const OperationLease &terminal_lease,
+		uint32_t core_gpo, uint32_t interface_module,
+		uint32_t sdr_port_control, uint32_t bridge_reset, uint32_t remap,
+		bool mappings_released);
+	Result CommitCleanupContainment(const CleanupEpoch &epoch,
+		const OperationLease &terminal_lease);
+	Result CommitRecoveryContainment(const RecoveryEpoch &epoch,
+		const OperationLease &terminal_lease);
+	Result BeginRecoveryObservation(const RecoveryEpoch &epoch);
+	Result CheckRecoveryObservationDeadline(const RecoveryEpoch &epoch);
+	Result EndRecoveryObservation(const RecoveryEpoch &epoch,
+		uint32_t observed_resource_flags, uint32_t neutral_resource_flags,
+		Result result);
+	Result RecordRecoveryContainmentObservation(const RecoveryEpoch &epoch,
+		uint32_t observed_resource_flags, uint32_t neutral_resource_flags,
+		Result result);
+	Result RecordRecoveryOperation(const RecoveryEpoch &epoch,
+		const OperationLease &lease, RecoveryResourceState resource_state,
+		Result result);
+	Result RecordRecoveryFailure(const RecoveryEpoch &epoch, Result result);
+	static uint32_t RecoveryResourceForOperation(OperationKind operation_kind);
+	void RecordRecoveryPartition(uint32_t observed_resource_flags,
+		uint32_t neutral_resource_flags);
+	void LatchRecoveryResult(Result result);
+	void ClearContainmentReceipt();
+	bool ReceiptMatchesCleanup(const CleanupEpoch &epoch) const;
+	bool ReceiptMatchesRecovery(const RecoveryEpoch &epoch) const;
 
 	NativeClock &clock_;
 	std::shared_ptr<BrokerLifetime> lifetime_;
@@ -242,9 +285,27 @@ private:
 	bool quiesce_complete_;
 	bool quiesce_call_active_;
 	bool containment_receipt_current_;
+	bool containment_evidence_pending_;
 	bool recovery_registered_;
+	bool recovery_observation_active_;
+	bool recovery_terminal_neutral_;
 	bool hardware_transaction_active_;
 	bool failure_latched_;
+	Result recovery_result_;
+	LeaseAuthority receipt_authority_;
+	uint64_t receipt_authority_identity_;
+	PlatformGenerationId receipt_generation_;
+	uint32_t receipt_requested_resource_flags_;
+	uint32_t receipt_core_gpo_;
+	uint32_t receipt_interface_module_;
+	uint32_t receipt_sdr_port_control_;
+	uint32_t receipt_bridge_reset_;
+	uint32_t receipt_remap_;
+	uint64_t receipt_mutation_sequence_;
+	uint32_t recovery_observed_resource_flags_;
+	uint32_t recovery_neutral_resource_flags_;
+	bool receipt_mappings_released_;
+	OperationRegistration *receipt_registration_;
 	const NativeCoreProfile *profile_;
 };
 
