@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "runtime/native/native_spi_bus.hpp"
+#include "runtime/native/native_core_profile.hpp"
 
 #include <assert.h>
 
@@ -9,11 +10,20 @@
 #include <thread>
 #include <string>
 #include <vector>
+#include <type_traits>
 
 namespace mister {
 namespace native {
 
-struct NativeCoreProfile {};
+static_assert(!std::is_default_constructible<SpiReceiptCommitToken>::value,
+	"SPI receipt commit token must be broker/input minted");
+static_assert(!std::is_copy_constructible<SpiReceiptCommitToken>::value,
+	"SPI receipt commit token must not be copied");
+static_assert(!std::is_constructible<SpiReceiptCommitToken, void *,
+	void *>::value, "SPI receipt commit token constructor must be private");
+static_assert(!std::is_constructible<SpiReceiptCommitToken, void *,
+	void (*)(void *, const SpiReceipt &)>::value,
+	"SPI receipt commit callback constructor must be private");
 
 namespace {
 
@@ -116,8 +126,8 @@ public:
 void Enter(HardwareBroker &broker, TestClock &clock,
 	PlatformGenerationId *generation)
 {
-	NativeCoreProfile profile;
-	assert(broker.Enter(profile, generation) == MISTER_RESULT_OK);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	assert(broker.EnterFixtureForTest(profile, generation) == MISTER_RESULT_OK);
 	assert(*generation != 0);
 	(void)clock;
 }

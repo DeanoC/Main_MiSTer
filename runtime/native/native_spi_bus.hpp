@@ -35,13 +35,37 @@ struct SpiReceipt {
 	uint64_t mutation_sequence;
 };
 
+class NativeInput;
+
+class SpiReceiptCommitToken final {
+public:
+	SpiReceiptCommitToken(const SpiReceiptCommitToken &) = delete;
+	SpiReceiptCommitToken &operator=(const SpiReceiptCommitToken &) = delete;
+	void Commit(const SpiReceipt &receipt) const noexcept
+	{
+		callback_(context_, receipt);
+	}
+private:
+	friend class NativeInput;
+	typedef void (*Callback)(void *, const SpiReceipt &);
+	SpiReceiptCommitToken(void *context, Callback callback)
+		: context_(context), callback_(callback) {}
+	void *context_;
+	Callback callback_;
+};
+
 class NativeSpiBus final {
 public:
 	NativeSpiBus(NativeClock &clock, NativeHardwareIo &hardware);
 	Result Execute(const OperationLease &lease,
-		const SpiTransaction &transaction, SpiReceipt *receipt);
+		const SpiTransaction &transaction, SpiReceipt *receipt,
+		const SpiReceiptCommitToken *commit = nullptr);
 
 private:
+	friend class NativeInput;
+	Result ExecuteWithHardwareLeaseView(HardwareLeaseView &view,
+		const SpiTransaction &transaction, SpiReceipt *receipt,
+		const SpiReceiptCommitToken *commit);
 	bool RecordObservedMutation(HardwareLeaseView &view, SpiReceipt *receipt);
 	Result WaitForAck(const HardwareLeaseView &view, bool want_high,
 		uint64_t deadline_ms, bool *observed);

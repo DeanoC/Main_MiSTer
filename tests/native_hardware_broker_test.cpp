@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "runtime/native/hardware_broker.hpp"
+#include "runtime/native/native_core_profile.hpp"
 
 #include <assert.h>
 #include <pthread.h>
@@ -15,10 +16,6 @@
 
 namespace mister {
 namespace native {
-
-// Task 1 only needs profile identity at the broker boundary. The complete,
-// immutable profile definition belongs to the profile task.
-struct NativeCoreProfile {};
 
 namespace {
 
@@ -166,7 +163,7 @@ void PrepareCleanup(HardwareBroker &broker, FakeClock &clock,
 	const NativeCoreProfile &profile, PlatformGenerationId *generation,
 	std::unique_ptr<CleanupEpoch> *epoch)
 {
-	assert(broker.Enter(profile, generation) == MISTER_RESULT_OK);
+	assert(broker.EnterFixtureForTest(profile, generation) == MISTER_RESULT_OK);
 	assert(*generation != 0);
 	assert(broker.Quiesce(*generation, clock.NowMs() + 100) ==
 		MISTER_RESULT_OK);
@@ -198,16 +195,43 @@ void TestOwningTypesAreNotForgeable()
 		"hardware views must retain unique owning handles");
 }
 
+void TestEnterRequiresExactTrustedFixtureAuthority()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	PlatformGenerationId generation = 0;
+	const NativeCoreProfile *fixture = FixtureNativeCoreProfile("snes");
+	assert(fixture != nullptr);
+	NativeCoreProfile copy = *fixture;
+	assert(broker.Enter(copy, &generation) == MISTER_RESULT_UNSUPPORTED);
+	assert(generation == 0);
+	copy = *fixture;
+	copy.authority = NativeProfileAuthority::untrusted;
+	assert(broker.Enter(copy, &generation) == MISTER_RESULT_UNSUPPORTED);
+	assert(generation == 0);
+	copy = *fixture;
+	copy.input.digital_word_count = 1;
+	assert(broker.Enter(copy, &generation) == MISTER_RESULT_UNSUPPORTED);
+	assert(generation == 0);
+	assert(broker.Enter(static_cast<const NativeCoreProfile *>(nullptr),
+		&generation) == MISTER_RESULT_UNSUPPORTED);
+	assert(generation == 0);
+	assert(ProductionNativeCoreProfile("snes") == nullptr);
+	assert(broker.Enter(*fixture, &generation) == MISTER_RESULT_UNSUPPORTED);
+	assert(broker.EnterFixtureForTest(*fixture, &generation) == MISTER_RESULT_OK);
+	assert(generation != 0);
+}
+
 void TestLeaseDurationQuiesceAndFreshGeneration()
 {
 	FakeClock clock(1000);
 	HardwareBroker broker(clock);
-	NativeCoreProfile profile;
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
 	PlatformGenerationId first_generation = 0;
 	PlatformGenerationId duplicate_generation = 0;
-	assert(broker.Enter(profile, &first_generation) == MISTER_RESULT_OK);
+	assert(broker.EnterFixtureForTest(profile, &first_generation) == MISTER_RESULT_OK);
 	assert(first_generation != 0);
-	assert(broker.Enter(profile, &duplicate_generation) ==
+	assert(broker.EnterFixtureForTest(profile, &duplicate_generation) ==
 		MISTER_RESULT_INVALID_STATE);
 	assert(duplicate_generation == 0);
 
@@ -311,7 +335,7 @@ void TestLeaseDurationQuiesceAndFreshGeneration()
 	FakeClock second_clock(5000);
 	HardwareBroker second_broker(second_clock);
 	PlatformGenerationId second_generation = 0;
-	assert(second_broker.Enter(profile, &second_generation) == MISTER_RESULT_OK);
+	assert(second_broker.EnterFixtureForTest(profile, &second_generation) == MISTER_RESULT_OK);
 	assert(second_generation != 0);
 	assert(second_generation != first_generation);
 	assert(broker.Begin(first_generation, OperationKind::input,
@@ -322,9 +346,9 @@ void TestBoundedQuiesceNeverReopensAdmission()
 {
 	FakeClock clock(4000);
 	HardwareBroker broker(clock);
-	NativeCoreProfile profile;
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
 	PlatformGenerationId generation = 0;
-	assert(broker.Enter(profile, &generation) == MISTER_RESULT_OK);
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
 
 	std::unique_ptr<OperationLease> held;
 	assert(broker.Begin(generation, OperationKind::offload, 5000, &held) ==
@@ -362,9 +386,9 @@ void TestCleanupCannotOvertakeQuiesceReturn()
 	FakeClock clock(6000);
 	clock.PauseAfterWait();
 	HardwareBroker broker(clock);
-	NativeCoreProfile profile;
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
 	PlatformGenerationId generation = 0;
-	assert(broker.Enter(profile, &generation) == MISTER_RESULT_OK);
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
 
 	std::unique_ptr<OperationLease> held;
 	assert(broker.Begin(generation, OperationKind::input, 7000, &held) ==
@@ -392,10 +416,10 @@ void TestCleanupCannotOvertakeQuiesceReturn()
 void TestOwningTokenMayOutliveBrokerSafely()
 {
 	FakeClock clock(9000);
-	NativeCoreProfile profile;
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
 	std::unique_ptr<HardwareBroker> broker(new HardwareBroker(clock));
 	PlatformGenerationId generation = 0;
-	assert(broker->Enter(profile, &generation) == MISTER_RESULT_OK);
+	assert(broker->EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
 	std::unique_ptr<OperationLease> lease;
 	assert(broker->Begin(generation, OperationKind::input, 10000, &lease) ==
 		MISTER_RESULT_OK);
@@ -415,7 +439,7 @@ void TestForeignNullDuplicateAndDestructionRejection()
 	FakeClock second_clock(200);
 	HardwareBroker first(first_clock);
 	HardwareBroker second(second_clock);
-	NativeCoreProfile profile;
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
 	PlatformGenerationId first_generation = 0;
 	PlatformGenerationId second_generation = 0;
 	std::unique_ptr<CleanupEpoch> first_epoch;
@@ -465,6 +489,7 @@ void TestForeignNullDuplicateAndDestructionRejection()
 int main()
 {
 	mister::native::TestOwningTypesAreNotForgeable();
+	mister::native::TestEnterRequiresExactTrustedFixtureAuthority();
 	mister::native::TestLeaseDurationQuiesceAndFreshGeneration();
 	mister::native::TestBoundedQuiesceNeverReopensAdmission();
 	mister::native::TestCleanupCannotOvertakeQuiesceReturn();

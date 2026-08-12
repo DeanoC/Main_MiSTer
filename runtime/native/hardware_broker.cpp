@@ -21,10 +21,11 @@ struct BrokerLifetime {
 struct OperationRegistration {
 	OperationRegistration(HardwareBroker &owner, LeaseAuthority lease_authority,
 		uint64_t identity, OperationKind kind, uint64_t deadline_ms,
-		const std::shared_ptr<BrokerLifetime> &broker_lifetime)
+		const std::shared_ptr<BrokerLifetime> &broker_lifetime,
+		const NativeCoreProfile *bound_profile)
 		: broker(&owner), lifetime(broker_lifetime), authority(lease_authority),
 		  authority_identity(identity), operation_kind(kind),
-		  absolute_deadline_ms(deadline_ms), registered(false)
+		  absolute_deadline_ms(deadline_ms), profile(bound_profile), registered(false)
 	{
 	}
 
@@ -42,6 +43,7 @@ struct OperationRegistration {
 	uint64_t authority_identity;
 	OperationKind operation_kind;
 	uint64_t absolute_deadline_ms;
+	const NativeCoreProfile *profile;
 	bool registered;
 };
 
@@ -97,10 +99,14 @@ uint64_t HardwareLeaseView::RecordMutation()
 	return registration_->broker->RecordMutation(*this);
 }
 
+uint64_t HardwareLeaseView::absolute_deadline_ms() const
+{
+	return registration_->absolute_deadline_ms;
+}
+
 OperationLease::OperationLease(
 	const std::shared_ptr<OperationRegistration> &registration)
-	: registration_(registration),
-	  operation_kind_(registration->operation_kind)
+	: registration_(registration)
 {
 }
 
@@ -117,6 +123,24 @@ Result OperationLease::AcquireHardwareLeaseView(
 	if (registration_->lifetime->broker != registration_->broker)
 		return MISTER_RESULT_INVALID_STATE;
 	return registration_->broker->AcquireHardwareLeaseView(*this, view);
+}
+
+Result OperationLease::AcquireInputHardwareLeaseView(
+	const NativeCoreProfile &profile,
+	std::unique_ptr<HardwareLeaseView> *view) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->AcquireHardwareLeaseViewFor(*this,
+		OperationKind::input, &profile, view);
+}
+
+OperationKind OperationLease::operation_kind() const
+{
+	return registration_->operation_kind;
 }
 
 uint64_t OperationLease::absolute_deadline_ms() const
@@ -172,7 +196,7 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 	  cleanup_registered_(false), cleanup_ever_started_(false),
 	  quiesce_complete_(false), quiesce_call_active_(false),
 	  containment_receipt_current_(false), recovery_registered_(false),
-	  hardware_transaction_active_(false), failure_latched_(false)
+	  hardware_transaction_active_(false), failure_latched_(false), profile_(nullptr)
 {
 }
 
@@ -185,8 +209,18 @@ HardwareBroker::~HardwareBroker()
 Result HardwareBroker::Enter(const NativeCoreProfile &profile,
 	PlatformGenerationId *generation)
 {
-	(void)profile;
+	return Enter(&profile, generation);
+}
+
+Result HardwareBroker::Enter(const NativeCoreProfile *profile,
+	PlatformGenerationId *generation)
+{
+	if (profile != nullptr &&
+		profile->authority == NativeProfileAuthority::fixture)
+		return MISTER_RESULT_UNSUPPORTED;
 	if (generation == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	if (profile == nullptr || !ValidateNativeCoreProfileRecord(*profile))
+		return MISTER_RESULT_UNSUPPORTED;
 
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (state_ != State::idle || generation_ != 0 ||
@@ -211,9 +245,44 @@ Result HardwareBroker::Enter(const NativeCoreProfile &profile,
 	quiesce_complete_ = false;
 	containment_receipt_current_ = false;
 	failure_latched_ = false;
+	profile_ = profile;
 	*generation = next_generation;
 	return MISTER_RESULT_OK;
 }
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+Result HardwareBroker::EnterFixtureForTest(const NativeCoreProfile &profile,
+	PlatformGenerationId *generation)
+{
+	if (generation == nullptr || !IsExactFixtureNativeCoreProfile(profile) ||
+		!ValidateNativeCoreProfileRecord(profile))
+		return MISTER_RESULT_UNSUPPORTED;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_ != State::idle || generation_ != 0 ||
+		active_lease_count_ != 0 || cleanup_registered_ || recovery_registered_)
+		return MISTER_RESULT_INVALID_STATE;
+	const PlatformGenerationId next_generation =
+		FreshNonzeroNonce(generation_nonce_source);
+	generation_ = next_generation;
+	state_ = State::active;
+	profile_ = &profile;
+	cleanup_identity_ = 0;
+	cleanup_non_fpga_deadline_ms_ = 0;
+	cleanup_fpga_deadline_ms_ = 0;
+	terminal_lease_deadline_ms_ = 0;
+	recovery_identity_ = 0;
+	recovery_requested_resource_flags_ = 0;
+	recovery_non_fpga_deadline_ms_ = 0;
+	recovery_fpga_deadline_ms_ = 0;
+	mutation_sequence_ = 0;
+	cleanup_ever_started_ = false;
+	quiesce_complete_ = false;
+	containment_receipt_current_ = false;
+	failure_latched_ = false;
+	*generation = next_generation;
+	return MISTER_RESULT_OK;
+}
+#endif
 
 Result HardwareBroker::Begin(PlatformGenerationId generation,
 	OperationKind operation_kind, uint64_t absolute_deadline_ms,
@@ -232,7 +301,7 @@ Result HardwareBroker::Begin(PlatformGenerationId generation,
 	std::shared_ptr<OperationRegistration> registration(
 		new (std::nothrow) OperationRegistration(*this,
 			LeaseAuthority::active_generation, generation, operation_kind,
-			absolute_deadline_ms, lifetime_));
+			absolute_deadline_ms, lifetime_, profile_));
 	if (!registration) return MISTER_RESULT_PLATFORM;
 	std::unique_ptr<OperationLease> admitted(
 		new (std::nothrow) OperationLease(registration));
@@ -339,7 +408,7 @@ Result HardwareBroker::BeginCleanupOperation(const CleanupEpoch &epoch,
 	std::shared_ptr<OperationRegistration> registration(
 		new (std::nothrow) OperationRegistration(*this,
 			LeaseAuthority::cleanup_epoch, epoch.identity_, operation_kind,
-			absolute_deadline_ms, lifetime_));
+			absolute_deadline_ms, lifetime_, profile_));
 	if (!registration) return MISTER_RESULT_PLATFORM;
 	std::unique_ptr<OperationLease> admitted(
 		new (std::nothrow) OperationLease(registration));
@@ -357,6 +426,15 @@ Result HardwareBroker::BeginCleanupOperation(const CleanupEpoch &epoch,
 Result HardwareBroker::AcquireHardwareLeaseView(const OperationLease &lease,
 	std::unique_ptr<HardwareLeaseView> *view)
 {
+	return AcquireHardwareLeaseViewFor(lease, lease.operation_kind(), nullptr,
+		view);
+}
+
+Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
+	OperationKind required_operation_kind,
+	const NativeCoreProfile *required_profile,
+	std::unique_ptr<HardwareLeaseView> *view)
+{
 	if (view == nullptr || view->get() != nullptr)
 		return MISTER_RESULT_INVALID_ARGUMENT;
 
@@ -367,9 +445,12 @@ Result HardwareBroker::AcquireHardwareLeaseView(const OperationLease &lease,
 		lease.registration_;
 	if (!registration || !registration->registered ||
 		registration->broker != this ||
+		registration->operation_kind != required_operation_kind ||
 		!IsHardwareOperation(registration->operation_kind)) {
 		return MISTER_RESULT_INVALID_STATE;
 	}
+	if (required_profile != nullptr && registration->profile != required_profile)
+		return MISTER_RESULT_UNSUPPORTED;
 	const bool active_authority =
 		registration->authority == LeaseAuthority::active_generation &&
 		registration->authority_identity == generation_ &&
@@ -476,7 +557,7 @@ Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
 	std::shared_ptr<OperationRegistration> registration(
 		new (std::nothrow) OperationRegistration(*this,
 			LeaseAuthority::recovery_epoch, epoch.identity_, operation_kind,
-			absolute_deadline_ms, lifetime_));
+			absolute_deadline_ms, lifetime_, profile_));
 	if (!registration) return MISTER_RESULT_PLATFORM;
 	std::unique_ptr<OperationLease> admitted(
 		new (std::nothrow) OperationLease(registration));

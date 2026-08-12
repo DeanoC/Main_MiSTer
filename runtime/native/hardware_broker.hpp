@@ -6,6 +6,7 @@
 
 #include "runtime/mister_runtime.h"
 #include "runtime/native/native_clock.hpp"
+#include "runtime/native/native_core_profile.hpp"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -16,8 +17,6 @@
 
 namespace mister {
 namespace native {
-
-struct NativeCoreProfile;
 
 using PlatformGenerationId = uint64_t;
 using Result = MisterResult;
@@ -44,6 +43,7 @@ enum class OperationKind : uint8_t {
 
 class HardwareBroker;
 class OperationLease;
+class NativeInput;
 class NativeSpiBus;
 struct BrokerLifetime;
 struct OperationRegistration;
@@ -60,6 +60,7 @@ private:
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
 	uint64_t RecordMutation();
+	uint64_t absolute_deadline_ms() const;
 
 	std::shared_ptr<OperationRegistration> registration_;
 };
@@ -72,19 +73,21 @@ public:
 	OperationLease(OperationLease &&) = delete;
 	OperationLease &operator=(OperationLease &&) = delete;
 
-	OperationKind operation_kind() const { return operation_kind_; }
+	OperationKind operation_kind() const;
 	uint64_t absolute_deadline_ms() const;
 
 private:
 	friend class HardwareBroker;
+	friend class NativeInput;
 	friend class NativeSpiBus;
 	explicit OperationLease(
 		const std::shared_ptr<OperationRegistration> &registration);
 	Result AcquireHardwareLeaseView(
 		std::unique_ptr<HardwareLeaseView> *view) const;
+	Result AcquireInputHardwareLeaseView(const NativeCoreProfile &profile,
+		std::unique_ptr<HardwareLeaseView> *view) const;
 
 	std::shared_ptr<OperationRegistration> registration_;
-	OperationKind operation_kind_;
 };
 
 class CleanupEpoch final {
@@ -144,6 +147,12 @@ public:
 
 	Result Enter(const NativeCoreProfile &profile,
 		PlatformGenerationId *generation);
+	Result Enter(const NativeCoreProfile *profile,
+		PlatformGenerationId *generation);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	Result EnterFixtureForTest(const NativeCoreProfile &profile,
+		PlatformGenerationId *generation);
+#endif
 	Result Begin(PlatformGenerationId generation, OperationKind operation_kind,
 		uint64_t absolute_deadline_ms,
 		std::unique_ptr<OperationLease> *lease);
@@ -201,6 +210,10 @@ private:
 		const CleanupEpoch &epoch, uint64_t *absolute_deadline_ms);
 	static bool RecoveryDeadline(OperationKind operation_kind,
 		const RecoveryEpoch &epoch, uint64_t *absolute_deadline_ms);
+	Result AcquireHardwareLeaseViewFor(const OperationLease &lease,
+		OperationKind required_operation_kind,
+		const NativeCoreProfile *required_profile,
+		std::unique_ptr<HardwareLeaseView> *view);
 	uint64_t RecordMutation(const HardwareLeaseView &view);
 
 	NativeClock &clock_;
@@ -228,6 +241,7 @@ private:
 	bool recovery_registered_;
 	bool hardware_transaction_active_;
 	bool failure_latched_;
+	const NativeCoreProfile *profile_;
 };
 
 } // namespace native
