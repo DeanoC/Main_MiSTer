@@ -95,6 +95,10 @@ public:
 		++core_protocol_session_calls;
 		const Result primary = ApplyDeadline(lease.absolute_deadline_ms(),
 			OperationKind::core_protocol, state);
+		if (abandon_core_protocol_release_once) {
+			abandon_core_protocol_release_once = false;
+			return MISTER_RESULT_PLATFORM;
+		}
 		const ProtocolMappingReleaseReceipt release = {
 			MISTER_RESULT_OK, true, true, true, true, true,
 			broker_.mutation_sequence_for_test()};
@@ -109,6 +113,7 @@ public:
 	int calls;
 	int core_protocol_session_calls;
 	uint64_t last_deadline;
+	bool abandon_core_protocol_release_once = false;
 };
 
 class FakeContainmentIo final : public NativeContainmentIo {
@@ -509,6 +514,34 @@ void TestCoreProtocolRecoveryUsesProfilelessSessionAuthority()
 		MISTER_RESOURCE_CORE_PROTOCOL);
 }
 
+void TestCoreProtocolRecoveryReleaseRetryRetainsItsRecoveryLease()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	NativeRecovery recovery(broker, io);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL, 3000, 6000,
+		&epoch) == MISTER_RESULT_OK);
+	io.states[KindIndex(OperationKind::core_protocol)] =
+		RecoveryResourceState::neutral;
+	io.abandon_core_protocol_release_once = true;
+	assert(recovery.Perform(*epoch, OperationKind::core_protocol) ==
+		MISTER_RESULT_PLATFORM);
+	assert(io.core_protocol_session_calls == 1);
+	const uint64_t original_deadline = io.last_deadline;
+	MisterRecoveryObservationV2 observation = Observation();
+	assert(recovery.Finish(std::move(epoch), &observation) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(epoch != nullptr);
+	clock.SetNow(2000);
+	assert(recovery.Perform(*epoch, OperationKind::core_protocol) ==
+		MISTER_RESULT_OK);
+	assert(io.core_protocol_session_calls == 2);
+	assert(io.last_deadline == original_deadline);
+	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+}
+
 void TestTerminalRecoveryAndReadOnlyObservation()
 {
 	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
@@ -786,6 +819,7 @@ int main()
 	TestBusyRecoveryAdmissionDoesNotLatchDeadline();
 	TestOperationOverrunRetainsTruthfulResult();
 	TestCoreProtocolRecoveryUsesProfilelessSessionAuthority();
+	TestCoreProtocolRecoveryReleaseRetryRetainsItsRecoveryLease();
 	TestTerminalRecoveryAndReadOnlyObservation();
 	TestRepeatedObservationReplacesStaleClassification();
 	TestForeignRecoveryAuthorityCannotMutate();

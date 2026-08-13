@@ -41,7 +41,7 @@ NativeLifecycle::NativeLifecycle(NativeClock &clock, HardwareBroker &broker,
 	  cleanup_timing_(EmptyCleanupTiming()),
 	  failure_drain_timing_(EmptyFailureDrainTiming()),
 	  latched_activation_result_(MISTER_RESULT_OK), profile_(nullptr),
-	  cleanup_epoch_()
+	  cleanup_epoch_(), core_protocol_cleanup_lease_()
 {
 }
 
@@ -50,6 +50,9 @@ NativeLifecycle::~NativeLifecycle()
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (state_ == NativeLifecycleState::active && generation_ != 0)
 		broker_.LatchFailure(generation_);
+	// This only releases the registration. The protocol resource owns the
+	// process-exit close path and session-handle destruction performs no I/O.
+	core_protocol_cleanup_lease_.reset();
 	cleanup_epoch_.reset();
 	if (ledger_.scheduler)
 		resources_.scheduler.CloseSchedulerForProcessExit();
@@ -562,13 +565,18 @@ Result NativeLifecycle::RunCleanupLocked()
 	}
 	if ((ledger_.resource_flags & MISTER_RESOURCE_CORE_PROTOCOL) != 0 &&
 		!ledger_.core_protocol_shutdown_complete) {
-		result = BeginCleanupOperationLocked(OperationKind::core_protocol, &lease);
-		if (result != MISTER_RESULT_OK) return result;
-		result = resources_.hardware.ShutdownCoreProtocol(*lease);
-		result = FinishCleanupOperationLocked(result, *lease);
-		lease.reset();
+		if (!core_protocol_cleanup_lease_) {
+			result = BeginCleanupOperationLocked(OperationKind::core_protocol,
+				&core_protocol_cleanup_lease_);
+			if (result != MISTER_RESULT_OK) return result;
+		}
+		result = resources_.hardware.ShutdownCoreProtocol(
+			*core_protocol_cleanup_lease_);
+		result = FinishCleanupOperationLocked(result,
+			*core_protocol_cleanup_lease_);
 		if (result != MISTER_RESULT_OK) return result;
 		ledger_.core_protocol_shutdown_complete = true;
+		core_protocol_cleanup_lease_.reset();
 	}
 
 	result = BeginCleanupOperationLocked(OperationKind::terminal_fpga_cleanup,
@@ -608,6 +616,7 @@ void NativeLifecycle::ClearGenerationLocked()
 	failure_drain_timing_ = EmptyFailureDrainTiming();
 	latched_activation_result_ = MISTER_RESULT_OK;
 	profile_ = nullptr;
+	core_protocol_cleanup_lease_.reset();
 }
 
 NativeLifecycleState NativeLifecycle::state() const

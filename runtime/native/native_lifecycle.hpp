@@ -110,6 +110,7 @@ private:
 	Result latched_activation_result_;
 	const NativeCoreProfile *profile_;
 	std::unique_ptr<CleanupEpoch> cleanup_epoch_;
+	std::unique_ptr<OperationLease> core_protocol_cleanup_lease_;
 };
 
 } // namespace native

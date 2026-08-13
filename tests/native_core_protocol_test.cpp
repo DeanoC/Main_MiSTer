@@ -58,7 +58,7 @@ struct Trace {
 	std::vector<uint16_t> words;
 };
 
-class TraceIo final : public NativeCoreProtocolIo {
+class TraceIo final : public NativeActiveCoreProtocolIo {
 public:
 	TraceIo() : live_{0x005ca623, 0xa8,
 		NativeFileIoWidth::little_endian_byte_pairs, 2}, responses_(), traces_() {}

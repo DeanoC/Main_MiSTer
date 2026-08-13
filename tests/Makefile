@@ -100,6 +100,14 @@ NATIVE_LINUX_INPUT_EXECUTION_HEADERS = \
 	runtime/native/native_spi_bus.hpp runtime/native/native_hardware_io.hpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp \
 	runtime/native/native_core_profile.hpp runtime/mister_runtime.h
+NATIVE_LINUX_CORE_PROTOCOL_IO_TEST_OBJECT = \
+	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test.o
+NATIVE_LINUX_CORE_PROTOCOL_IO_OBJECT = \
+	$(HOST_TEST_DIR)/native_core_protocol_io_adapter.o
+NATIVE_LINUX_CORE_PROTOCOL_IO_PRODUCTION_OBJECT = \
+	$(HOST_TEST_DIR)/native_core_protocol_io_adapter_production.o
+NATIVE_CORE_PROTOCOL_CAPABILITY_REACHABILITY_TEST_OBJECT = \
+	$(HOST_TEST_DIR)/native_core_protocol_capability_reachability_test.o
 RUNTIME_LINUX_V2_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2.o
 FOGCAST_STORAGE_PROBE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_storage_probe.o
 HOST_TEST_INCLUDE = $(if $(filter Darwin,$(shell uname -s)),-Itests/include)
@@ -112,7 +120,42 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-core-protocol test-native-core-protocol-reachability test-native-core-protocol-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-core-protocol test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+
+test-native-linux-core-protocol-io: \
+	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test \
+	test-native-linux-core-protocol-io-reachability \
+	test-native-core-protocol-capability-reachability
+	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test
+
+test-native-linux-core-protocol-io-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-core-protocol-io-sanitize-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-linux-core-protocol-io
+
+test-native-linux-core-protocol-io-tsan:
+	TSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-core-protocol-io-tsan-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' test-native-linux-core-protocol-io
+
+test-native-core-protocol-capability-reachability: \
+	$(HOST_TEST_DIR)/native_core_protocol_capability_reachability_test
+	$(HOST_TEST_DIR)/native_core_protocol_capability_reachability_test
+	@if $(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_PROFILE_TESTING \
+		-DMISTER_NATIVE_CORE_PROTOCOL_FIXTURE_CONSTRUCTOR_REACHABILITY_PROBE \
+		-I. -fsyntax-only tests/native_core_protocol_capability_reachability_test.cpp \
+		>/dev/null 2>&1; then \
+		echo "production protocol exposes the fixture-only active constructor" >&2; exit 1; \
+	fi
+
+test-native-linux-core-protocol-io-reachability: \
+	$(NATIVE_LINUX_CORE_PROTOCOL_IO_PRODUCTION_OBJECT)
+	@if $(HOST_CXX) $(HOST_CXX_FLAGS) \
+		-UMISTER_NATIVE_CORE_PROTOCOL_IO_TESTING \
+		-DMISTER_NATIVE_CORE_PROTOCOL_IO_REACHABILITY_PROBE -I. -fsyntax-only \
+		tests/native_linux_core_protocol_io_test.cpp >/dev/null 2>&1; then \
+		echo "production header exposes raw core-protocol I/O authority" >&2; exit 1; \
+	fi
+	@if nm -g $(NATIVE_LINUX_CORE_PROTOCOL_IO_PRODUCTION_OBJECT) | \
+		grep -E 'NativeCoreProtocolIoTest|LinuxOperations|PosixOperations|ff706' >/dev/null; then \
+		echo "core-protocol I/O adapter exports raw authority" >&2; exit 1; \
+	fi
 
 test-native-linux-input-execution: \
 	$(HOST_TEST_DIR)/native_linux_input_execution_test \
@@ -541,8 +584,39 @@ $(NATIVE_CORE_PROTOCOL_OBJECT): runtime/native/native_core_protocol.cpp \
 
 $(HOST_TEST_DIR)/native_core_protocol_test: \
 	$(NATIVE_CORE_PROTOCOL_TEST_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
+
+$(NATIVE_LINUX_CORE_PROTOCOL_IO_TEST_OBJECT): \
+	tests/native_linux_core_protocol_io_test.cpp \
+	runtime/native/linux/native_core_protocol_io_adapter.hpp \
+	runtime/native/native_core_protocol.hpp runtime/native/native_resources.hpp \
+	runtime/native/native_recovery.hpp runtime/native/hardware_broker.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_CORE_PROTOCOL_IO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(NATIVE_LINUX_CORE_PROTOCOL_IO_OBJECT): \
+	runtime/native/linux/native_core_protocol_io_adapter.cpp \
+	runtime/native/linux/native_core_protocol_io_adapter.hpp \
+	runtime/native/native_core_protocol_session_state.hpp \
+	runtime/native/hardware_broker.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_CORE_PROTOCOL_IO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(NATIVE_LINUX_CORE_PROTOCOL_IO_PRODUCTION_OBJECT): \
+	runtime/native/linux/native_core_protocol_io_adapter.cpp \
+	runtime/native/linux/native_core_protocol_io_adapter.hpp \
+	runtime/native/native_core_protocol_session_state.hpp \
+	runtime/native/hardware_broker.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_CORE_PROTOCOL_IO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_linux_core_protocol_io_test: \
+	$(NATIVE_LINUX_CORE_PROTOCOL_IO_TEST_OBJECT) \
+	$(NATIVE_LINUX_CORE_PROTOCOL_IO_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_RECOVERY_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT)
-	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(NATIVE_CORE_PROTOCOL_REACHABILITY_TEST_OBJECT): \
 	tests/native_core_protocol_reachability_test.cpp \
@@ -551,6 +625,16 @@ $(NATIVE_CORE_PROTOCOL_REACHABILITY_TEST_OBJECT): \
 	runtime/native/native_hardware_io.hpp runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(NATIVE_CORE_PROTOCOL_CAPABILITY_REACHABILITY_TEST_OBJECT): \
+	tests/native_core_protocol_capability_reachability_test.cpp \
+	runtime/native/native_core_protocol.hpp \
+	runtime/native/linux/native_core_protocol_io_adapter.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(HOST_TEST_DIR)/native_core_protocol_capability_reachability_test: \
+	$(NATIVE_CORE_PROTOCOL_CAPABILITY_REACHABILITY_TEST_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
 
 $(HOST_TEST_DIR)/native_core_protocol_reachability_test: \
 	$(NATIVE_CORE_PROTOCOL_REACHABILITY_TEST_OBJECT)

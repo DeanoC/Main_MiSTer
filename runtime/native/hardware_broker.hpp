@@ -56,6 +56,7 @@ class NativeSpiBus;
 class NativeContainment;
 class NativeRecovery;
 class NativeCoreProtocol;
+class NativeCoreProtocolTeardown;
 class NativeLifecycle;
 class CoreProtocolAuthorityTestPeer;
 class ActiveCoreProtocolSession;
@@ -71,6 +72,11 @@ class NativeFpgaProgrammer;
 class NativeInputAdapter;
 class NativeSchedulerAdapter;
 class NativeOffloadAdapter;
+class NativeCoreProtocolIoAdapter;
+class NativeCoreProtocolIoAdapterImpl;
+class NativeCoreProtocolActiveAdapterView;
+class NativeCoreProtocolCleanupAdapterView;
+class NativeCoreProtocolRecoveryAdapterView;
 }
 
 class ProcessOperationGuard final {
@@ -106,10 +112,12 @@ private:
 	friend class HardwareBroker;
 	friend class NativeSpiBus;
 	friend class NativeContainment;
+	friend class NativeCoreProtocol;
 	friend class ActiveCoreProtocolSession;
 	friend class CleanupCoreProtocolSession;
 	friend class RecoveryCoreProtocolSession;
 	friend class linux_native::NativeFpgaProgrammer;
+	friend class linux_native::NativeCoreProtocolIoAdapterImpl;
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
 	uint64_t RecordMutation();
@@ -166,6 +174,7 @@ private:
 	friend class NativeInput;
 	friend class NativeSpiBus;
 	friend class NativeCoreProtocol;
+	friend class NativeCoreProtocolTeardown;
 	friend class NativeLifecycle;
 	friend class NativeRecovery;
 	friend class CoreProtocolAuthorityTestPeer;

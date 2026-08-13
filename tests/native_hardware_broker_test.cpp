@@ -785,6 +785,63 @@ void TestCleanupAndRecoveryProtocolAbandonmentRetainBrokerFence()
 	}
 }
 
+void TestCleanupAndRecoveryProtocolRecheckoutRequiresExactAbandonedOwner()
+{
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	{
+		FakeClock clock(3000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		std::unique_ptr<CleanupEpoch> epoch;
+		PrepareCleanup(broker, clock, profile, &generation, &epoch);
+		std::unique_ptr<OperationLease> owner;
+		std::unique_ptr<OperationLease> foreign;
+		assert(broker.BeginCleanupOperation(*epoch, OperationKind::core_protocol,
+			&owner) == MISTER_RESULT_OK);
+		assert(broker.BeginCleanupOperation(*epoch, OperationKind::core_protocol,
+			&foreign) == MISTER_RESULT_OK);
+		const uint64_t original_deadline = owner->absolute_deadline_ms();
+		std::unique_ptr<CleanupCoreProtocolSession> session;
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*owner, broker,
+			&session) == MISTER_RESULT_OK);
+		session.reset();
+		assert(broker.core_protocol_session_abandoned_for_test(*owner));
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*foreign, broker,
+			&session) == MISTER_RESULT_INVALID_STATE);
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*owner, broker,
+			&session) == MISTER_RESULT_OK);
+		assert(owner->absolute_deadline_ms() == original_deadline);
+		std::unique_ptr<CleanupCoreProtocolSession> duplicate;
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*owner, broker,
+			&duplicate) == MISTER_RESULT_INVALID_STATE);
+		const ProtocolMappingReleaseReceipt receipt = {
+			MISTER_RESULT_OK, true, true, true, true, true,
+			broker.mutation_sequence_for_test()};
+		assert(CoreProtocolAuthorityTestPeer::CompleteCleanup(*owner, broker,
+			std::move(session), receipt) == MISTER_RESULT_OK);
+	}
+	{
+		FakeClock clock(7000);
+		HardwareBroker broker(clock);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL,
+			9000, 12000, &epoch) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> owner;
+		assert(broker.BeginRecoveryOperation(*epoch, OperationKind::core_protocol,
+			&owner) == MISTER_RESULT_OK);
+		const uint64_t original_deadline = owner->absolute_deadline_ms();
+		std::unique_ptr<RecoveryCoreProtocolSession> session;
+		assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*owner, broker,
+			&session) == MISTER_RESULT_OK);
+		session.reset();
+		clock.SetNow(original_deadline);
+		assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*owner, broker,
+			&session) == MISTER_RESULT_DEADLINE);
+		assert(broker.core_protocol_session_abandoned_for_test(*owner));
+		assert(owner->absolute_deadline_ms() == original_deadline);
+	}
+}
+
 void TestCleanupAndRecoveryProtocolCompletionAreExplicit()
 {
 	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
@@ -986,6 +1043,7 @@ int main()
 	mister::native::TestForeignActiveRegistrationCannotInvalidateCurrentSession();
 	mister::native::TestProtocolHandleAbandonmentRetainsBrokerFence();
 	mister::native::TestCleanupAndRecoveryProtocolAbandonmentRetainBrokerFence();
+	mister::native::TestCleanupAndRecoveryProtocolRecheckoutRequiresExactAbandonedOwner();
 	mister::native::TestCleanupAndRecoveryProtocolCompletionAreExplicit();
 	mister::native::TestCleanupCannotOvertakeQuiesceReturn();
 	mister::native::TestOwningTokenMayOutliveBrokerSafely();

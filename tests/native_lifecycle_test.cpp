@@ -170,6 +170,11 @@ public:
 		expected_deadline_ms_ = deadline_ms;
 	}
 
+	void AbandonCoreProtocolReleaseOnce()
+	{
+		abandon_core_protocol_release_once_ = true;
+	}
+
 	Result Validate(const NativeCoreProfile &, uint64_t absolute_deadline_ms) override
 	{
 		return RunBounded(Event::preflight, absolute_deadline_ms);
@@ -273,6 +278,10 @@ public:
 		hardware_events.push_back(Event::shutdown_core_protocol);
 		hardware_deadlines.push_back(lease.absolute_deadline_ms());
 		const Result primary = Run(Event::shutdown_core_protocol);
+		if (abandon_core_protocol_release_once_) {
+			abandon_core_protocol_release_once_ = false;
+			return MISTER_RESULT_PLATFORM;
+		}
 		const ProtocolMappingReleaseReceipt release = {
 			MISTER_RESULT_OK, true, true, true, true, true,
 			broker_.mutation_sequence_for_test()};
@@ -435,6 +444,7 @@ public:
 	NativeContentResource *protocol_content_;
 	const NativeCoreProfile *shutdown_protocol_profile_;
 	MalformedProtocolOutcome malformed_protocol_outcome_;
+	bool abandon_core_protocol_release_once_ = false;
 	bool hold_concurrent_protocol_peer_ = false;
 	std::unique_ptr<OperationLease> concurrent_protocol_peer_;
 
@@ -951,6 +961,29 @@ void TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates()
 		Event::terminal_fpga_cleanup) == timing.fpga_deadline_ms);
 }
 
+void TestCoreProtocolReleaseRetryRetainsItsCleanupLease()
+{
+	Fixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	fixture.resources.AbandonCoreProtocolReleaseOnce();
+	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 1);
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
+	assert((fixture.lifecycle.ledger().resource_flags &
+		MISTER_RESOURCE_CORE_PROTOCOL) != 0);
+	assert(!fixture.lifecycle.ledger().core_protocol_shutdown_complete);
+
+	fixture.clock.SetNow(200);
+	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 2);
+	assert(fixture.resources.LastHardwareDeadline(Event::shutdown_core_protocol) ==
+		timing.fpga_deadline_ms);
+	assert(fixture.lifecycle.ledger().core_protocol_shutdown_complete);
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
+}
+
 void TestNormalStopUsesTheNormativeOrder()
 {
 	Fixture fixture(100);
@@ -1146,6 +1179,7 @@ int main()
 	mister::native::TestMalformedProtocolOutcomesCloseBeforeReleaseAndUseFrozenDrain();
 	mister::native::TestCleanupDeadlineArithmeticSaturatesWithoutWrapping();
 	mister::native::TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates();
+	mister::native::TestCoreProtocolReleaseRetryRetainsItsCleanupLease();
 	mister::native::TestNormalStopUsesTheNormativeOrder();
 	mister::native::TestCleanupFailureRetainsTheFailedResourceLedger();
 	mister::native::TestCleanupSuccessAtDeadlineDoesNotClearTheLedger();

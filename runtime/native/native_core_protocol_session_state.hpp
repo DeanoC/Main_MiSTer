@@ -16,6 +16,14 @@ class HardwareLeaseView;
 struct NativeCoreProfile;
 struct OperationRegistration;
 
+// Platform adapters keep their opaque, typed mapping state here rather than
+// beside a transient session handle. The generic protocol boundary never sees
+// a Linux address, descriptor, or register mask.
+class ProtocolSessionIoState {
+public:
+	virtual ~ProtocolSessionIoState() {}
+};
+
 enum class ProtocolSessionHandleState : uint8_t {
 	live,
 	abandoned,
@@ -31,6 +39,7 @@ struct ProtocolSessionState {
 	const NativeCoreProfile *profile;
 	uint64_t initial_mutation_sequence;
 	std::atomic<ProtocolSessionHandleState> handle_state;
+	std::shared_ptr<ProtocolSessionIoState> io_state;
 };
 
 inline void MarkProtocolSessionAbandoned(

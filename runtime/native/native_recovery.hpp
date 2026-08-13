@@ -48,6 +48,8 @@ private:
 
 	HardwareBroker &broker_;
 	NativeRecoveryIo &io_;
+	const RecoveryEpoch *core_protocol_epoch_;
+	std::unique_ptr<OperationLease> core_protocol_lease_;
 };
 
 } // namespace native

@@ -15,7 +15,7 @@ namespace native {
 ProtocolSessionState::ProtocolSessionState()
 	: view(), owner_registration(), profile(nullptr),
 	  initial_mutation_sequence(0),
-	  handle_state(ProtocolSessionHandleState::live)
+	  handle_state(ProtocolSessionHandleState::live), io_state()
 {
 }
 
@@ -916,17 +916,47 @@ Result HardwareBroker::AcquireCleanupCoreProtocolSessionFor(
 	std::lock_guard<std::mutex> lock(mutex_);
 	const std::shared_ptr<OperationRegistration> &registration =
 		lease.registration_;
-	if (hardware_transaction_active_ || containment_evidence_pending_ ||
-		!registration || !registration->registered ||
-		registration->core_protocol_session_state ||
-		registration->core_protocol_completion !=
-			CoreProtocolBrokerDisposition::no_session ||
+	if (!registration || !registration->registered ||
 		registration->broker != this ||
 		registration->operation_kind != OperationKind::core_protocol ||
 		registration->authority != LeaseAuthority::cleanup_epoch ||
 		registration->authority_identity != cleanup_identity_ ||
 		registration->profile == nullptr || registration->profile != profile_ ||
 		state_ != State::cleanup || !cleanup_registered_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (registration->core_protocol_session_state) {
+		// A failed teardown retains the original registration, view, and
+		// immutable epoch deadline. Only that registration can atomically
+		// re-check out its abandoned typed handle.
+		if (clock_.NowMs() >= registration->absolute_deadline_ms)
+			return MISTER_RESULT_DEADLINE;
+		const std::shared_ptr<ProtocolSessionState> current =
+			core_protocol_session_state_.lock();
+		const std::shared_ptr<ProtocolSessionState> &retained =
+			registration->core_protocol_session_state;
+		if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+			registration->core_protocol_completion !=
+				CoreProtocolBrokerDisposition::no_session ||
+			current.get() != retained.get() || !retained->view ||
+			retained->profile != profile_ ||
+			retained->owner_registration.lock().get() != registration.get() ||
+			retained->view->registration_.get() != registration.get())
+			return MISTER_RESULT_INVALID_STATE;
+		std::unique_ptr<CleanupCoreProtocolSession> admitted(
+			new (std::nothrow) CleanupCoreProtocolSession());
+		if (!admitted) return MISTER_RESULT_PLATFORM;
+		ProtocolSessionHandleState expected =
+			ProtocolSessionHandleState::abandoned;
+		if (!retained->handle_state.compare_exchange_strong(expected,
+			ProtocolSessionHandleState::live))
+			return MISTER_RESULT_INVALID_STATE;
+		admitted->state_ = retained;
+		*session = std::move(admitted);
+		return MISTER_RESULT_OK;
+	}
+	if (hardware_transaction_active_ || containment_evidence_pending_ ||
+		registration->core_protocol_completion !=
+			CoreProtocolBrokerDisposition::no_session)
 		return MISTER_RESULT_INVALID_STATE;
 	if (clock_.NowMs() >= registration->absolute_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
@@ -960,11 +990,7 @@ Result HardwareBroker::AcquireRecoveryCoreProtocolSessionFor(
 	std::lock_guard<std::mutex> lock(mutex_);
 	const std::shared_ptr<OperationRegistration> &registration =
 		lease.registration_;
-	if (hardware_transaction_active_ || containment_evidence_pending_ ||
-		!registration || !registration->registered ||
-		registration->core_protocol_session_state ||
-		registration->core_protocol_completion !=
-			CoreProtocolBrokerDisposition::no_session ||
+	if (!registration || !registration->registered ||
 		registration->broker != this ||
 		registration->operation_kind != OperationKind::core_protocol ||
 		registration->authority != LeaseAuthority::recovery_epoch ||
@@ -973,6 +999,39 @@ Result HardwareBroker::AcquireRecoveryCoreProtocolSessionFor(
 		!recovery_registered_ || recovery_terminal_neutral_ ||
 		(recovery_requested_resource_flags_ &
 		 MISTER_RESOURCE_CORE_PROTOCOL) == 0)
+		return MISTER_RESULT_INVALID_STATE;
+	if (registration->core_protocol_session_state) {
+		// Recovery has no profile, but it retains the exact requested
+		// CORE_PROTOCOL registration and its original deadline on failure.
+		if (clock_.NowMs() >= registration->absolute_deadline_ms)
+			return MISTER_RESULT_DEADLINE;
+		const std::shared_ptr<ProtocolSessionState> current =
+			core_protocol_session_state_.lock();
+		const std::shared_ptr<ProtocolSessionState> &retained =
+			registration->core_protocol_session_state;
+		if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+			registration->core_protocol_completion !=
+				CoreProtocolBrokerDisposition::no_session ||
+			current.get() != retained.get() || !retained->view ||
+			retained->profile != nullptr ||
+			retained->owner_registration.lock().get() != registration.get() ||
+			retained->view->registration_.get() != registration.get())
+			return MISTER_RESULT_INVALID_STATE;
+		std::unique_ptr<RecoveryCoreProtocolSession> admitted(
+			new (std::nothrow) RecoveryCoreProtocolSession());
+		if (!admitted) return MISTER_RESULT_PLATFORM;
+		ProtocolSessionHandleState expected =
+			ProtocolSessionHandleState::abandoned;
+		if (!retained->handle_state.compare_exchange_strong(expected,
+			ProtocolSessionHandleState::live))
+			return MISTER_RESULT_INVALID_STATE;
+		admitted->state_ = retained;
+		*session = std::move(admitted);
+		return MISTER_RESULT_OK;
+	}
+	if (hardware_transaction_active_ || containment_evidence_pending_ ||
+		registration->core_protocol_completion !=
+			CoreProtocolBrokerDisposition::no_session)
 		return MISTER_RESULT_INVALID_STATE;
 	if (clock_.NowMs() >= registration->absolute_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
