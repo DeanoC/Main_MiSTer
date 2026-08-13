@@ -169,6 +169,14 @@ uint64_t HardwareLeaseView::RecordMutation()
 	return registration_->broker->RecordMutation(*this);
 }
 
+uint64_t HardwareLeaseView::CurrentMutationSequence() const
+{
+	if (!registration_ || !registration_->lifetime) return 0;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker) return 0;
+	return registration_->broker->CurrentMutationSequence(*this);
+}
+
 Result HardwareLeaseView::RecordFpgaProgrammingMutation(
 	size_t accepted_bytes, uint64_t *mutation_sequence)
 {
@@ -632,6 +640,9 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 	  receipt_requested_resource_flags_(0), receipt_core_gpo_(0),
 	  receipt_interface_module_(0), receipt_sdr_port_control_(0),
 	  receipt_bridge_reset_(0), receipt_remap_(0),
+	  receipt_manager_control_(0), receipt_manager_mode_(0),
+	  receipt_manager_neutral_observed_(false),
+	  receipt_manager_neutral_mutation_sequence_(0),
 	  receipt_mutation_sequence_(0), recovery_observed_resource_flags_(0),
 	  recovery_neutral_resource_flags_(0), receipt_mappings_released_(false),
 	  receipt_registration_(nullptr),
@@ -776,6 +787,20 @@ uint64_t HardwareBroker::containment_receipt_sequence_for_test()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return containment_receipt_current_ ? receipt_mutation_sequence_ : 0;
+}
+
+bool HardwareBroker::containment_manager_receipt_for_test(uint32_t *control,
+	uint32_t *mode, uint64_t *mutation_sequence)
+{
+	if (control == nullptr || mode == nullptr || mutation_sequence == nullptr)
+		return false;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!containment_receipt_current_ ||
+		!receipt_manager_neutral_observed_) return false;
+	*control = receipt_manager_control_;
+	*mode = receipt_manager_mode_;
+	*mutation_sequence = receipt_manager_neutral_mutation_sequence_;
+	return true;
 }
 
 bool HardwareBroker::core_protocol_failure_receipt_for_test(
@@ -3170,6 +3195,18 @@ uint64_t HardwareBroker::RecordMutation(const HardwareLeaseView &view)
 	return ++mutation_sequence_;
 }
 
+uint64_t HardwareBroker::CurrentMutationSequence(
+	const HardwareLeaseView &view)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || !registration ||
+		!registration->registered || registration->broker != this)
+		return 0;
+	return mutation_sequence_;
+}
+
 Result HardwareBroker::RecordFpgaProgrammingMutation(
 	const HardwareLeaseView &view, size_t accepted_bytes,
 	uint64_t *mutation_sequence)
@@ -3274,6 +3311,9 @@ Result HardwareBroker::ValidateContainmentBoundary(
 
 Result HardwareBroker::MintContainmentResumeKey(
 	const HardwareLeaseView &view,
+	uint32_t core_gpo, uint32_t interface_module, uint32_t sdr_port_control,
+	uint32_t bridge_reset, uint32_t remap, uint32_t manager_control,
+	uint32_t manager_mode, uint64_t manager_mutation_sequence,
 	std::unique_ptr<ContainmentResumeKey> *key)
 {
 	if (key == nullptr || key->get() != nullptr)
@@ -3299,7 +3339,9 @@ Result HardwareBroker::MintContainmentResumeKey(
 	std::unique_ptr<ContainmentResumeKey> minted(
 		new (std::nothrow) ContainmentResumeKey(*this,
 			registration->authority, registration->authority_identity,
-			cleanup ? generation_ : 0, lifetime_));
+			cleanup ? generation_ : 0, mutation_sequence_, core_gpo,
+			interface_module, sdr_port_control, bridge_reset, remap,
+			manager_control, manager_mode, manager_mutation_sequence, lifetime_));
 	if (!minted) return MISTER_RESULT_PLATFORM;
 	*key = std::move(minted);
 	return MISTER_RESULT_OK;
@@ -3307,7 +3349,10 @@ Result HardwareBroker::MintContainmentResumeKey(
 
 Result HardwareBroker::ValidateContainmentResumeKey(
 	const ContainmentResumeKey &key,
-	const OperationLease &terminal_lease)
+	const OperationLease &terminal_lease, uint32_t core_gpo,
+	uint32_t interface_module, uint32_t sdr_port_control,
+	uint32_t bridge_reset, uint32_t remap, uint32_t manager_control,
+	uint32_t manager_mode, uint64_t manager_mutation_sequence)
 {
 	const std::shared_ptr<BrokerLifetime> key_lifetime = key.lifetime_.lock();
 	if (!key_lifetime || key.broker_ != this ||
@@ -3322,6 +3367,12 @@ Result HardwareBroker::ValidateContainmentResumeKey(
 		registration->operation_kind != OperationKind::terminal_fpga_cleanup ||
 		registration->authority != key.authority_ ||
 		registration->authority_identity != key.authority_identity_ ||
+		mutation_sequence_ != key.mutation_sequence_ ||
+		core_gpo != key.core_gpo_ || interface_module != key.interface_module_ ||
+		sdr_port_control != key.sdr_port_control_ || bridge_reset != key.bridge_reset_ ||
+		remap != key.remap_ || manager_control != key.manager_control_ ||
+		manager_mode != key.manager_mode_ ||
+		manager_mutation_sequence != key.manager_mutation_sequence_ ||
 		active_lease_count_ != 1 || terminal_lease_count_ != 1)
 		return MISTER_RESULT_INVALID_STATE;
 	const bool cleanup = key.authority_ == LeaseAuthority::cleanup_epoch &&
@@ -3339,7 +3390,9 @@ Result HardwareBroker::ValidateContainmentResumeKey(
 Result HardwareBroker::StageContainmentEvidence(
 	const OperationLease &terminal_lease, uint32_t core_gpo,
 	uint32_t interface_module, uint32_t sdr_port_control,
-	uint32_t bridge_reset, uint32_t remap, bool mappings_released)
+	uint32_t bridge_reset, uint32_t remap, uint32_t manager_control,
+	uint32_t manager_mode, bool manager_neutral_observed,
+	uint64_t manager_neutral_mutation_sequence, bool mappings_released)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	const std::shared_ptr<OperationRegistration> &registration =
@@ -3362,7 +3415,12 @@ Result HardwareBroker::StageContainmentEvidence(
 		return MISTER_RESULT_DEADLINE;
 	if ((core_gpo & 0xc0000000u) != 0x40000000u ||
 		interface_module != 0 || sdr_port_control != 0 || bridge_reset != 7 ||
-		remap != 1 || !mappings_released)
+		remap != 1 || (manager_control & 0x107u) != 0x2u ||
+		manager_mode > 4u || !manager_neutral_observed ||
+		manager_neutral_mutation_sequence == 0 ||
+		manager_neutral_mutation_sequence == UINT64_MAX ||
+		manager_neutral_mutation_sequence + 1 != mutation_sequence_ ||
+		!mappings_released)
 		return MISTER_RESULT_CLEANUP_INCOMPLETE;
 	containment_evidence_pending_ = true;
 	receipt_authority_ = registration->authority;
@@ -3375,6 +3433,11 @@ Result HardwareBroker::StageContainmentEvidence(
 	receipt_sdr_port_control_ = sdr_port_control;
 	receipt_bridge_reset_ = bridge_reset;
 	receipt_remap_ = remap;
+	receipt_manager_control_ = manager_control;
+	receipt_manager_mode_ = manager_mode;
+	receipt_manager_neutral_observed_ = manager_neutral_observed;
+	receipt_manager_neutral_mutation_sequence_ =
+		manager_neutral_mutation_sequence;
 	receipt_mutation_sequence_ = mutation_sequence_;
 	receipt_mappings_released_ = mappings_released;
 	receipt_registration_ = registration.get();
@@ -3747,6 +3810,10 @@ void HardwareBroker::ClearContainmentReceipt()
 	receipt_sdr_port_control_ = 0;
 	receipt_bridge_reset_ = 0;
 	receipt_remap_ = 0;
+	receipt_manager_control_ = 0;
+	receipt_manager_mode_ = 0;
+	receipt_manager_neutral_observed_ = false;
+	receipt_manager_neutral_mutation_sequence_ = 0;
 	receipt_mutation_sequence_ = 0;
 	receipt_mappings_released_ = false;
 	receipt_registration_ = nullptr;
@@ -3786,6 +3853,11 @@ bool HardwareBroker::ReceiptMatchesCleanup(const CleanupEpoch &epoch) const
 		(receipt_core_gpo_ & 0xc0000000u) == 0x40000000u &&
 		receipt_interface_module_ == 0 && receipt_sdr_port_control_ == 0 &&
 		receipt_bridge_reset_ == 7 && receipt_remap_ == 1 &&
+		receipt_manager_neutral_observed_ &&
+		(receipt_manager_control_ & 0x107u) == 0x2u &&
+		receipt_manager_mode_ <= 4u &&
+		receipt_manager_neutral_mutation_sequence_ != 0 &&
+		receipt_manager_neutral_mutation_sequence_ <= receipt_mutation_sequence_ &&
 		receipt_mappings_released_ &&
 		receipt_mutation_sequence_ == mutation_sequence_;
 }
@@ -3800,6 +3872,11 @@ bool HardwareBroker::ReceiptMatchesRecovery(const RecoveryEpoch &epoch) const
 		(receipt_core_gpo_ & 0xc0000000u) == 0x40000000u &&
 		receipt_interface_module_ == 0 && receipt_sdr_port_control_ == 0 &&
 		receipt_bridge_reset_ == 7 && receipt_remap_ == 1 &&
+		receipt_manager_neutral_observed_ &&
+		(receipt_manager_control_ & 0x107u) == 0x2u &&
+		receipt_manager_mode_ <= 4u &&
+		receipt_manager_neutral_mutation_sequence_ != 0 &&
+		receipt_manager_neutral_mutation_sequence_ <= receipt_mutation_sequence_ &&
 		receipt_mappings_released_ &&
 		receipt_mutation_sequence_ == mutation_sequence_;
 }

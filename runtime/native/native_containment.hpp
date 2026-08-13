@@ -11,6 +11,34 @@
 namespace mister {
 namespace native {
 
+struct NativeMappingAcquisitionReceipt {
+	Result result;
+	bool acquired;
+	bool complete;
+};
+
+struct NativeBridgeEnableReceipt {
+	Result result;
+	bool acquired;
+	bool mutation_applied;
+	bool sdr_ports_observed;
+	bool bridge_release_observed;
+	bool remap_observed;
+	bool core_normal_write_attempted;
+	bool core_normal_observed;
+	uint32_t observed_core_gpo;
+	uint64_t mutation_sequence;
+};
+
+struct NativeManagerNeutralReceipt {
+	Result result;
+	uint32_t observed_control;
+	uint32_t observed_mode;
+	bool neutral_observed;
+	bool mutation_attempted;
+	bool mutation_applied;
+};
+
 class NativeContainmentIo {
 public:
 	class Access final {
@@ -34,6 +62,32 @@ public:
 
 private:
 	friend class NativeContainment;
+	virtual NativeMappingAcquisitionReceipt AcquireMappings(
+		const Access &)
+	{
+		const NativeMappingAcquisitionReceipt receipt = {
+			MISTER_RESULT_UNSUPPORTED, false, false};
+		return receipt;
+	}
+	virtual NativeBridgeEnableReceipt EnableBridges(const Access &)
+	{
+		const NativeBridgeEnableReceipt receipt = {
+			MISTER_RESULT_UNSUPPORTED, false, false, false, false, false, false, false,
+			0, 0};
+		return receipt;
+	}
+	virtual NativeManagerNeutralReceipt ReconcileManager(const Access &)
+	{
+		const NativeManagerNeutralReceipt receipt = {
+			MISTER_RESULT_UNSUPPORTED, 0, 0, false, false, false};
+		return receipt;
+	}
+	virtual Result ReadManagerControl(const Access &, uint32_t *)
+		{ return MISTER_RESULT_UNSUPPORTED; }
+	virtual Result ReadManagerMode(const Access &, uint32_t *)
+		{ return MISTER_RESULT_UNSUPPORTED; }
+	virtual bool RecoveryMappingsHeld(const Access &) const { return false; }
+	virtual bool ConsumeAppliedMutation(const Access &) { return false; }
 	virtual Result WriteCoreReset(const Access &access,
 		uint32_t mask, uint32_t value) = 0;
 	virtual Result WriteInterfaceModule(const Access &access,
@@ -57,6 +111,10 @@ private:
 class NativeContainment final {
 public:
 	NativeContainment(HardwareBroker &broker, NativeContainmentIo &io);
+	NativeMappingAcquisitionReceipt AcquireMappings(
+		const OperationLease &program_lease);
+	NativeBridgeEnableReceipt EnableBridges(
+		const OperationLease &program_lease);
 	Result ResetAndContain(const OperationLease &terminal_lease);
 	Result ResetAndContain(const CleanupEpoch &epoch,
 		const OperationLease &terminal_lease);
@@ -75,9 +133,13 @@ private:
 		uint32_t sdr_port_control;
 		uint32_t bridge_reset;
 		uint32_t remap;
-		bool known[5];
+		bool known[7];
 		bool mappings_released;
 		bool mutation_attempted;
+		uint32_t manager_control;
+		uint32_t manager_mode;
+		bool manager_neutral_observed;
+		uint64_t manager_mutation_sequence;
 	};
 	static void Partition(const Values &values, bool require_mapping_release,
 		uint32_t *observed, uint32_t *neutral);

@@ -147,6 +147,7 @@ private:
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
 	uint64_t RecordMutation();
+	uint64_t CurrentMutationSequence() const;
 	Result RecordFpgaProgrammingMutation(size_t accepted_bytes,
 		uint64_t *mutation_sequence);
 	Result AuthorizeFpgaProgrammingProfile(
@@ -385,15 +386,32 @@ private:
 	friend class NativeContainment;
 	ContainmentResumeKey(HardwareBroker &broker, LeaseAuthority authority,
 		uint64_t authority_identity, PlatformGenerationId generation,
+		uint64_t mutation_sequence, uint32_t core_gpo,
+		uint32_t interface_module, uint32_t sdr_port_control,
+		uint32_t bridge_reset, uint32_t remap, uint32_t manager_control,
+		uint32_t manager_mode, uint64_t manager_mutation_sequence,
 		const std::shared_ptr<BrokerLifetime> &lifetime)
 		: broker_(&broker), lifetime_(lifetime), authority_(authority),
-		  authority_identity_(authority_identity), generation_(generation) {}
+		  authority_identity_(authority_identity), generation_(generation),
+		  mutation_sequence_(mutation_sequence), core_gpo_(core_gpo),
+		  interface_module_(interface_module), sdr_port_control_(sdr_port_control),
+		  bridge_reset_(bridge_reset), remap_(remap), manager_control_(manager_control),
+		  manager_mode_(manager_mode), manager_mutation_sequence_(manager_mutation_sequence) {}
 
 	HardwareBroker *broker_;
 	std::weak_ptr<BrokerLifetime> lifetime_;
 	LeaseAuthority authority_;
 	uint64_t authority_identity_;
 	PlatformGenerationId generation_;
+	uint64_t mutation_sequence_;
+	uint32_t core_gpo_;
+	uint32_t interface_module_;
+	uint32_t sdr_port_control_;
+	uint32_t bridge_reset_;
+	uint32_t remap_;
+	uint32_t manager_control_;
+	uint32_t manager_mode_;
+	uint64_t manager_mutation_sequence_;
 };
 
 class HardwareBroker final {
@@ -413,6 +431,8 @@ public:
 	bool has_live_generation_for_test();
 	uint64_t mutation_sequence_for_test();
 	uint64_t containment_receipt_sequence_for_test();
+	bool containment_manager_receipt_for_test(uint32_t *control,
+		uint32_t *mode, uint64_t *mutation_sequence);
 	bool core_protocol_failure_receipt_for_test(
 		ActiveProtocolFailureReceipt *receipt);
 	bool core_protocol_session_current_for_test();
@@ -659,6 +679,7 @@ private:
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<ProcessOperationGuard> *guard);
 	uint64_t RecordMutation(const HardwareLeaseView &view);
+	uint64_t CurrentMutationSequence(const HardwareLeaseView &view);
 	Result RecordFpgaProgrammingMutation(const HardwareLeaseView &view,
 		size_t accepted_bytes, uint64_t *mutation_sequence);
 	Result AuthorizeFpgaProgrammingProfile(const HardwareLeaseView &view,
@@ -669,12 +690,22 @@ private:
 		const OperationLease &terminal_lease);
 	Result ValidateContainmentBoundary(const HardwareLeaseView &view);
 	Result MintContainmentResumeKey(const HardwareLeaseView &view,
+		uint32_t core_gpo, uint32_t interface_module,
+		uint32_t sdr_port_control, uint32_t bridge_reset, uint32_t remap,
+		uint32_t manager_control, uint32_t manager_mode,
+		uint64_t manager_mutation_sequence,
 		std::unique_ptr<ContainmentResumeKey> *key);
 	Result ValidateContainmentResumeKey(const ContainmentResumeKey &key,
-		const OperationLease &terminal_lease);
+		const OperationLease &terminal_lease, uint32_t core_gpo,
+		uint32_t interface_module, uint32_t sdr_port_control,
+		uint32_t bridge_reset, uint32_t remap, uint32_t manager_control,
+		uint32_t manager_mode, uint64_t manager_mutation_sequence);
 	Result StageContainmentEvidence(const OperationLease &terminal_lease,
 		uint32_t core_gpo, uint32_t interface_module,
 		uint32_t sdr_port_control, uint32_t bridge_reset, uint32_t remap,
+		uint32_t manager_control, uint32_t manager_mode,
+		bool manager_neutral_observed,
+		uint64_t manager_neutral_mutation_sequence,
 		bool mappings_released);
 	Result CommitCleanupContainment(const CleanupEpoch &epoch,
 		const OperationLease &terminal_lease);
@@ -787,6 +818,10 @@ private:
 	uint32_t receipt_sdr_port_control_;
 	uint32_t receipt_bridge_reset_;
 	uint32_t receipt_remap_;
+	uint32_t receipt_manager_control_;
+	uint32_t receipt_manager_mode_;
+	bool receipt_manager_neutral_observed_;
+	uint64_t receipt_manager_neutral_mutation_sequence_;
 	uint64_t receipt_mutation_sequence_;
 	uint32_t recovery_observed_resource_flags_;
 	uint32_t recovery_neutral_resource_flags_;

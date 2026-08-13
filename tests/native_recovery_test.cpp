@@ -451,6 +451,22 @@ public:
 	{
 		assert(value == 1); ++writes; return Step();
 	}
+	NativeManagerNeutralReceipt ReconcileManager(const Access &) override
+	{
+		const NativeManagerNeutralReceipt receipt = {
+			MISTER_RESULT_OK, 2, 2, true, false, false};
+		return receipt;
+	}
+	Result ReadManagerControl(const Access &, uint32_t *value) override
+	{
+		*value = 2;
+		return MISTER_RESULT_OK;
+	}
+	Result ReadManagerMode(const Access &, uint32_t *value) override
+	{
+		*value = 2;
+		return MISTER_RESULT_OK;
+	}
 	Result ReadCoreGpo(const Access &access, uint32_t *value) override
 	{
 		last_deadline = access.absolute_deadline_ms();

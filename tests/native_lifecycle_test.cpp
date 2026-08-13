@@ -937,6 +937,12 @@ private:
 
 class LifecycleContainmentIo final : public NativeContainmentIo {
 public:
+	NativeManagerNeutralReceipt ReconcileManager(const Access &) override
+	{
+		const NativeManagerNeutralReceipt receipt = {
+			MISTER_RESULT_OK, 0x2u, 0, true, false, false};
+		return receipt;
+	}
 	Result WriteCoreReset(const Access &, uint32_t, uint32_t) override
 	{ return MISTER_RESULT_OK; }
 	Result WriteInterfaceModule(const Access &, uint32_t) override

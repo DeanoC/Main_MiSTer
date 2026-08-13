@@ -392,6 +392,49 @@ NativeArtifactResult NativeCoreArtifactHandle::CloseRetainedBefore(
 	return CloseBefore(absolute_deadline_ms);
 }
 
+NativeArtifactResult NativeCoreArtifactHandle::PrepareVerifiedProgrammingRead(
+	uint64_t absolute_deadline_ms) const
+{
+	if (!valid() || bound_profile_ == nullptr ||
+		!ValidateNativeCoreProfileRecord(*bound_profile_))
+		return NativeArtifactResult::invalid_argument;
+	NativeArtifactResult result = Revalidate(absolute_deadline_ms);
+	char digest[65] = {};
+	if (result == NativeArtifactResult::ok)
+		result = HashDescriptor(*filesystem_, file_descriptor_, size_,
+			absolute_deadline_ms, digest);
+	if (result == NativeArtifactResult::ok)
+		result = Revalidate(absolute_deadline_ms);
+	if (result == NativeArtifactResult::ok &&
+		memcmp(digest, file_name_, 64) != 0)
+		result = NativeArtifactResult::digest_mismatch;
+	if (result == NativeArtifactResult::ok &&
+		filesystem_->Seek(file_descriptor_, 0, SEEK_SET) != 0)
+		result = NativeArtifactResult::io;
+	if (result == NativeArtifactResult::ok)
+		result = CheckDeadline(*filesystem_, absolute_deadline_ms);
+	return result;
+}
+
+NativeArtifactResult NativeCoreArtifactHandle::RevalidateProgrammedIdentity(
+	uint64_t absolute_deadline_ms) const
+{
+	if (!valid() || bound_profile_ == nullptr ||
+		!ValidateNativeCoreProfileRecord(*bound_profile_))
+		return NativeArtifactResult::invalid_argument;
+	NativeArtifactResult result = Revalidate(absolute_deadline_ms);
+	char digest[65] = {};
+	if (result == NativeArtifactResult::ok)
+		result = HashDescriptor(*filesystem_, file_descriptor_, size_,
+			absolute_deadline_ms, digest);
+	if (result == NativeArtifactResult::ok)
+		result = Revalidate(absolute_deadline_ms);
+	if (result == NativeArtifactResult::ok &&
+		memcmp(digest, file_name_, 64) != 0)
+		result = NativeArtifactResult::digest_mismatch;
+	return result;
+}
+
 NativeArtifactResult NativeHeldFile::Revalidate(
 	uint64_t absolute_deadline_ms) const
 {

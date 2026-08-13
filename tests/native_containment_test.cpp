@@ -70,6 +70,22 @@ public:
 		remap_value = value;
 		return Step();
 	}
+	NativeManagerNeutralReceipt ReconcileManager(const Access &) override
+	{
+		const NativeManagerNeutralReceipt receipt = {
+			MISTER_RESULT_OK, 0x2u, 0x2u, true, false, false};
+		return receipt;
+	}
+	Result ReadManagerControl(const Access &, uint32_t *value) override
+	{
+		*value = 0x2u;
+		return MISTER_RESULT_OK;
+	}
+	Result ReadManagerMode(const Access &, uint32_t *value) override
+	{
+		*value = 0x2u;
+		return MISTER_RESULT_OK;
+	}
 	Result ReadCoreGpo(const Access &, uint32_t *value) override
 	{
 		const Result result = Step();
@@ -182,6 +198,75 @@ void TestExactTerminalContractAndOnlyLeaveAfterReceipt()
 	assert(broker.containment_receipt_sequence_for_test() == 6);
 	terminal.reset();
 	assert(broker.Leave(generation, std::move(epoch)) == MISTER_RESULT_OK);
+}
+
+void TestCleanupResumeRejectsInterveningSameEpochMutationBeforeRelease()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeContainmentIo original_io;
+	original_io.fail_at = 11;
+	NativeContainment original(broker, original_io);
+	PlatformGenerationId generation = 0;
+	std::unique_ptr<CleanupEpoch> epoch;
+	std::unique_ptr<OperationLease> terminal;
+	PrepareCleanup(broker, clock, &generation, &epoch, &terminal);
+	assert(original.ResetAndContain(*epoch, *terminal) == MISTER_RESULT_PLATFORM);
+	const int original_calls = original_io.calls;
+	terminal.reset();
+
+	FakeContainmentIo intervening_io;
+	intervening_io.fail_at = 2;
+	NativeContainment intervening(broker, intervening_io);
+	assert(broker.BeginCleanupOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+	assert(intervening.ResetAndContain(*epoch, *terminal) ==
+		MISTER_RESULT_PLATFORM);
+	assert(broker.mutation_sequence_for_test() == 6);
+	terminal.reset();
+
+	assert(broker.BeginCleanupOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+	assert(original.ResetAndContain(*epoch, *terminal) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(original_io.calls == original_calls);
+	assert(broker.containment_receipt_sequence_for_test() == 0);
+}
+
+void TestRecoveryResumeRejectsInterveningSameEpochMutationBeforeRelease()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(closure, 3000, 6000, &epoch) == MISTER_RESULT_OK);
+	FakeContainmentIo original_io;
+	original_io.fail_at = 11;
+	NativeContainment original(broker, original_io);
+	std::unique_ptr<OperationLease> terminal;
+	assert(broker.BeginRecoveryOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+	assert(original.ResetAndContain(*epoch, *terminal) == MISTER_RESULT_PLATFORM);
+	const int original_calls = original_io.calls;
+	terminal.reset();
+
+	FakeContainmentIo intervening_io;
+	intervening_io.fail_at = 2;
+	NativeContainment intervening(broker, intervening_io);
+	assert(broker.BeginRecoveryOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+	assert(intervening.ResetAndContain(*epoch, *terminal) ==
+		MISTER_RESULT_PLATFORM);
+	assert(broker.mutation_sequence_for_test() == 6);
+	terminal.reset();
+
+	assert(broker.BeginRecoveryOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+	assert(original.ResetAndContain(*epoch, *terminal) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(original_io.calls == original_calls);
+	assert(broker.containment_receipt_sequence_for_test() == 0);
 }
 
 void TestEveryBoundaryMustSucceedBeforeReceipt()
@@ -337,6 +422,8 @@ int main()
 {
 	using namespace mister::native;
 	TestExactTerminalContractAndOnlyLeaveAfterReceipt();
+	TestCleanupResumeRejectsInterveningSameEpochMutationBeforeRelease();
+	TestRecoveryResumeRejectsInterveningSameEpochMutationBeforeRelease();
 	TestEveryBoundaryMustSucceedBeforeReceipt();
 	TestEveryExactReadbackIsRequired();
 	TestForeignAuthorityCannotMintReceipt();

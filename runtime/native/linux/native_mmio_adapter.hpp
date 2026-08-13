@@ -5,6 +5,7 @@
 #define MISTER_RUNTIME_NATIVE_LINUX_NATIVE_MMIO_ADAPTER_HPP
 
 #include "runtime/native/native_containment.hpp"
+#include "runtime/native/linux/native_fpga_programmer.hpp"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -40,18 +41,31 @@ public:
 };
 #endif
 
-class NativeLinuxMmioAdapter final : public NativeContainmentIo {
+class NativeLinuxMmioAdapter final : public NativeContainmentIo,
+	public NativeFpgaByteSink {
 public:
 	NativeLinuxMmioAdapter();
 #if defined(MISTER_NATIVE_MMIO_TESTING)
 	explicit NativeLinuxMmioAdapter(NativeMmioTestOperations &operations);
 #endif
 	~NativeLinuxMmioAdapter() override;
+	Result CloseMappingsForProcessExit();
 	NativeLinuxMmioAdapter(const NativeLinuxMmioAdapter &) = delete;
 	NativeLinuxMmioAdapter &operator=(const NativeLinuxMmioAdapter &) = delete;
 
 private:
 	class Impl;
+	NativeMappingAcquisitionReceipt AcquireMappings(
+		const Access &access) override;
+	NativeBridgeEnableReceipt EnableBridges(const Access &access) override;
+	NativeManagerNeutralReceipt ReconcileManager(const Access &access) override;
+	Result ReadManagerControl(const Access &access, uint32_t *value) override;
+	Result ReadManagerMode(const Access &access, uint32_t *value) override;
+	bool RecoveryMappingsHeld(const Access &access) const override;
+	bool ConsumeAppliedMutation(const Access &access) override;
+	NativeFpgaSinkStartOutcome Begin(uint64_t expected_bytes,
+		uint64_t absolute_deadline_ms,
+		std::unique_ptr<NativeFpgaProgramSession> *session) override;
 
 	Result WriteCoreReset(const Access &access, uint32_t mask,
 		uint32_t value) override;

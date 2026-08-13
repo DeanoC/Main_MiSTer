@@ -133,7 +133,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-linux-hardware-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 test-native-linux-core-protocol-io: \
 	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test \
@@ -481,6 +481,32 @@ test-native-save-dependency-invalidation:
 					exit 1; \
 				fi; \
 			done; \
+		done
+
+test-native-linux-hardware-dependency-invalidation:
+	@probe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-linux-hardware-deps.XXXXXX"); \
+		trap 'rm -r "$$probe_dir"' EXIT; \
+		for check in \
+			'runtime/native/linux/native_core_artifact_adapter.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_core_artifact_adapter.cpp' \
+			'runtime/native/linux/native_core_artifact_adapter.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_fpga_programmer.cpp' \
+			'runtime/native/linux/native_fpga_programmer.hpp:test-native-linux-artifact-programmer:-c tests/native_linux_artifact_programmer_test.cpp' \
+			'runtime/native/linux/native_fpga_programmer.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
+			'runtime/native/linux/native_mmio_adapter.hpp:test-native-linux-mmio-containment:-c tests/native_linux_mmio_containment_test.cpp' \
+			'runtime/native/native_containment.hpp:test-native-containment:-c runtime/native/native_containment.cpp' \
+			'runtime/native/native_containment.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
+			'runtime/native/hardware_broker.hpp:test-native-hardware-broker:-c runtime/native/hardware_broker.cpp' \
+			'runtime/native/native_clock.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_fpga_programmer.cpp' \
+			'runtime/native/native_core_profile.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_core_artifact_adapter.cpp' \
+			'runtime/native/native_resources.hpp:test-native-linux-artifact-programmer:-c tests/native_linux_artifact_programmer_test.cpp' \
+			'runtime/mister_runtime.h:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp'; do \
+			header=$${check%%:*}; remainder=$${check#*:}; \
+			target=$${remainder%%:*}; expected=$${remainder#*:}; \
+			$(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" "$$target" >/dev/null || exit 1; \
+			if ! $(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" -W "$$header" -n "$$target" | \
+				grep -F -- "$$expected" >/dev/null; then \
+				echo "native Linux hardware dependency invalidation missing: $$header -> $$expected" >&2; \
+				exit 1; \
+			fi; \
 		done
 
 test-native-input: $(HOST_TEST_DIR)/native_input_test
@@ -959,6 +985,8 @@ $(HOST_TEST_DIR)/native_content_adapter.o: runtime/native/linux/native_content_a
 $(NATIVE_LINUX_MMIO_CONTAINMENT_TEST_OBJECT): \
 	tests/native_linux_mmio_containment_test.cpp \
 	runtime/native/linux/native_mmio_adapter.hpp \
+	runtime/native/linux/native_fpga_programmer.hpp \
+	runtime/native/linux/native_core_artifact_adapter.hpp \
 	runtime/native/native_containment.hpp runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
@@ -968,6 +996,8 @@ $(NATIVE_LINUX_MMIO_CONTAINMENT_TEST_OBJECT): \
 $(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT): \
 	runtime/native/linux/native_mmio_adapter.cpp \
 	runtime/native/linux/native_mmio_adapter.hpp \
+	runtime/native/linux/native_fpga_programmer.hpp \
+	runtime/native/linux/native_core_artifact_adapter.hpp \
 	runtime/native/native_containment.hpp runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
@@ -977,6 +1007,8 @@ $(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT): \
 $(NATIVE_LINUX_MMIO_PRODUCTION_OBJECT): \
 	runtime/native/linux/native_mmio_adapter.cpp \
 	runtime/native/linux/native_mmio_adapter.hpp \
+	runtime/native/linux/native_fpga_programmer.hpp \
+	runtime/native/linux/native_core_artifact_adapter.hpp \
 	runtime/native/native_containment.hpp runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
@@ -1030,7 +1062,9 @@ $(HOST_TEST_DIR)/native_linux_input_execution_test: \
 
 $(HOST_TEST_DIR)/native_linux_mmio_containment_test: \
 	$(NATIVE_LINUX_MMIO_CONTAINMENT_TEST_OBJECT) \
-	$(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT) $(NATIVE_CONTAINMENT_OBJECT) \
+	$(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT) \
+	$(HOST_TEST_DIR)/native_core_artifact_adapter.o \
+	$(HOST_TEST_DIR)/native_fpga_programmer.o $(NATIVE_CONTAINMENT_OBJECT) \
 	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)

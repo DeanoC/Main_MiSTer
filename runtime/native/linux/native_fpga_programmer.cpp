@@ -28,7 +28,8 @@ Result ToProgrammingResult(NativeArtifactResult result)
 
 NativeFpgaProgrammingReceipt Receipt(Result result)
 {
-	NativeFpgaProgrammingReceipt receipt = {result, 0, 0};
+	const NativeFpgaProgrammingReceipt receipt = {
+		result, false, 0, false, false, false, false, 0};
 	return receipt;
 }
 
@@ -41,12 +42,10 @@ NativeFpgaProgrammer::NativeFpgaProgrammer(HardwareBroker &broker,
 }
 
 NativeFpgaProgrammingReceipt NativeFpgaProgrammer::Program(
-	const OperationLease &lease,
-	const NativeCoreArtifactHandle &artifact)
+	const OperationLease &lease, const NativeCoreArtifactHandle &artifact)
 {
 	NativeFpgaProgrammingReceipt receipt = Receipt(MISTER_RESULT_OK);
-	if (!artifact.valid()) return Receipt(MISTER_RESULT_INVALID_ARGUMENT);
-	if (artifact.bound_profile_ == nullptr)
+	if (!artifact.valid() || artifact.bound_profile_ == nullptr)
 		return Receipt(MISTER_RESULT_INVALID_ARGUMENT);
 	if (lease.operation_kind() != OperationKind::program_fpga)
 		return Receipt(MISTER_RESULT_INVALID_STATE);
@@ -58,11 +57,35 @@ NativeFpgaProgrammingReceipt NativeFpgaProgrammer::Program(
 	result = view->AuthorizeFpgaProgrammingProfile(*artifact.bound_profile_);
 	if (result != MISTER_RESULT_OK) return Receipt(result);
 	NativeArtifactResult artifact_result =
-		artifact.RewindAndRevalidate(deadline);
+		artifact.PrepareVerifiedProgrammingRead(deadline);
 	if (artifact_result != NativeArtifactResult::ok) {
 		receipt.result = ToProgrammingResult(artifact_result);
 		return receipt;
 	}
+
+	std::unique_ptr<NativeFpgaProgramSession> session;
+	auto record_applied = [&view, &receipt](bool applied) -> Result {
+		if (!applied) return MISTER_RESULT_OK;
+		const uint64_t sequence = view->RecordMutation();
+		if (sequence == 0) return MISTER_RESULT_PLATFORM;
+		receipt.mutation_sequence = sequence;
+		return MISTER_RESULT_OK;
+	};
+	const NativeFpgaSinkStartOutcome start =
+		sink_.Begin(artifact.size(), deadline, &session);
+	receipt.acquired = start.acquired || start.mutation_attempted ||
+		start.mutation_applied;
+	result = record_applied(start.mutation_applied);
+	const bool malformed_start =
+		(start.result == MISTER_RESULT_OK) != (session.get() != nullptr);
+	if (result != MISTER_RESULT_OK || malformed_start ||
+		start.result != MISTER_RESULT_OK) {
+		receipt.result = result != MISTER_RESULT_OK ? result :
+			(malformed_start ? MISTER_RESULT_PLATFORM : start.result);
+		session.reset();
+		return receipt;
+	}
+
 	unsigned char bytes[4096];
 	uint64_t consumed = 0;
 	while (consumed < artifact.size()) {
@@ -90,35 +113,30 @@ NativeFpgaProgrammingReceipt NativeFpgaProgrammer::Program(
 				receipt.result = MISTER_RESULT_DEADLINE;
 				return receipt;
 			}
-			size_t accepted = 0;
-			result = sink_.Write(bytes + written, requested - written, deadline,
-				&accepted);
-			if (accepted == 0) {
-				receipt.result = result == MISTER_RESULT_OK ?
-					MISTER_RESULT_PLATFORM : result;
-				return receipt;
-			}
-			if (accepted > UINT64_MAX - receipt.accepted_bytes)
+			const NativeFpgaSinkWriteOutcome outcome = session->Write(
+				bytes + written, requested - written, deadline);
+			receipt.acquired = receipt.acquired || outcome.mutation_attempted ||
+				outcome.mutation_applied || outcome.accepted_bytes != 0;
+			result = record_applied(
+				outcome.mutation_applied || outcome.accepted_bytes != 0);
+			if (outcome.accepted_bytes > UINT64_MAX - receipt.accepted_bytes)
 				receipt.accepted_bytes = UINT64_MAX;
 			else
-				receipt.accepted_bytes += static_cast<uint64_t>(accepted);
-			uint64_t mutation_sequence = 0;
-			const Result mutation_result =
-				view->RecordFpgaProgrammingMutation(accepted,
-					&mutation_sequence);
-			if (mutation_sequence != 0)
-				receipt.mutation_sequence = mutation_sequence;
-			if (mutation_result != MISTER_RESULT_OK) {
-				receipt.result = mutation_result;
-				return receipt;
-			}
-			if (accepted > requested - written) {
-				receipt.result = MISTER_RESULT_PLATFORM;
-				return receipt;
-			}
-			written += accepted;
+				receipt.accepted_bytes +=
+					static_cast<uint64_t>(outcome.accepted_bytes);
 			if (result != MISTER_RESULT_OK) {
 				receipt.result = result;
+				return receipt;
+			}
+			if (outcome.accepted_bytes == 0 ||
+				outcome.accepted_bytes > requested - written) {
+				receipt.result = outcome.result == MISTER_RESULT_OK ?
+					MISTER_RESULT_PLATFORM : outcome.result;
+				return receipt;
+			}
+			written += outcome.accepted_bytes;
+			if (outcome.result != MISTER_RESULT_OK) {
+				receipt.result = outcome.result;
 				return receipt;
 			}
 			if (clock_.NowMs() >= deadline) {
@@ -128,18 +146,27 @@ NativeFpgaProgrammingReceipt NativeFpgaProgrammer::Program(
 		}
 		consumed += requested;
 	}
-	ssize_t extra = -1;
-	artifact_result = artifact.ReadForUse(bytes, 1, &extra, deadline);
+
+	artifact_result = artifact.RevalidateProgrammedIdentity(deadline);
 	if (artifact_result != NativeArtifactResult::ok) {
 		receipt.result = ToProgrammingResult(artifact_result);
 		return receipt;
 	}
-	if (extra != 0) {
+	const NativeFpgaSinkFinishOutcome finish = session->Finish(deadline);
+	receipt.acquired = receipt.acquired || finish.mutation_attempted ||
+		finish.mutation_applied;
+	result = record_applied(finish.mutation_applied);
+	receipt.configuration_done_observed = finish.configuration_done_observed;
+	receipt.initialization_observed = finish.initialization_observed;
+	receipt.user_mode_observed = finish.user_mode_observed;
+	receipt.manager_drive_released = finish.manager_drive_released;
+	if (result != MISTER_RESULT_OK) receipt.result = result;
+	else if (finish.result != MISTER_RESULT_OK) receipt.result = finish.result;
+	else if (!finish.configuration_done_observed ||
+		!finish.initialization_observed || !finish.user_mode_observed ||
+		!finish.manager_drive_released || receipt.accepted_bytes != artifact.size() ||
+		receipt.mutation_sequence == 0)
 		receipt.result = MISTER_RESULT_PLATFORM;
-		return receipt;
-	}
-	artifact_result = artifact.Revalidate(deadline);
-	receipt.result = ToProgrammingResult(artifact_result);
 	return receipt;
 }
 

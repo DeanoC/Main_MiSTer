@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <functional>
 
@@ -23,6 +24,13 @@ using mister::native::NativeAcquisitionOutcome;
 using namespace mister::native;
 
 namespace {
+
+static_assert(std::is_abstract<NativeFpgaProgramSession>::value,
+	"FPGA programming must use one abstract duration-held session");
+static_assert(!std::is_default_constructible<NativeFpgaProgramSession>::value,
+	"callers must not construct FPGA programming authority");
+static_assert(!std::is_copy_constructible<NativeFpgaProgramSession>::value,
+	"FPGA programming authority must not be copyable");
 
 std::string TemporaryFile(const char *bytes, size_t size, int *descriptor)
 {
@@ -791,26 +799,73 @@ public:
 		over_accept_(false), max_accept_(SIZE_MAX), last_deadline_(0),
 		writes_(0), clock_(nullptr), advance_to_(0), advance_at_write_(0),
 		over_accept_at_write_(0), reported_accept_(0), callback_at_write_(0),
-		after_write_() {}
-	Result Write(const unsigned char *bytes, size_t count,
-		uint64_t absolute_deadline_ms, size_t *accepted) override
+		after_write_(), begin_result_(MISTER_RESULT_OK),
+		begin_provide_session_(true), start_acquired_(false),
+		start_attempted_(false), start_applied_(false),
+		finish_result_(MISTER_RESULT_OK), finish_configuration_(true),
+		finish_initialization_(true), finish_user_(true), finish_released_(true),
+		finish_attempted_(false), finish_applied_(false) {}
+
+private:
+	class Session final : public NativeFpgaProgramSession {
+	public:
+		explicit Session(CollectingSink &owner) : owner_(owner) {}
+
+	private:
+		NativeFpgaSinkWriteOutcome Write(const unsigned char *bytes, size_t count,
+			uint64_t absolute_deadline_ms) override
+		{
+			return owner_.WriteBytes(bytes, count, absolute_deadline_ms);
+		}
+		NativeFpgaSinkFinishOutcome Finish(uint64_t) override
+		{
+			const NativeFpgaSinkFinishOutcome outcome = {
+				owner_.finish_result_, owner_.finish_attempted_,
+				owner_.finish_applied_, owner_.finish_configuration_,
+				owner_.finish_initialization_, owner_.finish_user_,
+				owner_.finish_released_};
+			return outcome;
+		}
+		CollectingSink &owner_;
+	};
+
+	NativeFpgaSinkStartOutcome Begin(uint64_t,
+		uint64_t absolute_deadline_ms,
+		std::unique_ptr<NativeFpgaProgramSession> *session) override
+	{
+		last_deadline_ = absolute_deadline_ms;
+		if (begin_provide_session_) session->reset(new Session(*this));
+		const NativeFpgaSinkStartOutcome outcome = {
+			begin_result_, start_acquired_, start_attempted_, start_applied_};
+		return outcome;
+	}
+	NativeFpgaSinkWriteOutcome WriteBytes(const unsigned char *bytes,
+		size_t count, uint64_t absolute_deadline_ms)
 	{
 		++writes_;
 		last_deadline_ = absolute_deadline_ms;
-		if (fail_) return MISTER_RESULT_PLATFORM;
-		if (zero_) { *accepted = 0; return MISTER_RESULT_OK; }
-		*accepted = count < max_accept_ ? count : max_accept_;
-		const size_t copied = *accepted > count ? count : *accepted;
+		if (fail_) {
+			const NativeFpgaSinkWriteOutcome outcome = {
+				MISTER_RESULT_PLATFORM, 0, false, false};
+			return outcome;
+		}
+		size_t accepted = zero_ ? 0 : (count < max_accept_ ? count : max_accept_);
+		const size_t copied = accepted > count ? count : accepted;
 		bytes_.insert(bytes_.end(), bytes, bytes + copied);
 		if (over_accept_ &&
 			(over_accept_at_write_ == 0 || writes_ == over_accept_at_write_))
-			*accepted = reported_accept_ == 0 ? count + 1 : reported_accept_;
+			accepted = reported_accept_ == 0 ? count + 1 : reported_accept_;
 		if (clock_ != nullptr &&
 			(advance_at_write_ == 0 || writes_ == advance_at_write_))
 			clock_->SetNow(advance_to_);
 		if (after_write_ && writes_ == callback_at_write_) after_write_();
-		return fail_after_accept_ ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
+		const NativeFpgaSinkWriteOutcome outcome = {
+			fail_after_accept_ ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK,
+			accepted, accepted != 0, accepted != 0};
+		return outcome;
 	}
+
+public:
 	bool fail_;
 	bool fail_after_accept_;
 	bool zero_;
@@ -826,6 +881,18 @@ public:
 	size_t reported_accept_;
 	unsigned callback_at_write_;
 	std::function<void()> after_write_;
+	Result begin_result_;
+	bool begin_provide_session_;
+	bool start_acquired_;
+	bool start_attempted_;
+	bool start_applied_;
+	Result finish_result_;
+	bool finish_configuration_;
+	bool finish_initialization_;
+	bool finish_user_;
+	bool finish_released_;
+	bool finish_attempted_;
+	bool finish_applied_;
 };
 
 void TestProgrammingRequiresExactActiveProgramLeaseAndDeadline()
@@ -1271,6 +1338,91 @@ void TestProgrammingFailureBoundariesRetainAuthority()
 	RemoveArtifactTree(root, "snes", name);
 }
 
+void TestProgrammingRejectsMalformedSessionAndIncompleteFinishEvidence()
+{
+	const std::string root = TemporaryRoot();
+	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+	const std::string name =
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
+	WriteFile(Join(Join(root, "snes"), name), "hello");
+	NativePosixFileSystem filesystem;
+	NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+	NativeCoreArtifactHandle artifact;
+	assert(ResolveSnesFixtureForTest(adapter, filesystem.NowMs() + 1000,
+		&artifact) == NativeArtifactResult::ok);
+	const uint64_t start = filesystem.NowMs();
+	TestClock clock(start);
+	HardwareBroker broker(clock);
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+		&generation) == MISTER_RESULT_OK);
+	CollectingSink sink;
+	NativeFpgaProgrammer programmer(broker, clock, sink);
+	std::unique_ptr<OperationLease> lease;
+	NativeFpgaProgrammingReceipt receipt = {};
+
+	assert(broker.Begin(generation, OperationKind::program_fpga, start + 1000,
+		&lease) == MISTER_RESULT_OK);
+	sink.begin_provide_session_ = false;
+	receipt = programmer.Program(*lease, artifact);
+	assert(receipt.result == MISTER_RESULT_PLATFORM);
+	assert(!receipt.acquired);
+	assert(sink.writes_ == 0);
+	lease.reset();
+
+	assert(broker.Begin(generation, OperationKind::program_fpga, start + 1000,
+		&lease) == MISTER_RESULT_OK);
+	sink.begin_provide_session_ = true;
+	sink.begin_result_ = MISTER_RESULT_UNSUPPORTED;
+	receipt = programmer.Program(*lease, artifact);
+	assert(receipt.result == MISTER_RESULT_PLATFORM);
+	assert(!receipt.acquired);
+	assert(sink.writes_ == 0);
+	lease.reset();
+
+	assert(broker.Begin(generation, OperationKind::program_fpga, start + 1000,
+		&lease) == MISTER_RESULT_OK);
+	sink.begin_provide_session_ = false;
+	sink.begin_result_ = MISTER_RESULT_UNSUPPORTED;
+	receipt = programmer.Program(*lease, artifact);
+	assert(receipt.result == MISTER_RESULT_UNSUPPORTED);
+	assert(!receipt.acquired);
+	assert(sink.writes_ == 0);
+	lease.reset();
+
+	assert(broker.Begin(generation, OperationKind::program_fpga, start + 1000,
+		&lease) == MISTER_RESULT_OK);
+	sink.start_attempted_ = true;
+	sink.start_applied_ = true;
+	receipt = programmer.Program(*lease, artifact);
+	assert(receipt.result == MISTER_RESULT_UNSUPPORTED);
+	assert(receipt.acquired);
+	assert(receipt.mutation_sequence != 0);
+	assert(sink.writes_ == 0);
+	lease.reset();
+
+	assert(broker.Begin(generation, OperationKind::program_fpga, start + 1000,
+		&lease) == MISTER_RESULT_OK);
+	sink.begin_provide_session_ = true;
+	sink.begin_result_ = MISTER_RESULT_OK;
+	sink.start_attempted_ = false;
+	sink.start_applied_ = false;
+	sink.finish_configuration_ = false;
+	receipt = programmer.Program(*lease, artifact);
+	assert(receipt.result == MISTER_RESULT_PLATFORM);
+	assert(receipt.acquired);
+	assert(receipt.accepted_bytes == artifact.size());
+	assert(!receipt.configuration_done_observed);
+	assert(receipt.initialization_observed);
+	assert(receipt.user_mode_observed);
+	assert(receipt.manager_drive_released);
+	assert(receipt.mutation_sequence != 0);
+	lease.reset();
+
+	assert(artifact.Close() == NativeArtifactResult::ok);
+	RemoveArtifactTree(root, "snes", name);
+}
+
 void TestProgrammingReceiptSurvivesLateDeadlineAndBrokerDestruction()
 {
 	const std::string root = TemporaryRoot();
@@ -1331,7 +1483,7 @@ void TestProgrammingReceiptSurvivesLateDeadlineAndBrokerDestruction()
 		destroyed_clock, destroyed_sink);
 	const NativeFpgaProgrammingReceipt destroyed_receipt =
 		destroyed_programmer.Program(*destroyed_lease, artifact);
-	assert(destroyed_receipt.result == MISTER_RESULT_INVALID_STATE);
+	assert(destroyed_receipt.result == MISTER_RESULT_PLATFORM);
 	assert(destroyed_receipt.accepted_bytes == 4);
 	assert(destroyed_receipt.mutation_sequence == 1);
 	assert(destroyed_broker.get() == nullptr);
@@ -1540,6 +1692,7 @@ void RunAllTests()
 	TestProgrammingAuthorityMatrix();
 	TestResolutionFailureInjectionAndEntrySubstitution();
 	TestProgrammingFailureBoundariesRetainAuthority();
+	TestProgrammingRejectsMalformedSessionAndIncompleteFinishEvidence();
 	TestProgrammingReceiptSurvivesLateDeadlineAndBrokerDestruction();
 	TestInsecureEntrySizeAndDigestFailures();
 	TestPrivateIdentitySentinelsAreNotEmitted();

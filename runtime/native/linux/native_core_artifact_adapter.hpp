@@ -126,6 +126,13 @@ class NativeCoreArtifactHandle final : public NativeHeldFile {
 public:
 	NativeCoreArtifactHandle() {}
 	NativeArtifactResult CloseRetainedBefore(uint64_t absolute_deadline_ms);
+
+private:
+	friend class NativeFpgaProgrammer;
+	NativeArtifactResult PrepareVerifiedProgrammingRead(
+		uint64_t absolute_deadline_ms) const;
+	NativeArtifactResult RevalidateProgrammedIdentity(
+		uint64_t absolute_deadline_ms) const;
 };
 
 class NativeCoreArtifactAdapter final {

@@ -23,6 +23,54 @@ NativeContainment::NativeContainment(HardwareBroker &broker,
 {
 }
 
+NativeMappingAcquisitionReceipt NativeContainment::AcquireMappings(
+	const OperationLease &program_lease)
+{
+	const NativeMappingAcquisitionReceipt denied = {
+		MISTER_RESULT_INVALID_STATE, false, false};
+	if (program_lease.operation_kind() != OperationKind::program_fpga)
+		return denied;
+	std::unique_ptr<HardwareLeaseView> view;
+	const Result result = broker_.AcquireHardwareLeaseView(program_lease, &view);
+	if (result != MISTER_RESULT_OK) {
+		NativeMappingAcquisitionReceipt receipt = denied;
+		receipt.result = result;
+		return receipt;
+	}
+	NativeContainmentIo::Access access(view->absolute_deadline_ms());
+	return io_.AcquireMappings(access);
+}
+
+NativeBridgeEnableReceipt NativeContainment::EnableBridges(
+	const OperationLease &program_lease)
+{
+	NativeBridgeEnableReceipt receipt = {
+		MISTER_RESULT_INVALID_STATE, false, false, false, false, false, false, false,
+		0, 0};
+	if (program_lease.operation_kind() != OperationKind::program_fpga)
+		return receipt;
+	std::unique_ptr<HardwareLeaseView> view;
+	receipt.result = broker_.AcquireHardwareLeaseView(program_lease, &view);
+	if (receipt.result != MISTER_RESULT_OK) return receipt;
+	NativeContainmentIo::Access access(view->absolute_deadline_ms());
+	receipt = io_.EnableBridges(access);
+	if (receipt.mutation_applied) {
+		receipt.mutation_sequence = view->RecordMutation();
+		if (receipt.mutation_sequence == 0)
+			receipt.result = MISTER_RESULT_PLATFORM;
+	}
+	if (receipt.result == MISTER_RESULT_OK &&
+		(!receipt.acquired || !receipt.mutation_applied ||
+		 !receipt.sdr_ports_observed ||
+		 !receipt.bridge_release_observed || !receipt.remap_observed ||
+		 !receipt.core_normal_write_attempted ||
+		 !receipt.core_normal_observed ||
+		 (receipt.observed_core_gpo & 0xc0000000u) != 0x80000000u ||
+		 receipt.mutation_sequence == 0))
+		receipt.result = MISTER_RESULT_PLATFORM;
+	return receipt;
+}
+
 Result NativeContainment::RunTerminal(const OperationLease &terminal_lease,
 	Values *values, std::unique_ptr<HardwareLeaseView> *held_view)
 {
@@ -34,7 +82,13 @@ Result NativeContainment::RunTerminal(const OperationLease &terminal_lease,
 	NativeContainmentIo::Access access(view->absolute_deadline_ms());
 	if (pending_release_) {
 		result = broker_.ValidateContainmentResumeKey(*pending_release_,
-			terminal_lease);
+			terminal_lease, pending_release_values_.core_gpo,
+			pending_release_values_.interface_module,
+			pending_release_values_.sdr_port_control,
+			pending_release_values_.bridge_reset, pending_release_values_.remap,
+			pending_release_values_.manager_control,
+			pending_release_values_.manager_mode,
+			pending_release_values_.manager_mutation_sequence);
 		if (result != MISTER_RESULT_OK) return result;
 		*values = pending_release_values_;
 		result = broker_.ValidateContainmentBoundary(*view);
@@ -70,11 +124,13 @@ Result NativeContainment::RunTerminal(const OperationLease &terminal_lease,
 		if (result != MISTER_RESULT_OK) return result; \
 		values->mutation_attempted = true; \
 		result = (expression); \
-		if (result != MISTER_RESULT_OK) return result; \
-		if (view->RecordMutation() == 0) { \
+		const bool applied = io_.ConsumeAppliedMutation(access) || \
+			result == MISTER_RESULT_OK; \
+		if (applied && view->RecordMutation() == 0) { \
 			result = broker_.ValidateContainmentBoundary(*view); \
 			return result == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : result; \
 		} \
+		if (result != MISTER_RESULT_OK) return result; \
 	} while (0)
 
 	CONTAINMENT_MUTATION(io_.WriteCoreReset(access, 0xc0000000u,
@@ -83,6 +139,26 @@ Result NativeContainment::RunTerminal(const OperationLease &terminal_lease,
 	CONTAINMENT_MUTATION(io_.WriteSdrPortControl(access, 0x5080u, 0));
 	CONTAINMENT_MUTATION(io_.WriteBridgeReset(access, 7));
 	CONTAINMENT_MUTATION(io_.WriteRemap(access, 1));
+	result = broker_.ValidateContainmentBoundary(*view);
+	if (result != MISTER_RESULT_OK) return result;
+	const NativeManagerNeutralReceipt manager = io_.ReconcileManager(access);
+	values->mutation_attempted = values->mutation_attempted ||
+		manager.mutation_attempted;
+	if (manager.mutation_applied) {
+		values->manager_mutation_sequence = view->RecordMutation();
+		if (values->manager_mutation_sequence == 0)
+			return MISTER_RESULT_PLATFORM;
+	} else {
+		values->manager_mutation_sequence = view->CurrentMutationSequence();
+	}
+	if (manager.result != MISTER_RESULT_OK) return manager.result;
+	values->manager_control = manager.observed_control;
+	values->manager_mode = manager.observed_mode;
+	values->manager_neutral_observed = manager.neutral_observed;
+	if (!manager.neutral_observed ||
+		(manager.observed_control & 0x107u) != 0x2u ||
+		manager.observed_mode > 4u || values->manager_mutation_sequence == 0)
+		return MISTER_RESULT_CLEANUP_INCOMPLETE;
 	CONTAINMENT_READ(0, io_.ReadCoreGpo(access, &values->core_gpo));
 	CONTAINMENT_READ(1, io_.ReadInterfaceModule(access,
 		&values->interface_module));
@@ -97,6 +173,9 @@ Result NativeContainment::RunTerminal(const OperationLease &terminal_lease,
 	if (result != MISTER_RESULT_OK) {
 		pending_release_values_ = *values;
 		const Result key_result = broker_.MintContainmentResumeKey(*view,
+			values->core_gpo, values->interface_module, values->sdr_port_control,
+			values->bridge_reset, values->remap, values->manager_control,
+			values->manager_mode, values->manager_mutation_sequence,
 			&pending_release_);
 		if (key_result != MISTER_RESULT_OK) return key_result;
 		return result;
@@ -134,7 +213,9 @@ Result NativeContainment::ResetAndContain(
 	if (result != MISTER_RESULT_OK) return result;
 	return broker_.StageContainmentEvidence(terminal_lease,
 		values.core_gpo, values.interface_module, values.sdr_port_control,
-		values.bridge_reset, values.remap, true);
+		values.bridge_reset, values.remap, values.manager_control,
+		values.manager_mode, values.manager_neutral_observed,
+		values.manager_mutation_sequence, true);
 }
 
 Result NativeContainment::ResetAndContain(const RecoveryEpoch &epoch,
@@ -162,7 +243,9 @@ Result NativeContainment::ResetAndContain(const RecoveryEpoch &epoch,
 	}
 	Result commit = broker_.StageContainmentEvidence(terminal_lease,
 		values.core_gpo, values.interface_module, values.sdr_port_control,
-		values.bridge_reset, values.remap, true);
+		values.bridge_reset, values.remap, values.manager_control,
+		values.manager_mode, values.manager_neutral_observed,
+		values.manager_mutation_sequence, true);
 	if (commit == MISTER_RESULT_OK)
 		commit = broker_.CommitRecoveryContainment(epoch, terminal_lease);
 	if (IsRecordableRecoveryFailure(commit))
@@ -182,9 +265,13 @@ void NativeContainment::Partition(const Values &values,
 	const bool sdr_bad = values.known[2] && values.sdr_port_control != 0;
 	const bool bridge_bad = values.known[3] && values.bridge_reset != 7;
 	const bool remap_bad = values.known[4] && values.remap != 1;
-	if (core_bad || interface_bad || sdr_bad)
+	const bool manager_bad =
+		(values.known[5] && (values.manager_control & 0x107u) != 0x2u) ||
+		(values.known[6] && values.manager_mode > 4u);
+	if (core_bad || interface_bad || sdr_bad || manager_bad)
 		*observed |= MISTER_RESOURCE_FPGA;
 	else if (values.known[0] && values.known[1] && values.known[2] &&
+		values.known[5] && values.known[6] &&
 		(!require_mapping_release || values.mappings_released))
 		*neutral |= MISTER_RESOURCE_FPGA;
 	if (bridge_bad || remap_bad)
@@ -207,7 +294,7 @@ Result NativeContainment::ObserveRecovery(const RecoveryEpoch &epoch,
 	if (result != MISTER_RESULT_OK)
 		return broker_.EndRecoveryObservation(epoch, invocation, 0, 0, result);
 	Values values = {};
-	bool known[5] = {false, false, false, false, false};
+	bool known[7] = {false, false, false, false, false, false, false};
 	Result first_failure = MISTER_RESULT_OK;
 	NativeContainmentIo::Access access(deadline_ms);
 
@@ -230,13 +317,17 @@ Result NativeContainment::ObserveRecovery(const RecoveryEpoch &epoch,
 		&values.sdr_port_control));
 	RECOVERY_READ(3, io_.ReadBridgeReset(access, &values.bridge_reset));
 	RECOVERY_READ(4, io_.ReadRemap(access, &values.remap));
+	RECOVERY_READ(5, io_.ReadManagerControl(access,
+		&values.manager_control));
+	RECOVERY_READ(6, io_.ReadManagerMode(access, &values.manager_mode));
 
 #undef RECOVERY_READ
-	for (size_t index = 0; index != 5; ++index)
+	for (size_t index = 0; index != 7; ++index)
 		values.known[index] = known[index];
+	values.mappings_released = !io_.RecoveryMappingsHeld(access);
 	uint32_t observed = 0;
 	uint32_t neutral = 0;
-	Partition(values, false, &observed, &neutral);
+	Partition(values, true, &observed, &neutral);
 	return broker_.EndRecoveryObservation(epoch, invocation, observed, neutral,
 		first_failure);
 }
