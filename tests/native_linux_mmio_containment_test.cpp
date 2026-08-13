@@ -441,7 +441,8 @@ void TestRecoveryReleaseFailureResumesWithoutRegisterReplay()
 	terminal.reset();
 	MisterRecoveryObservationV2 observation = Observation();
 	assert(broker.FinishRecovery(std::move(epoch), &observation) ==
-		MISTER_RESULT_CLEANUP_INCOMPLETE);
+		MISTER_RESULT_OK);
+	assert(epoch == nullptr);
 	assert(observation.neutral_resource_flags == closure);
 }
 
