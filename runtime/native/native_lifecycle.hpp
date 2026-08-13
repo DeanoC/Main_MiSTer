@@ -30,6 +30,7 @@ struct NativeResourceLedger {
 	bool scheduler;
 	bool offload;
 	bool input_descriptors;
+	bool core_protocol_shutdown_complete;
 	bool digital_neutral_captured;
 	bool digital_neutral_valid[kNativePlayerCount];
 	NativeDigitalNeutral digital_neutral[kNativePlayerCount];
@@ -40,6 +41,12 @@ struct NativeCleanupTiming {
 	uint64_t cleanup_start_ms;
 	uint64_t non_fpga_deadline_ms;
 	uint64_t fpga_deadline_ms;
+};
+
+struct NativeFailureDrainTiming {
+	bool established;
+	uint64_t drain_start_ms;
+	uint64_t drain_deadline_ms;
 };
 
 class NativeLifecycle final {
@@ -56,6 +63,7 @@ public:
 	Result ActivateFixtureForTest(const NativeCoreProfile &profile,
 		uint64_t activation_deadline_ms);
 	uint64_t cleanup_epoch_identity_for_test() const;
+	NativeFailureDrainTiming failure_drain_timing_for_test() const;
 #endif
 	Result Stop();
 
@@ -71,9 +79,14 @@ private:
 	Result FinishAcquisitionLocked(NativeAcquisitionOutcome outcome,
 		uint64_t resource_flags,
 		bool *supporting_ledger, uint64_t activation_deadline_ms);
+	Result FinishCoreProtocolAcquisitionLocked(
+		NativeCoreProtocolOutcome outcome,
+		std::unique_ptr<OperationLease> *lease,
+		uint64_t activation_deadline_ms);
 	Result FailActivationLocked(Result activation_result);
 	Result FinishPreownershipContentLocked(Result activation_result);
 	void EstablishCleanupTimingLocked();
+	void EstablishFailureDrainTimingLocked();
 	Result EstablishCleanupLocked();
 	Result RunCleanupLocked();
 	Result BeginCleanupOperationLocked(OperationKind kind,
@@ -93,6 +106,7 @@ private:
 	PlatformGenerationId generation_;
 	NativeResourceLedger ledger_;
 	NativeCleanupTiming cleanup_timing_;
+	NativeFailureDrainTiming failure_drain_timing_;
 	Result latched_activation_result_;
 	const NativeCoreProfile *profile_;
 	std::unique_ptr<CleanupEpoch> cleanup_epoch_;

@@ -41,16 +41,31 @@ enum class OperationKind : uint8_t {
 	terminal_fpga_cleanup
 };
 
+enum class CoreProtocolBrokerDisposition : uint8_t {
+	no_session,
+	session_current,
+	session_abandoned,
+	success_completed,
+	failure_completed
+};
+
 class HardwareBroker;
 class OperationLease;
 class NativeInput;
 class NativeSpiBus;
 class NativeContainment;
 class NativeRecovery;
+class NativeCoreProtocol;
+class NativeLifecycle;
+class CoreProtocolAuthorityTestPeer;
+class ActiveCoreProtocolSession;
+class CleanupCoreProtocolSession;
+class RecoveryCoreProtocolSession;
 class ContainmentResumeKey;
 enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
 struct OperationRegistration;
+struct ProtocolSessionState;
 namespace linux_native {
 class NativeFpgaProgrammer;
 class NativeInputAdapter;
@@ -91,6 +106,9 @@ private:
 	friend class HardwareBroker;
 	friend class NativeSpiBus;
 	friend class NativeContainment;
+	friend class ActiveCoreProtocolSession;
+	friend class CleanupCoreProtocolSession;
+	friend class RecoveryCoreProtocolSession;
 	friend class linux_native::NativeFpgaProgrammer;
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
@@ -102,6 +120,34 @@ private:
 	uint64_t absolute_deadline_ms() const;
 
 	std::shared_ptr<OperationRegistration> registration_;
+};
+
+struct CoreProtocolResidue {
+	bool mapping_retained;
+	bool identity_mode_may_be_asserted;
+	bool user_io_selected;
+	bool file_io_selected;
+	bool strobe_may_be_high;
+	bool download_may_be_active;
+	bool status_reset_asserted;
+	uint64_t last_mutation_sequence;
+};
+
+struct ProtocolMappingReleaseReceipt {
+	Result result;
+	bool selected_transaction_closed;
+	bool unmap_attempted;
+	bool mapping_absent;
+	bool descriptor_close_attempted;
+	bool descriptor_absent;
+	uint64_t mutation_sequence;
+};
+
+struct ActiveProtocolFailureReceipt {
+	Result primary_result;
+	CoreProtocolResidue residue;
+	ProtocolMappingReleaseReceipt mapping_release;
+	uint64_t final_mutation_sequence;
 };
 
 class OperationLease final {
@@ -119,6 +165,10 @@ private:
 	friend class HardwareBroker;
 	friend class NativeInput;
 	friend class NativeSpiBus;
+	friend class NativeCoreProtocol;
+	friend class NativeLifecycle;
+	friend class NativeRecovery;
+	friend class CoreProtocolAuthorityTestPeer;
 	friend class linux_native::NativeInputAdapter;
 	friend class linux_native::NativeSchedulerAdapter;
 	friend class linux_native::NativeOffloadAdapter;
@@ -131,6 +181,37 @@ private:
 	Result AcquireInputHardwareLeaseView(HardwareBroker &owner,
 		const NativeCoreProfile &profile,
 		std::unique_ptr<HardwareLeaseView> *view) const;
+	Result AcquireActiveCoreProtocolSession(HardwareBroker &owner,
+		const NativeCoreProfile &profile,
+		std::unique_ptr<ActiveCoreProtocolSession> *session) const;
+	Result AcquireCleanupCoreProtocolSession(HardwareBroker &owner,
+		std::unique_ptr<CleanupCoreProtocolSession> *session) const;
+	Result AcquireRecoveryCoreProtocolSession(HardwareBroker &owner,
+		std::unique_ptr<RecoveryCoreProtocolSession> *session) const;
+	Result CompleteFailedCoreProtocolSession(HardwareBroker &owner,
+		std::unique_ptr<ActiveCoreProtocolSession> &&session,
+		const ActiveProtocolFailureReceipt &receipt) const;
+	Result CompleteSuccessfulCoreProtocolSession(HardwareBroker &owner,
+		std::unique_ptr<ActiveCoreProtocolSession> &&session,
+		const ProtocolMappingReleaseReceipt &receipt) const;
+	Result CompleteCleanupCoreProtocolSession(HardwareBroker &owner,
+		std::unique_ptr<CleanupCoreProtocolSession> &&session,
+		const ProtocolMappingReleaseReceipt &receipt) const;
+	Result CompleteRecoveryCoreProtocolSession(HardwareBroker &owner,
+		std::unique_ptr<RecoveryCoreProtocolSession> &&session,
+		const ProtocolMappingReleaseReceipt &receipt) const;
+	Result CompleteInvalidCoreProtocolOutcome(HardwareBroker &owner,
+		Result primary_result) const;
+	Result GetCoreProtocolBrokerDisposition(HardwareBroker &owner,
+		CoreProtocolBrokerDisposition *disposition) const;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	Result BeginConcurrentActiveOperationForTest(HardwareBroker &owner,
+		OperationKind operation_kind, uint64_t absolute_deadline_ms,
+		std::unique_ptr<OperationLease> *lease) const;
+	Result RecordActiveCoreProtocolMutationForTest(HardwareBroker &owner,
+		ActiveCoreProtocolSession &session,
+		uint64_t *mutation_sequence) const;
+#endif
 	Result AcquireProcessOperationGuard(HardwareBroker &owner,
 		OperationKind required_operation_kind,
 		const NativeCoreProfile *required_profile,
@@ -234,6 +315,11 @@ public:
 	bool has_live_generation_for_test();
 	uint64_t mutation_sequence_for_test();
 	uint64_t containment_receipt_sequence_for_test();
+	bool core_protocol_failure_receipt_for_test(
+		ActiveProtocolFailureReceipt *receipt);
+	bool core_protocol_session_current_for_test();
+	bool core_protocol_session_abandoned_for_test(
+		const OperationLease &lease);
 #endif
 	Result Begin(PlatformGenerationId generation, OperationKind operation_kind,
 		uint64_t absolute_deadline_ms,
@@ -300,6 +386,34 @@ private:
 		OperationKind required_operation_kind,
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<HardwareLeaseView> *view);
+	Result AcquireActiveCoreProtocolSessionFor(const OperationLease &lease,
+		const NativeCoreProfile &profile,
+		std::unique_ptr<ActiveCoreProtocolSession> *session);
+	Result AcquireCleanupCoreProtocolSessionFor(const OperationLease &lease,
+		std::unique_ptr<CleanupCoreProtocolSession> *session);
+	Result AcquireRecoveryCoreProtocolSessionFor(const OperationLease &lease,
+		std::unique_ptr<RecoveryCoreProtocolSession> *session);
+	Result CompleteFailedCoreProtocolSessionFor(const OperationLease &lease,
+		std::unique_ptr<ActiveCoreProtocolSession> &&session,
+		const ActiveProtocolFailureReceipt &receipt);
+	Result CompleteSuccessfulCoreProtocolSessionFor(const OperationLease &lease,
+		std::unique_ptr<ActiveCoreProtocolSession> &&session,
+		const ProtocolMappingReleaseReceipt &receipt);
+	Result CompleteCleanupCoreProtocolSessionFor(const OperationLease &lease,
+		std::unique_ptr<CleanupCoreProtocolSession> &&session,
+		const ProtocolMappingReleaseReceipt &receipt);
+	Result CompleteRecoveryCoreProtocolSessionFor(const OperationLease &lease,
+		std::unique_ptr<RecoveryCoreProtocolSession> &&session,
+		const ProtocolMappingReleaseReceipt &receipt);
+	Result CompleteInvalidCoreProtocolOutcomeFor(const OperationLease &lease,
+		Result primary_result);
+	Result GetCoreProtocolBrokerDispositionFor(const OperationLease &lease,
+		CoreProtocolBrokerDisposition *disposition);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	Result RecordActiveCoreProtocolMutationForTest(const OperationLease &lease,
+		ActiveCoreProtocolSession &session,
+		uint64_t *mutation_sequence);
+#endif
 	Result AcquireProcessOperationGuardFor(const OperationLease &lease,
 		HardwareBroker &owner, OperationKind required_operation_kind,
 		const NativeCoreProfile *required_profile,
@@ -343,6 +457,9 @@ private:
 		uint32_t neutral_resource_flags);
 	void LatchRecoveryResult(Result result);
 	void ClearContainmentReceipt();
+	void ClearCoreProtocolFailureReceipt();
+	void ConsumeCoreProtocolSessionState(OperationRegistration &registration,
+		const std::shared_ptr<ProtocolSessionState> &state);
 	bool ReceiptMatchesCleanup(const CleanupEpoch &epoch) const;
 	bool ReceiptMatchesRecovery(const RecoveryEpoch &epoch) const;
 
@@ -389,6 +506,9 @@ private:
 	uint32_t recovery_neutral_resource_flags_;
 	bool receipt_mappings_released_;
 	OperationRegistration *receipt_registration_;
+	bool core_protocol_failure_receipt_current_;
+	ActiveProtocolFailureReceipt core_protocol_failure_receipt_;
+	std::weak_ptr<ProtocolSessionState> core_protocol_session_state_;
 	const NativeCoreProfile *profile_;
 };
 

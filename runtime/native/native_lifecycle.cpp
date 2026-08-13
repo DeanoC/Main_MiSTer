@@ -14,7 +14,8 @@ NativeResourceLedger EmptyLedger()
 {
 	const NativeDigitalNeutral empty = {0, {0, 0}};
 	const NativeResourceLedger ledger = {
-		0, false, false, false, false, false, {false, false}, {empty, empty}
+		0, false, false, false, false, false, false,
+		{false, false}, {empty, empty}
 	};
 	return ledger;
 }
@@ -25,6 +26,12 @@ NativeCleanupTiming EmptyCleanupTiming()
 	return timing;
 }
 
+NativeFailureDrainTiming EmptyFailureDrainTiming()
+{
+	const NativeFailureDrainTiming timing = {false, 0, 0};
+	return timing;
+}
+
 } // namespace
 
 NativeLifecycle::NativeLifecycle(NativeClock &clock, HardwareBroker &broker,
@@ -32,6 +39,7 @@ NativeLifecycle::NativeLifecycle(NativeClock &clock, HardwareBroker &broker,
 	: clock_(clock), broker_(broker), resources_(resources), mutex_(),
 	  state_(NativeLifecycleState::idle), generation_(0), ledger_(EmptyLedger()),
 	  cleanup_timing_(EmptyCleanupTiming()),
+	  failure_drain_timing_(EmptyFailureDrainTiming()),
 	  latched_activation_result_(MISTER_RESULT_OK), profile_(nullptr),
 	  cleanup_epoch_()
 {
@@ -95,6 +103,12 @@ uint64_t NativeLifecycle::cleanup_epoch_identity_for_test() const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return cleanup_epoch_ ? cleanup_epoch_->identity_for_test() : 0;
+}
+
+NativeFailureDrainTiming NativeLifecycle::failure_drain_timing_for_test() const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return failure_drain_timing_;
 }
 #endif
 
@@ -167,10 +181,8 @@ Result NativeLifecycle::ActivateLocked(const NativeCoreProfile &profile,
 	NativeCoreProtocolOutcome protocol_outcome = {result, false, false};
 	if (result == MISTER_RESULT_OK) protocol_outcome =
 		resources_.hardware.StartCoreProtocol(*lease, profile, resources_.content);
-	outcome = {protocol_outcome.result, protocol_outcome.acquired};
-	lease.reset();
-	result = FinishAcquisitionLocked(outcome, MISTER_RESOURCE_CORE_PROTOCOL,
-		nullptr, activation_deadline_ms);
+	result = FinishCoreProtocolAcquisitionLocked(protocol_outcome, &lease,
+		activation_deadline_ms);
 	if (result != MISTER_RESULT_OK) return result;
 
 	result = broker_.Begin(generation_, OperationKind::video,
@@ -250,6 +262,76 @@ Result NativeLifecycle::FinishAcquisitionLocked(NativeAcquisitionOutcome outcome
 	return MISTER_RESULT_OK;
 }
 
+Result NativeLifecycle::FinishCoreProtocolAcquisitionLocked(
+	NativeCoreProtocolOutcome outcome,
+	std::unique_ptr<OperationLease> *lease,
+	uint64_t activation_deadline_ms)
+{
+	if (outcome.acquired) {
+		ledger_.resource_flags |= MISTER_RESOURCE_CORE_PROTOCOL;
+		ledger_.core_protocol_shutdown_complete = false;
+	}
+
+	// A failed Begin has no provider claim or live operation registration to
+	// validate. All provider-returned outcomes retain the operation lease until
+	// the broker's completion state has been checked under its own lock.
+	if (!*lease) return FailActivationLocked(outcome.result);
+
+	CoreProtocolBrokerDisposition disposition =
+		CoreProtocolBrokerDisposition::no_session;
+	const Result disposition_result =
+		(*lease)->GetCoreProtocolBrokerDisposition(broker_, &disposition);
+	const bool valid_success =
+		disposition_result == MISTER_RESULT_OK &&
+		outcome.result == MISTER_RESULT_OK && outcome.acquired &&
+		!outcome.broker_failure_completed &&
+		disposition == CoreProtocolBrokerDisposition::success_completed;
+	const bool valid_failure =
+		disposition_result == MISTER_RESULT_OK &&
+		outcome.result != MISTER_RESULT_OK && outcome.acquired &&
+		outcome.broker_failure_completed &&
+		disposition == CoreProtocolBrokerDisposition::failure_completed;
+	const bool valid_nonmutating_failure =
+		disposition_result == MISTER_RESULT_OK &&
+		outcome.result != MISTER_RESULT_OK && !outcome.acquired &&
+		!outcome.broker_failure_completed &&
+		disposition == CoreProtocolBrokerDisposition::no_session;
+
+	if (valid_success && clock_.NowMs() < activation_deadline_ms) {
+		lease->reset();
+		return MISTER_RESULT_OK;
+	}
+	if (valid_nonmutating_failure) {
+		lease->reset();
+		return FailActivationLocked(outcome.result);
+	}
+
+	Result activation_result = valid_failure ? outcome.result :
+		MISTER_RESULT_PLATFORM;
+	if (valid_success) activation_result = MISTER_RESULT_DEADLINE;
+	if (!valid_failure) {
+		const Result closed = (*lease)->CompleteInvalidCoreProtocolOutcome(
+			broker_, activation_result);
+		if (closed != MISTER_RESULT_OK) {
+			// This fallback still closes admission while the operation lease is
+			// live. The broker-owned completion path above is the only expected
+			// route for a current protocol registration.
+			broker_.LatchFailure(generation_);
+		}
+	}
+
+	latched_activation_result_ = activation_result;
+	state_ = NativeLifecycleState::quiescing;
+	EstablishFailureDrainTimingLocked();
+	lease->reset();
+	const Result quiesce = broker_.Quiesce(generation_,
+		failure_drain_timing_.drain_deadline_ms);
+	if (quiesce != MISTER_RESULT_OK) return activation_result;
+	state_ = NativeLifecycleState::cleanup;
+	if (EstablishCleanupLocked() == MISTER_RESULT_OK) RunCleanupLocked();
+	return activation_result;
+}
+
 Result NativeLifecycle::FailActivationLocked(Result activation_result)
 {
 	latched_activation_result_ = activation_result;
@@ -307,7 +389,9 @@ Result NativeLifecycle::Stop()
 	if (state_ == NativeLifecycleState::active ||
 		state_ == NativeLifecycleState::quiescing) {
 		state_ = NativeLifecycleState::quiescing;
-		const uint64_t quiesce_deadline = SaturatingAdd(clock_.NowMs(), 2000);
+		const uint64_t quiesce_deadline = failure_drain_timing_.established ?
+			failure_drain_timing_.drain_deadline_ms :
+			SaturatingAdd(clock_.NowMs(), 2000);
 		const Result quiesce = broker_.Quiesce(generation_, quiesce_deadline);
 		if (quiesce != MISTER_RESULT_OK) return CleanupFailure(quiesce);
 		state_ = NativeLifecycleState::cleanup;
@@ -335,6 +419,15 @@ void NativeLifecycle::EstablishCleanupTimingLocked()
 		cleanup_timing_.cleanup_start_ms, 2000);
 	cleanup_timing_.fpga_deadline_ms = SaturatingAdd(
 		cleanup_timing_.cleanup_start_ms, 5000);
+}
+
+void NativeLifecycle::EstablishFailureDrainTimingLocked()
+{
+	if (failure_drain_timing_.established) return;
+	failure_drain_timing_.established = true;
+	failure_drain_timing_.drain_start_ms = clock_.NowMs();
+	failure_drain_timing_.drain_deadline_ms = SaturatingAdd(
+		failure_drain_timing_.drain_start_ms, 2000);
 }
 
 Result NativeLifecycle::BeginCleanupOperationLocked(OperationKind kind,
@@ -467,14 +560,15 @@ Result NativeLifecycle::RunCleanupLocked()
 		if (result != MISTER_RESULT_OK) return result;
 		ledger_.resource_flags &= ~MISTER_RESOURCE_CONTENT;
 	}
-	if ((ledger_.resource_flags & MISTER_RESOURCE_CORE_PROTOCOL) != 0) {
+	if ((ledger_.resource_flags & MISTER_RESOURCE_CORE_PROTOCOL) != 0 &&
+		!ledger_.core_protocol_shutdown_complete) {
 		result = BeginCleanupOperationLocked(OperationKind::core_protocol, &lease);
 		if (result != MISTER_RESULT_OK) return result;
 		result = resources_.hardware.ShutdownCoreProtocol(*lease);
 		result = FinishCleanupOperationLocked(result, *lease);
 		lease.reset();
 		if (result != MISTER_RESULT_OK) return result;
-		ledger_.resource_flags &= ~MISTER_RESOURCE_CORE_PROTOCOL;
+		ledger_.core_protocol_shutdown_complete = true;
 	}
 
 	result = BeginCleanupOperationLocked(OperationKind::terminal_fpga_cleanup,
@@ -492,6 +586,7 @@ Result NativeLifecycle::RunCleanupLocked()
 
 	ledger_.resource_flags &= ~(MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
 		MISTER_RESOURCE_CORE_PROTOCOL | MISTER_RESOURCE_CORE_INPUT);
+	ledger_.core_protocol_shutdown_complete = false;
 	for (size_t player = 0; player < kNativePlayerCount; ++player)
 		ledger_.digital_neutral_valid[player] = false;
 	state_ = NativeLifecycleState::neutral;
@@ -510,6 +605,7 @@ void NativeLifecycle::ClearGenerationLocked()
 	generation_ = 0;
 	ledger_ = EmptyLedger();
 	cleanup_timing_ = EmptyCleanupTiming();
+	failure_drain_timing_ = EmptyFailureDrainTiming();
 	latched_activation_result_ = MISTER_RESULT_OK;
 	profile_ = nullptr;
 }

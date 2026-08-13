@@ -4,6 +4,7 @@
 #include "runtime/native/native_containment.hpp"
 #include "runtime/native/native_core_profile.hpp"
 #include "runtime/native/native_recovery.hpp"
+#include "tests/native_core_protocol_authority_test_peer.hpp"
 
 #include <assert.h>
 
@@ -35,7 +36,9 @@ size_t KindIndex(OperationKind kind)
 
 class FakeRecoveryIo final : public NativeRecoveryIo {
 public:
-	FakeRecoveryIo() : calls(0), last_deadline(0)
+	explicit FakeRecoveryIo(HardwareBroker &broker)
+		: broker_(broker), calls(0), core_protocol_session_calls(0),
+		  last_deadline(0)
 	{
 		for (size_t index = 0; index != 11; ++index) {
 			states[index] = RecoveryResourceState::unknown;
@@ -46,8 +49,13 @@ public:
 	Result Apply(const OperationLease &lease, OperationKind kind,
 		RecoveryResourceState *state)
 	{
+		return ApplyDeadline(lease.absolute_deadline_ms(), kind, state);
+	}
+	Result ApplyDeadline(uint64_t absolute_deadline_ms, OperationKind kind,
+		RecoveryResourceState *state)
+	{
 		++calls;
-		last_deadline = lease.absolute_deadline_ms();
+		last_deadline = absolute_deadline_ms;
 		const size_t index = KindIndex(kind);
 		*state = states[index];
 		return results[index];
@@ -80,12 +88,26 @@ public:
 	Result DisableCoreProtocol(const OperationLease &lease,
 		RecoveryResourceState *state) override
 	{
-		return Apply(lease, OperationKind::core_protocol, state);
+		std::unique_ptr<RecoveryCoreProtocolSession> session;
+		const Result acquire = CoreProtocolAuthorityTestPeer::AcquireRecovery(
+			lease, broker_, &session);
+		if (acquire != MISTER_RESULT_OK) return acquire;
+		++core_protocol_session_calls;
+		const Result primary = ApplyDeadline(lease.absolute_deadline_ms(),
+			OperationKind::core_protocol, state);
+		const ProtocolMappingReleaseReceipt release = {
+			MISTER_RESULT_OK, true, true, true, true, true,
+			broker_.mutation_sequence_for_test()};
+		const Result completed = CoreProtocolAuthorityTestPeer::CompleteRecovery(
+			lease, broker_, std::move(session), release);
+		return completed == MISTER_RESULT_OK ? primary : completed;
 	}
 
+	HardwareBroker &broker_;
 	RecoveryResourceState states[11];
 	Result results[11];
 	int calls;
+	int core_protocol_session_calls;
 	uint64_t last_deadline;
 };
 
@@ -235,7 +257,7 @@ void TestNormativeDependenciesAndExactDeadlines()
 	for (const Case &test : cases) {
 		FakeClock clock(1000);
 		HardwareBroker broker(clock);
-		FakeRecoveryIo io;
+		FakeRecoveryIo io(broker);
 		NativeRecovery recovery(broker, io);
 		std::unique_ptr<RecoveryEpoch> epoch;
 		assert(broker.BeginRecovery(test.bit, 3000, 6000, &epoch) ==
@@ -281,7 +303,7 @@ void TestTruthfulPartitionAndExactOkRule()
 {
 	FakeClock clock(1000);
 	HardwareBroker broker(clock);
-	FakeRecoveryIo io;
+	FakeRecoveryIo io(broker);
 	NativeRecovery recovery(broker, io);
 	const uint32_t requested = MISTER_RESOURCE_CORE_INPUT |
 		MISTER_RESOURCE_SAVES | MISTER_RESOURCE_NATIVE_AUDIO |
@@ -321,7 +343,7 @@ void TestNonOkResultsRetainPartialFields()
 	for (Result failure : failures) {
 		FakeClock clock(1000);
 		HardwareBroker broker(clock);
-		FakeRecoveryIo io;
+		FakeRecoveryIo io(broker);
 		NativeRecovery recovery(broker, io);
 		std::unique_ptr<RecoveryEpoch> epoch;
 		const uint32_t requested = MISTER_RESOURCE_CORE_INPUT |
@@ -347,7 +369,7 @@ void TestDeadlineExpiryDoesNotExtendAndRetainsProgress()
 {
 	FakeClock clock(1000);
 	HardwareBroker broker(clock);
-	FakeRecoveryIo io;
+	FakeRecoveryIo io(broker);
 	NativeRecovery recovery(broker, io);
 	std::unique_ptr<RecoveryEpoch> epoch;
 	const uint32_t requested = MISTER_RESOURCE_CORE_INPUT |
@@ -374,7 +396,7 @@ void TestTerminalAdmissionDeadlineRetainsProgress()
 {
 	FakeClock clock(1000);
 	HardwareBroker broker(clock);
-	FakeRecoveryIo io;
+	FakeRecoveryIo io(broker);
 	NativeRecovery recovery(broker, io);
 	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
 		MISTER_RESOURCE_CORE_PROTOCOL;
@@ -463,6 +485,28 @@ void TestOperationOverrunRetainsTruthfulResult()
 		MISTER_RESULT_DEADLINE);
 	assert(observation.neutral_resource_flags == MISTER_RESOURCE_CORE_INPUT);
 	assert(observation.observed_resource_flags == 0);
+}
+
+void TestCoreProtocolRecoveryUsesProfilelessSessionAuthority()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	NativeRecovery recovery(broker, io);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL, 3000, 6000,
+		&epoch) == MISTER_RESULT_OK);
+	io.states[KindIndex(OperationKind::core_protocol)] =
+		RecoveryResourceState::neutral;
+	assert(recovery.Perform(*epoch, OperationKind::core_protocol) ==
+		MISTER_RESULT_OK);
+	assert(io.core_protocol_session_calls == 1);
+	assert(io.last_deadline == 6000);
+	MisterRecoveryObservationV2 observation = Observation();
+	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+	assert(observation.observed_resource_flags == 0);
+	assert(observation.neutral_resource_flags ==
+		MISTER_RESOURCE_CORE_PROTOCOL);
 }
 
 void TestTerminalRecoveryAndReadOnlyObservation()
@@ -741,6 +785,7 @@ int main()
 	TestTerminalAdmissionDeadlineRetainsProgress();
 	TestBusyRecoveryAdmissionDoesNotLatchDeadline();
 	TestOperationOverrunRetainsTruthfulResult();
+	TestCoreProtocolRecoveryUsesProfilelessSessionAuthority();
 	TestTerminalRecoveryAndReadOnlyObservation();
 	TestRepeatedObservationReplacesStaleClassification();
 	TestForeignRecoveryAuthorityCannotMutate();

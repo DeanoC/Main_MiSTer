@@ -3,6 +3,7 @@
 
 #include "runtime/native/native_spi_bus.hpp"
 #include "runtime/native/native_core_profile.hpp"
+#include "tests/native_core_protocol_authority_test_peer.hpp"
 
 #include <assert.h>
 
@@ -12,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <type_traits>
+#include <utility>
 
 namespace mister {
 namespace native {
@@ -25,6 +27,30 @@ static_assert(!std::is_constructible<SpiReceiptCommitToken, void *,
 static_assert(!std::is_constructible<SpiReceiptCommitToken, void *,
 	void (*)(void *, const SpiReceipt &)>::value,
 	"SPI receipt commit callback constructor must be private");
+
+template <typename Authority>
+class CanUseGenericSpiExchange {
+private:
+	template <typename Candidate>
+	static auto Probe(int) -> decltype(
+		std::declval<NativeSpiBus &>().ExchangeForTest(
+			std::declval<const Candidate &>(), NativeSpiTarget::user_io,
+			std::declval<const SpiWords &>(),
+			std::declval<SpiReceipt *>()), std::true_type());
+	template <typename>
+	static std::false_type Probe(...);
+public:
+	static const bool value = decltype(Probe<Authority>(0))::value;
+};
+
+static_assert(CanUseGenericSpiExchange<OperationLease>::value,
+	"generic SPI testing remains lease-scoped");
+static_assert(!CanUseGenericSpiExchange<ActiveCoreProtocolSession>::value,
+	"active protocol authority must not name generic SPI exchange");
+static_assert(!CanUseGenericSpiExchange<CleanupCoreProtocolSession>::value,
+	"cleanup protocol authority must not name generic SPI exchange");
+static_assert(!CanUseGenericSpiExchange<RecoveryCoreProtocolSession>::value,
+	"recovery protocol authority must not name generic SPI exchange");
 
 namespace {
 
@@ -631,15 +657,21 @@ void TestRecoveryEpochDestructionDrainsConservatively()
 	std::unique_ptr<OperationLease> lease;
 	assert(broker.BeginRecoveryOperation(*epoch, OperationKind::core_protocol,
 		&lease) == MISTER_RESULT_OK);
-	epoch.reset();
 	FakeIo io;
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 1;
 	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
-	assert(Exchange(bus, *lease, transaction, &receipt) == MISTER_RESULT_OK);
-	assert(receipt.mutation_sequence != 0);
+	assert(Exchange(bus, *lease, transaction, &receipt) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(io.events.empty());
+	assert(receipt.mutation_sequence == 0);
+	std::unique_ptr<RecoveryCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*lease, broker,
+		&session) == MISTER_RESULT_OK);
+	assert(broker.mutation_sequence_for_test() == 0);
+	epoch.reset();
 	lease.reset();
 	std::unique_ptr<RecoveryEpoch> replacement;
 	assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL, 20, 30,
@@ -656,7 +688,7 @@ const OperationKind kAllKinds[] = {
 bool IsSpiHardwareKind(OperationKind kind)
 {
 	return kind == OperationKind::program_fpga ||
-		kind == OperationKind::core_protocol || kind == OperationKind::input ||
+		kind == OperationKind::input ||
 		kind == OperationKind::audio || kind == OperationKind::video ||
 		kind == OperationKind::terminal_fpga_cleanup;
 }
@@ -701,7 +733,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.Begin(generation, OperationKind::core_protocol, 100,
 				&probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 0);
 			continue;
 		}
 		assert(begin_result == MISTER_RESULT_OK);
@@ -712,7 +744,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.Begin(generation, OperationKind::core_protocol, 100,
 				&probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 0);
 		}
 	}
 
@@ -738,7 +770,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginCleanupOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 0);
 			continue;
 		}
 		assert(begin_result == MISTER_RESULT_OK);
@@ -758,7 +790,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginCleanupOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 0);
 		}
 	}
 
@@ -790,7 +822,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginRecoveryOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 0);
 			continue;
 		}
 		assert(begin_result == MISTER_RESULT_OK);
@@ -801,7 +833,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginRecoveryOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 0);
 		}
 	}
 }
@@ -891,7 +923,7 @@ void TestRecoveryMissingBitsAndTerminalClosure()
 		assert(core_result == (core_present ? MISTER_RESULT_OK :
 			MISTER_RESULT_INVALID_STATE));
 		if (core_present) ExecuteMatrixCell(*core,
-			OperationKind::core_protocol, clock, 10);
+			OperationKind::core_protocol, clock, 0);
 	}
 }
 

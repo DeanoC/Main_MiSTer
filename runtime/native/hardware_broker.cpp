@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "runtime/native/hardware_broker.hpp"
+#include "runtime/native/native_core_protocol.hpp"
+#include "runtime/native/native_core_protocol_session_state.hpp"
 #include "runtime/native/native_recovery.hpp"
 
 #include <atomic>
@@ -9,6 +11,15 @@
 
 namespace mister {
 namespace native {
+
+ProtocolSessionState::ProtocolSessionState()
+	: view(), owner_registration(), profile(nullptr),
+	  initial_mutation_sequence(0),
+	  handle_state(ProtocolSessionHandleState::live)
+{
+}
+
+ProtocolSessionState::~ProtocolSessionState() = default;
 
 struct BrokerLifetime {
 	explicit BrokerLifetime(HardwareBroker *owner)
@@ -33,7 +44,9 @@ struct OperationRegistration {
 		: broker(&owner), lifetime(broker_lifetime), authority(lease_authority),
 		  authority_identity(identity), operation_kind(kind),
 		  absolute_deadline_ms(deadline_ms), profile(bound_profile),
-		  registered(false), process_guard_active(false)
+		  registered(false), process_guard_active(false),
+		  core_protocol_completion(CoreProtocolBrokerDisposition::no_session),
+		  core_protocol_session_state()
 	{
 	}
 
@@ -54,6 +67,8 @@ struct OperationRegistration {
 	const NativeCoreProfile *profile;
 	bool registered;
 	bool process_guard_active;
+	CoreProtocolBrokerDisposition core_protocol_completion;
+	std::shared_ptr<ProtocolSessionState> core_protocol_session_state;
 };
 
 namespace {
@@ -219,6 +234,158 @@ Result OperationLease::AcquireInputHardwareLeaseView(HardwareBroker &owner,
 		OperationKind::input, &profile, view);
 }
 
+Result OperationLease::AcquireActiveCoreProtocolSession(HardwareBroker &owner,
+	const NativeCoreProfile &profile,
+	std::unique_ptr<ActiveCoreProtocolSession> *session) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.AcquireActiveCoreProtocolSessionFor(*this, profile, session);
+}
+
+Result OperationLease::AcquireCleanupCoreProtocolSession(HardwareBroker &owner,
+	std::unique_ptr<CleanupCoreProtocolSession> *session) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.AcquireCleanupCoreProtocolSessionFor(*this, session);
+}
+
+Result OperationLease::AcquireRecoveryCoreProtocolSession(HardwareBroker &owner,
+	std::unique_ptr<RecoveryCoreProtocolSession> *session) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.AcquireRecoveryCoreProtocolSessionFor(*this, session);
+}
+
+Result OperationLease::CompleteFailedCoreProtocolSession(HardwareBroker &owner,
+	std::unique_ptr<ActiveCoreProtocolSession> &&session,
+	const ActiveProtocolFailureReceipt &receipt) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.CompleteFailedCoreProtocolSessionFor(*this,
+		std::move(session), receipt);
+}
+
+Result OperationLease::CompleteSuccessfulCoreProtocolSession(
+	HardwareBroker &owner,
+	std::unique_ptr<ActiveCoreProtocolSession> &&session,
+	const ProtocolMappingReleaseReceipt &receipt) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.CompleteSuccessfulCoreProtocolSessionFor(*this,
+		std::move(session), receipt);
+}
+
+Result OperationLease::CompleteCleanupCoreProtocolSession(
+	HardwareBroker &owner,
+	std::unique_ptr<CleanupCoreProtocolSession> &&session,
+	const ProtocolMappingReleaseReceipt &receipt) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.CompleteCleanupCoreProtocolSessionFor(*this,
+		std::move(session), receipt);
+}
+
+Result OperationLease::CompleteRecoveryCoreProtocolSession(
+	HardwareBroker &owner,
+	std::unique_ptr<RecoveryCoreProtocolSession> &&session,
+	const ProtocolMappingReleaseReceipt &receipt) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.CompleteRecoveryCoreProtocolSessionFor(*this,
+		std::move(session), receipt);
+}
+
+Result OperationLease::CompleteInvalidCoreProtocolOutcome(
+	HardwareBroker &owner, Result primary_result) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.CompleteInvalidCoreProtocolOutcomeFor(*this, primary_result);
+}
+
+Result OperationLease::GetCoreProtocolBrokerDisposition(HardwareBroker &owner,
+	CoreProtocolBrokerDisposition *disposition) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.GetCoreProtocolBrokerDispositionFor(*this, disposition);
+}
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+Result OperationLease::BeginConcurrentActiveOperationForTest(
+	HardwareBroker &owner, OperationKind operation_kind,
+	uint64_t absolute_deadline_ms,
+	std::unique_ptr<OperationLease> *lease) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner ||
+		registration_->authority != LeaseAuthority::active_generation)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.Begin(registration_->authority_identity, operation_kind,
+		absolute_deadline_ms, lease);
+}
+
+Result OperationLease::RecordActiveCoreProtocolMutationForTest(
+	HardwareBroker &owner, ActiveCoreProtocolSession &session,
+	uint64_t *mutation_sequence) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker ||
+		registration_->broker != &owner)
+		return MISTER_RESULT_INVALID_STATE;
+	return owner.RecordActiveCoreProtocolMutationForTest(*this, session,
+		mutation_sequence);
+}
+#endif
+
 Result OperationLease::AcquireProcessOperationGuard(HardwareBroker &owner,
 	OperationKind required_operation_kind,
 	const NativeCoreProfile *required_profile,
@@ -324,8 +491,11 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 	  receipt_mutation_sequence_(0), recovery_observed_resource_flags_(0),
 	  recovery_neutral_resource_flags_(0), receipt_mappings_released_(false),
 	  receipt_registration_(nullptr),
+	  core_protocol_failure_receipt_current_(false),
+	  core_protocol_session_state_(),
 	  profile_(nullptr)
 {
+	ClearCoreProtocolFailureReceipt();
 }
 
 HardwareBroker::~HardwareBroker()
@@ -335,6 +505,22 @@ HardwareBroker::~HardwareBroker()
 	while (lifetime_->process_guard_count != 0)
 		lifetime_->process_guards_released.wait(lifetime_lock);
 	lifetime_->broker = nullptr;
+	lifetime_lock.unlock();
+	const std::shared_ptr<ProtocolSessionState> state =
+		core_protocol_session_state_.lock();
+	if (state) {
+		state->handle_state.store(ProtocolSessionHandleState::finalized);
+		const std::shared_ptr<OperationRegistration> registration =
+			state->owner_registration.lock();
+		if (state->view) {
+			state->view->registration_.reset();
+			state->view.reset();
+		}
+		if (registration)
+			registration->core_protocol_session_state.reset();
+	}
+	core_protocol_session_state_.reset();
+	hardware_transaction_active_ = false;
 }
 
 Result HardwareBroker::Enter(const NativeCoreProfile &profile,
@@ -375,6 +561,7 @@ Result HardwareBroker::Enter(const NativeCoreProfile *profile,
 	cleanup_ever_started_ = false;
 	quiesce_complete_ = false;
 	ClearContainmentReceipt();
+	ClearCoreProtocolFailureReceipt();
 	recovery_result_ = MISTER_RESULT_OK;
 	recovery_observed_resource_flags_ = 0;
 	recovery_neutral_resource_flags_ = 0;
@@ -414,6 +601,7 @@ Result HardwareBroker::EnterFixtureForTest(const NativeCoreProfile &profile,
 	cleanup_ever_started_ = false;
 	quiesce_complete_ = false;
 	ClearContainmentReceipt();
+	ClearCoreProtocolFailureReceipt();
 	recovery_result_ = MISTER_RESULT_OK;
 	recovery_observed_resource_flags_ = 0;
 	recovery_neutral_resource_flags_ = 0;
@@ -440,6 +628,40 @@ uint64_t HardwareBroker::containment_receipt_sequence_for_test()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return containment_receipt_current_ ? receipt_mutation_sequence_ : 0;
+}
+
+bool HardwareBroker::core_protocol_failure_receipt_for_test(
+	ActiveProtocolFailureReceipt *receipt)
+{
+	if (receipt == nullptr) return false;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!core_protocol_failure_receipt_current_) return false;
+	*receipt = core_protocol_failure_receipt_;
+	return true;
+}
+
+bool HardwareBroker::core_protocol_session_current_for_test()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<ProtocolSessionState> state =
+		core_protocol_session_state_.lock();
+	return state && state->view;
+}
+
+bool HardwareBroker::core_protocol_session_abandoned_for_test(
+	const OperationLease &lease)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	return registration && registration->registered &&
+		registration->broker == this && current && current->view &&
+		registration->core_protocol_session_state.get() == current.get() &&
+		current->view->registration_.get() == registration.get() &&
+		current->handle_state.load() ==
+			ProtocolSessionHandleState::abandoned;
 }
 #endif
 
@@ -596,6 +818,8 @@ Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
 {
 	if (view == nullptr || view->get() != nullptr)
 		return MISTER_RESULT_INVALID_ARGUMENT;
+	if (required_operation_kind == OperationKind::core_protocol)
+		return MISTER_RESULT_INVALID_STATE;
 
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (hardware_transaction_active_ || containment_evidence_pending_)
@@ -613,7 +837,7 @@ Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
 	const bool active_authority =
 		registration->authority == LeaseAuthority::active_generation &&
 		registration->authority_identity == generation_ &&
-		(state_ == State::active || state_ == State::quiescing);
+		state_ == State::active && !failure_latched_;
 	const bool cleanup_authority =
 		registration->authority == LeaseAuthority::cleanup_epoch &&
 		registration->authority_identity == cleanup_identity_ &&
@@ -637,6 +861,479 @@ Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
 	*view = std::move(admitted);
 	return MISTER_RESULT_OK;
 }
+
+Result HardwareBroker::AcquireActiveCoreProtocolSessionFor(
+	const OperationLease &lease, const NativeCoreProfile &profile,
+	std::unique_ptr<ActiveCoreProtocolSession> *session)
+{
+	if (session == nullptr || session->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->core_protocol_session_state ||
+		registration->core_protocol_completion !=
+			CoreProtocolBrokerDisposition::no_session ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		registration->profile != &profile || state_ != State::active ||
+		failure_latched_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	std::unique_ptr<ActiveCoreProtocolSession> admitted(
+		new (std::nothrow) ActiveCoreProtocolSession());
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	std::shared_ptr<ProtocolSessionState> state(
+		new (std::nothrow) ProtocolSessionState());
+	if (!state) return MISTER_RESULT_PLATFORM;
+	std::unique_ptr<HardwareLeaseView> view(
+		new (std::nothrow) HardwareLeaseView(registration));
+	if (!view) return MISTER_RESULT_PLATFORM;
+	state->view = std::move(view);
+	state->owner_registration = registration;
+	state->profile = registration->profile;
+	state->initial_mutation_sequence = mutation_sequence_;
+	admitted->state_ = state;
+	registration->core_protocol_session_state = state;
+	core_protocol_session_state_ = state;
+	hardware_transaction_active_ = true;
+	*session = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::AcquireCleanupCoreProtocolSessionFor(
+	const OperationLease &lease,
+	std::unique_ptr<CleanupCoreProtocolSession> *session)
+{
+	if (session == nullptr || session->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->core_protocol_session_state ||
+		registration->core_protocol_completion !=
+			CoreProtocolBrokerDisposition::no_session ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != cleanup_identity_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		state_ != State::cleanup || !cleanup_registered_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	std::unique_ptr<CleanupCoreProtocolSession> admitted(
+		new (std::nothrow) CleanupCoreProtocolSession());
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	std::shared_ptr<ProtocolSessionState> state(
+		new (std::nothrow) ProtocolSessionState());
+	if (!state) return MISTER_RESULT_PLATFORM;
+	std::unique_ptr<HardwareLeaseView> view(
+		new (std::nothrow) HardwareLeaseView(registration));
+	if (!view) return MISTER_RESULT_PLATFORM;
+	state->view = std::move(view);
+	state->owner_registration = registration;
+	state->profile = registration->profile;
+	state->initial_mutation_sequence = mutation_sequence_;
+	admitted->state_ = state;
+	registration->core_protocol_session_state = state;
+	core_protocol_session_state_ = state;
+	hardware_transaction_active_ = true;
+	*session = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::AcquireRecoveryCoreProtocolSessionFor(
+	const OperationLease &lease,
+	std::unique_ptr<RecoveryCoreProtocolSession> *session)
+{
+	if (session == nullptr || session->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->core_protocol_session_state ||
+		registration->core_protocol_completion !=
+			CoreProtocolBrokerDisposition::no_session ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::recovery_epoch ||
+		registration->authority_identity != recovery_identity_ ||
+		registration->profile != nullptr || state_ != State::recovery ||
+		!recovery_registered_ || recovery_terminal_neutral_ ||
+		(recovery_requested_resource_flags_ &
+		 MISTER_RESOURCE_CORE_PROTOCOL) == 0)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	std::unique_ptr<RecoveryCoreProtocolSession> admitted(
+		new (std::nothrow) RecoveryCoreProtocolSession());
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	std::shared_ptr<ProtocolSessionState> state(
+		new (std::nothrow) ProtocolSessionState());
+	if (!state) return MISTER_RESULT_PLATFORM;
+	std::unique_ptr<HardwareLeaseView> view(
+		new (std::nothrow) HardwareLeaseView(registration));
+	if (!view) return MISTER_RESULT_PLATFORM;
+	state->view = std::move(view);
+	state->owner_registration = registration;
+	state->initial_mutation_sequence = mutation_sequence_;
+	admitted->state_ = state;
+	registration->core_protocol_session_state = state;
+	core_protocol_session_state_ = state;
+	hardware_transaction_active_ = true;
+	*session = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CompleteFailedCoreProtocolSessionFor(
+	const OperationLease &lease,
+	std::unique_ptr<ActiveCoreProtocolSession> &&session,
+	const ActiveProtocolFailureReceipt &receipt)
+{
+	if (!session || !session->state_ || !session->state_->view)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	const std::shared_ptr<OperationRegistration> session_owner =
+		session->state_->owner_registration.lock();
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		current.get() != session->state_.get() ||
+		core_protocol_failure_receipt_current_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->core_protocol_session_state.get() !=
+			session->state_.get() || session_owner.get() != registration.get() ||
+		session->state_->handle_state.load() !=
+			ProtocolSessionHandleState::live ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		session->state_->profile != profile_ ||
+		session->state_->view->registration_.get() != registration.get() ||
+		state_ != State::active || failure_latched_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (receipt.primary_result == MISTER_RESULT_OK ||
+		receipt.final_mutation_sequence <=
+			session->state_->initial_mutation_sequence ||
+		receipt.final_mutation_sequence != mutation_sequence_ ||
+		receipt.residue.last_mutation_sequence != mutation_sequence_ ||
+		receipt.mapping_release.mutation_sequence != mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (receipt.mapping_release.result == MISTER_RESULT_OK &&
+		(!receipt.mapping_release.selected_transaction_closed ||
+		 !receipt.mapping_release.unmap_attempted ||
+		 !receipt.mapping_release.mapping_absent ||
+		 !receipt.mapping_release.descriptor_close_attempted ||
+		 !receipt.mapping_release.descriptor_absent))
+		return MISTER_RESULT_INVALID_STATE;
+	if (receipt.residue.mapping_retained ==
+		(receipt.mapping_release.mapping_absent &&
+		 receipt.mapping_release.descriptor_absent))
+		return MISTER_RESULT_INVALID_STATE;
+
+	core_protocol_failure_receipt_ = receipt;
+	core_protocol_failure_receipt_current_ = true;
+	failure_latched_ = true;
+	state_ = State::quiescing;
+	quiesce_complete_ = false;
+
+	// The failure latch and residue become current under this same broker lock
+	// before the duration-held protocol view is consumed. Clearing the view's
+	// registration makes its destructor inert and avoids reacquiring this lock.
+	session->state_->handle_state.store(ProtocolSessionHandleState::finalized);
+	ConsumeCoreProtocolSessionState(*registration, session->state_);
+	registration->core_protocol_completion =
+		CoreProtocolBrokerDisposition::failure_completed;
+	session.reset();
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CompleteSuccessfulCoreProtocolSessionFor(
+	const OperationLease &lease,
+	std::unique_ptr<ActiveCoreProtocolSession> &&session,
+	const ProtocolMappingReleaseReceipt &receipt)
+{
+	if (!session || !session->state_ || !session->state_->view)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	const std::shared_ptr<OperationRegistration> session_owner =
+		session->state_->owner_registration.lock();
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		current.get() != session->state_.get() ||
+		!registration || !registration->registered ||
+		registration->core_protocol_session_state.get() !=
+			session->state_.get() || session_owner.get() != registration.get() ||
+		session->state_->handle_state.load() !=
+			ProtocolSessionHandleState::live ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		session->state_->profile != profile_ ||
+		session->state_->view->registration_.get() != registration.get() ||
+		state_ != State::active || failure_latched_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (receipt.result != MISTER_RESULT_OK ||
+		!receipt.selected_transaction_closed || !receipt.unmap_attempted ||
+		!receipt.mapping_absent || !receipt.descriptor_close_attempted ||
+		!receipt.descriptor_absent ||
+		receipt.mutation_sequence <=
+			session->state_->initial_mutation_sequence ||
+		receipt.mutation_sequence != mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+
+	session->state_->handle_state.store(ProtocolSessionHandleState::finalized);
+	ConsumeCoreProtocolSessionState(*registration, session->state_);
+	registration->core_protocol_completion =
+		CoreProtocolBrokerDisposition::success_completed;
+	session.reset();
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CompleteCleanupCoreProtocolSessionFor(
+	const OperationLease &lease,
+	std::unique_ptr<CleanupCoreProtocolSession> &&session,
+	const ProtocolMappingReleaseReceipt &receipt)
+{
+	if (!session || !session->state_ || !session->state_->view)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	const std::shared_ptr<OperationRegistration> session_owner =
+		session->state_->owner_registration.lock();
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		current.get() != session->state_.get() ||
+		!registration || !registration->registered ||
+		registration->core_protocol_session_state.get() !=
+			session->state_.get() || session_owner.get() != registration.get() ||
+		session->state_->handle_state.load() !=
+			ProtocolSessionHandleState::live ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != cleanup_identity_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		session->state_->profile != profile_ ||
+		session->state_->view->registration_.get() != registration.get() ||
+		state_ != State::cleanup || !cleanup_registered_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (receipt.result != MISTER_RESULT_OK ||
+		!receipt.selected_transaction_closed || !receipt.unmap_attempted ||
+		!receipt.mapping_absent || !receipt.descriptor_close_attempted ||
+		!receipt.descriptor_absent ||
+		receipt.mutation_sequence != mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	session->state_->handle_state.store(ProtocolSessionHandleState::finalized);
+	ConsumeCoreProtocolSessionState(*registration, session->state_);
+	registration->core_protocol_completion =
+		CoreProtocolBrokerDisposition::success_completed;
+	session.reset();
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CompleteRecoveryCoreProtocolSessionFor(
+	const OperationLease &lease,
+	std::unique_ptr<RecoveryCoreProtocolSession> &&session,
+	const ProtocolMappingReleaseReceipt &receipt)
+{
+	if (!session || !session->state_ || !session->state_->view)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	const std::shared_ptr<OperationRegistration> session_owner =
+		session->state_->owner_registration.lock();
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		current.get() != session->state_.get() ||
+		!registration || !registration->registered ||
+		registration->core_protocol_session_state.get() !=
+			session->state_.get() || session_owner.get() != registration.get() ||
+		session->state_->handle_state.load() !=
+			ProtocolSessionHandleState::live ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::recovery_epoch ||
+		registration->authority_identity != recovery_identity_ ||
+		registration->profile != nullptr || session->state_->profile != nullptr ||
+		session->state_->view->registration_.get() != registration.get() ||
+		state_ != State::recovery || !recovery_registered_ ||
+		recovery_terminal_neutral_ ||
+		(recovery_requested_resource_flags_ & MISTER_RESOURCE_CORE_PROTOCOL) == 0)
+		return MISTER_RESULT_INVALID_STATE;
+	if (receipt.result != MISTER_RESULT_OK ||
+		!receipt.selected_transaction_closed || !receipt.unmap_attempted ||
+		!receipt.mapping_absent || !receipt.descriptor_close_attempted ||
+		!receipt.descriptor_absent ||
+		receipt.mutation_sequence != mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	session->state_->handle_state.store(ProtocolSessionHandleState::finalized);
+	ConsumeCoreProtocolSessionState(*registration, session->state_);
+	registration->core_protocol_completion =
+		CoreProtocolBrokerDisposition::success_completed;
+	session.reset();
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CompleteInvalidCoreProtocolOutcomeFor(
+	const OperationLease &lease, Result primary_result)
+{
+	if (primary_result == MISTER_RESULT_OK)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		(state_ != State::active &&
+		 !(state_ == State::quiescing && failure_latched_)))
+		return MISTER_RESULT_INVALID_STATE;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	if (current) {
+		const std::shared_ptr<OperationRegistration> session_owner =
+			current->owner_registration.lock();
+		if (!current->view ||
+			registration->core_protocol_session_state.get() != current.get() ||
+			session_owner.get() != registration.get() ||
+			current->view->registration_.get() != registration.get() ||
+			current->handle_state.load() ==
+				ProtocolSessionHandleState::finalized)
+			return MISTER_RESULT_INVALID_STATE;
+	} else if (registration->core_protocol_session_state) {
+		return MISTER_RESULT_INVALID_STATE;
+	}
+
+	if (!core_protocol_failure_receipt_current_) {
+		const bool retained = current != nullptr;
+		const bool mutated = current &&
+			mutation_sequence_ >
+				current->initial_mutation_sequence;
+		const CoreProtocolResidue residue = {
+			retained, mutated, mutated, mutated, mutated, mutated, mutated,
+			mutation_sequence_};
+		const ProtocolMappingReleaseReceipt release = {
+			MISTER_RESULT_CLEANUP_INCOMPLETE, false, false, !retained,
+			false, !retained, mutation_sequence_};
+		core_protocol_failure_receipt_ = {
+			primary_result, residue, release, mutation_sequence_};
+		core_protocol_failure_receipt_current_ = true;
+	}
+	failure_latched_ = true;
+	state_ = State::quiescing;
+	quiesce_complete_ = false;
+	if (current) {
+		current->handle_state.store(ProtocolSessionHandleState::finalized);
+		ConsumeCoreProtocolSessionState(*registration, current);
+	}
+	registration->core_protocol_completion =
+		CoreProtocolBrokerDisposition::failure_completed;
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::GetCoreProtocolBrokerDispositionFor(
+	const OperationLease &lease,
+	CoreProtocolBrokerDisposition *disposition)
+{
+	if (disposition == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (registration->core_protocol_completion ==
+			CoreProtocolBrokerDisposition::success_completed ||
+		registration->core_protocol_completion ==
+			CoreProtocolBrokerDisposition::failure_completed) {
+		*disposition = registration->core_protocol_completion;
+		return MISTER_RESULT_OK;
+	}
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	if (current && current->view &&
+		registration->core_protocol_session_state.get() == current.get() &&
+		current->owner_registration.lock().get() == registration.get() &&
+		current->view->registration_.get() == registration.get()) {
+		*disposition = current->handle_state.load() ==
+			ProtocolSessionHandleState::abandoned ?
+			CoreProtocolBrokerDisposition::session_abandoned :
+			CoreProtocolBrokerDisposition::session_current;
+		return MISTER_RESULT_OK;
+	}
+	*disposition = CoreProtocolBrokerDisposition::no_session;
+	return MISTER_RESULT_OK;
+}
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+Result HardwareBroker::RecordActiveCoreProtocolMutationForTest(
+	const OperationLease &lease, ActiveCoreProtocolSession &session,
+	uint64_t *mutation_sequence)
+{
+	if (mutation_sequence == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	*mutation_sequence = 0;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<ProtocolSessionState> current =
+		core_protocol_session_state_.lock();
+	if (!session.state_ || !session.state_->view || !registration ||
+		!registration->registered || registration->broker != this ||
+		current.get() != session.state_.get() ||
+		registration->core_protocol_session_state.get() != session.state_.get() ||
+		session.state_->owner_registration.lock().get() != registration.get() ||
+		session.state_->handle_state.load() !=
+			ProtocolSessionHandleState::live ||
+		registration->operation_kind != OperationKind::core_protocol ||
+		registration->authority != LeaseAuthority::active_generation ||
+		registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		session.state_->profile != profile_ ||
+		session.state_->view->registration_.get() != registration.get() ||
+		state_ != State::active || failure_latched_ ||
+		!hardware_transaction_active_ || containment_evidence_pending_ ||
+		mutation_sequence_ == UINT64_MAX)
+		return MISTER_RESULT_INVALID_STATE;
+	*mutation_sequence = ++mutation_sequence_;
+	return MISTER_RESULT_OK;
+}
+#endif
 
 Result HardwareBroker::AcquireProcessOperationGuardFor(
 	const OperationLease &lease, HardwareBroker &owner,
@@ -750,7 +1447,7 @@ Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
 	std::shared_ptr<OperationRegistration> registration(
 		new (std::nothrow) OperationRegistration(*this,
 			LeaseAuthority::recovery_epoch, epoch.identity_, operation_kind,
-			absolute_deadline_ms, lifetime_, profile_));
+			absolute_deadline_ms, lifetime_, nullptr));
 	if (!registration) {
 		LatchRecoveryResult(MISTER_RESULT_PLATFORM);
 		return MISTER_RESULT_PLATFORM;
@@ -841,6 +1538,8 @@ Result HardwareBroker::Leave(PlatformGenerationId generation,
 		quiesce_complete_ = false;
 		quiesce_call_active_ = false;
 		failure_latched_ = false;
+		ClearCoreProtocolFailureReceipt();
+		profile_ = nullptr;
 		state_ = State::idle;
 	}
 
@@ -1428,6 +2127,30 @@ void HardwareBroker::ClearContainmentReceipt()
 	receipt_mutation_sequence_ = 0;
 	receipt_mappings_released_ = false;
 	receipt_registration_ = nullptr;
+}
+
+void HardwareBroker::ClearCoreProtocolFailureReceipt()
+{
+	const CoreProtocolResidue residue = {
+		false, false, false, false, false, false, false, 0};
+	const ProtocolMappingReleaseReceipt mapping_release = {
+		MISTER_RESULT_OK, false, false, false, false, false, 0};
+	core_protocol_failure_receipt_current_ = false;
+	core_protocol_failure_receipt_ = {
+		MISTER_RESULT_OK, residue, mapping_release, 0};
+}
+
+void HardwareBroker::ConsumeCoreProtocolSessionState(
+	OperationRegistration &registration,
+	const std::shared_ptr<ProtocolSessionState> &state)
+{
+	if (state && state->view) {
+		state->view->registration_.reset();
+		state->view.reset();
+	}
+	registration.core_protocol_session_state.reset();
+	core_protocol_session_state_.reset();
+	hardware_transaction_active_ = false;
 }
 
 bool HardwareBroker::ReceiptMatchesCleanup(const CleanupEpoch &epoch) const

@@ -3,6 +3,7 @@
 
 #include "runtime/native/hardware_broker.hpp"
 #include "runtime/native/native_core_profile.hpp"
+#include "tests/native_core_protocol_authority_test_peer.hpp"
 
 #include <assert.h>
 #include <pthread.h>
@@ -193,6 +194,83 @@ void TestOwningTypesAreNotForgeable()
 		"hardware views must not be constructible by adapters or tests");
 	static_assert(!std::is_copy_constructible<HardwareLeaseView>::value,
 		"hardware views must retain unique owning handles");
+	static_assert(!std::is_default_constructible<
+		ActiveCoreProtocolSession>::value,
+		"active protocol authority must be broker-created");
+	static_assert(!std::is_default_constructible<
+		CleanupCoreProtocolSession>::value,
+		"cleanup protocol authority must be broker-created");
+	static_assert(!std::is_default_constructible<
+		RecoveryCoreProtocolSession>::value,
+		"recovery protocol authority must be broker-created");
+	static_assert(!std::is_convertible<ActiveCoreProtocolSession *,
+		CleanupCoreProtocolSession *>::value,
+		"active protocol authority cannot become cleanup authority");
+	static_assert(!std::is_convertible<CleanupCoreProtocolSession *,
+		RecoveryCoreProtocolSession *>::value,
+		"cleanup protocol authority cannot become recovery authority");
+	static_assert(!std::is_convertible<RecoveryCoreProtocolSession *,
+		ActiveCoreProtocolSession *>::value,
+		"recovery protocol authority cannot become active authority");
+}
+
+void TestProtocolSessionsRequireExactAuthority()
+{
+	FakeClock active_clock(1000);
+	HardwareBroker active_broker(active_clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(active_broker.EnterFixtureForTest(profile, &generation) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> active_lease;
+	assert(active_broker.Begin(generation, OperationKind::core_protocol, 2000,
+		&active_lease) == MISTER_RESULT_OK);
+	NativeCoreProfile copied_profile = profile;
+	std::unique_ptr<ActiveCoreProtocolSession> wrong_profile;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*active_lease,
+		active_broker, copied_profile, &wrong_profile) ==
+		MISTER_RESULT_INVALID_STATE);
+	std::unique_ptr<ActiveCoreProtocolSession> active;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*active_lease,
+		active_broker, profile, &active) == MISTER_RESULT_OK);
+	assert(active_lease->absolute_deadline_ms() == 2000);
+	std::unique_ptr<CleanupCoreProtocolSession> wrong_cleanup;
+	assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*active_lease,
+		active_broker, &wrong_cleanup) == MISTER_RESULT_INVALID_STATE);
+	active.reset();
+	active_lease.reset();
+
+	FakeClock cleanup_clock(3000);
+	HardwareBroker cleanup_broker(cleanup_clock);
+	std::unique_ptr<CleanupEpoch> cleanup_epoch;
+	PrepareCleanup(cleanup_broker, cleanup_clock, profile, &generation,
+		&cleanup_epoch);
+	std::unique_ptr<OperationLease> cleanup_lease;
+	assert(cleanup_broker.BeginCleanupOperation(*cleanup_epoch,
+		OperationKind::core_protocol, &cleanup_lease) == MISTER_RESULT_OK);
+	std::unique_ptr<CleanupCoreProtocolSession> cleanup;
+	assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*cleanup_lease,
+		cleanup_broker, &cleanup) == MISTER_RESULT_OK);
+	assert(cleanup_lease->absolute_deadline_ms() == cleanup_clock.NowMs() + 5000);
+	std::unique_ptr<RecoveryCoreProtocolSession> wrong_recovery;
+	assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*cleanup_lease,
+		cleanup_broker, &wrong_recovery) == MISTER_RESULT_INVALID_STATE);
+
+	FakeClock recovery_clock(7000);
+	HardwareBroker recovery_broker(recovery_clock);
+	std::unique_ptr<RecoveryEpoch> recovery_epoch;
+	assert(recovery_broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL,
+		9000, 12000, &recovery_epoch) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> recovery_lease;
+	assert(recovery_broker.BeginRecoveryOperation(*recovery_epoch,
+		OperationKind::core_protocol, &recovery_lease) == MISTER_RESULT_OK);
+	std::unique_ptr<RecoveryCoreProtocolSession> recovery;
+	assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*recovery_lease,
+		recovery_broker, &recovery) == MISTER_RESULT_OK);
+	assert(recovery_lease->absolute_deadline_ms() == 12000);
+	std::unique_ptr<ActiveCoreProtocolSession> wrong_active;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*recovery_lease,
+		recovery_broker, profile, &wrong_active) == MISTER_RESULT_INVALID_STATE);
 }
 
 void TestEnterRequiresExactTrustedFixtureAuthority()
@@ -381,6 +459,402 @@ void TestBoundedQuiesceNeverReopensAdmission()
 	assert(second_retry->absolute_deadline_ms() == 6000);
 }
 
+void TestFailureLatchClosesPreissuedHardwareLeaseAdmission()
+{
+	FakeClock clock(4500);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+
+	std::unique_ptr<OperationLease> preissued;
+	assert(broker.Begin(generation, OperationKind::input, 5500, &preissued) ==
+		MISTER_RESULT_OK);
+	assert(broker.LatchFailure(generation) == MISTER_RESULT_OK);
+
+	std::unique_ptr<HardwareLeaseView> denied;
+	assert(broker.AcquireHardwareLeaseView(*preissued, &denied) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(denied == nullptr);
+}
+
+void TestFailedProtocolCompletionLatchesAndRequiresBoundedDrain()
+{
+	FakeClock clock(5000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+
+	std::unique_ptr<OperationLease> preissued_input;
+	assert(broker.Begin(generation, OperationKind::input, 9000,
+		&preissued_input) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> failing_lease;
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&failing_lease) == MISTER_RESULT_OK);
+	std::unique_ptr<ActiveCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*failing_lease, broker,
+		profile, &session) == MISTER_RESULT_OK);
+	const CoreProtocolResidue unmutated_residue = {
+		false, false, false, false, false, false, false, 0};
+	const ProtocolMappingReleaseReceipt unmutated_release = {
+		MISTER_RESULT_OK, true, true, true, true, true, 0};
+	const ActiveProtocolFailureReceipt unmutated_receipt = {
+		MISTER_RESULT_PLATFORM, unmutated_residue, unmutated_release, 0};
+	assert(CoreProtocolAuthorityTestPeer::CompleteFailed(*failing_lease, broker,
+		std::move(session), unmutated_receipt) == MISTER_RESULT_INVALID_STATE);
+	assert(session != nullptr);
+	const uint64_t sequence =
+		CoreProtocolAuthorityTestPeer::RecordMutation(*failing_lease, broker,
+			*session);
+	assert(sequence != 0);
+
+	const CoreProtocolResidue residue = {
+		false, false, false, false, false, true, true, sequence};
+	const ProtocolMappingReleaseReceipt mapping_release = {
+		MISTER_RESULT_OK, true, true, true, true, true, sequence};
+	ActiveProtocolFailureReceipt receipt = {
+		MISTER_RESULT_PLATFORM, residue, mapping_release, sequence + 1};
+	assert(CoreProtocolAuthorityTestPeer::CompleteFailed(*failing_lease, broker,
+		std::move(session), receipt) == MISTER_RESULT_INVALID_STATE);
+	assert(session != nullptr);
+
+	receipt.final_mutation_sequence = sequence;
+	assert(CoreProtocolAuthorityTestPeer::CompleteFailed(*failing_lease, broker,
+		std::move(session), receipt) == MISTER_RESULT_OK);
+	assert(session == nullptr);
+	ActiveProtocolFailureReceipt stored = {};
+	assert(broker.core_protocol_failure_receipt_for_test(&stored));
+	assert(stored.primary_result == MISTER_RESULT_PLATFORM);
+	assert(stored.final_mutation_sequence == sequence);
+	assert(stored.residue.download_may_be_active);
+	assert(stored.residue.status_reset_asserted);
+	assert(!stored.residue.mapping_retained);
+	std::unique_ptr<HardwareLeaseView> denied;
+	assert(broker.AcquireHardwareLeaseView(*preissued_input, &denied) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(denied == nullptr);
+
+	std::unique_ptr<CleanupEpoch> premature;
+	assert(broker.BeginCleanup(generation, 8000, 11000, &premature) ==
+		MISTER_RESULT_INVALID_STATE);
+	failing_lease.reset();
+	clock.ForceTimeout(true);
+	assert(broker.Quiesce(generation, 7000) == MISTER_RESULT_DEADLINE);
+	assert(broker.BeginCleanup(generation, 8000, 11000, &premature) ==
+		MISTER_RESULT_INVALID_STATE);
+	preissued_input.reset();
+	clock.SetNow(7000);
+	clock.ForceTimeout(false);
+	assert(broker.Quiesce(generation, 7000) == MISTER_RESULT_OK);
+	assert(broker.BeginCleanup(generation, 9000, 12000, &premature) ==
+		MISTER_RESULT_OK);
+	assert(broker.core_protocol_failure_receipt_for_test(&stored));
+	assert(stored.final_mutation_sequence == sequence);
+}
+
+void TestSuccessfulProtocolCompletionIsExplicitAndBrokerDominated()
+{
+	FakeClock clock(5000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> protocol_lease;
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&protocol_lease) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> preissued;
+	assert(broker.Begin(generation, OperationKind::input, 9000, &preissued) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<ActiveCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*protocol_lease, broker,
+		profile, &session) == MISTER_RESULT_OK);
+	assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	const uint64_t sequence = CoreProtocolAuthorityTestPeer::RecordMutation(
+		*protocol_lease, broker, *session);
+	assert(sequence != 0);
+	std::unique_ptr<HardwareLeaseView> denied_while_current;
+	assert(broker.AcquireHardwareLeaseView(*preissued, &denied_while_current) ==
+		MISTER_RESULT_INVALID_STATE);
+
+	ProtocolMappingReleaseReceipt receipt = {
+		MISTER_RESULT_OK, true, true, true, true, true, sequence + 1};
+	assert(CoreProtocolAuthorityTestPeer::CompleteSuccess(*protocol_lease, broker,
+		std::move(session), receipt) == MISTER_RESULT_INVALID_STATE);
+	assert(session != nullptr);
+	assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	receipt.mutation_sequence = sequence;
+	assert(CoreProtocolAuthorityTestPeer::CompleteSuccess(*protocol_lease, broker,
+		std::move(session), receipt) == MISTER_RESULT_OK);
+	assert(session == nullptr);
+	assert(!CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	std::unique_ptr<ActiveCoreProtocolSession> duplicate;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*protocol_lease, broker,
+		profile, &duplicate) == MISTER_RESULT_INVALID_STATE);
+
+	std::unique_ptr<HardwareLeaseView> view;
+	assert(broker.AcquireHardwareLeaseView(*preissued, &view) ==
+		MISTER_RESULT_OK);
+}
+
+void TestInvalidProtocolOutcomeClosesAdmissionWhileLeaseIsLive()
+{
+	FakeClock clock(5000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> preissued;
+	assert(broker.Begin(generation, OperationKind::input, 9000, &preissued) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> protocol_lease;
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&protocol_lease) == MISTER_RESULT_OK);
+	std::unique_ptr<ActiveCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*protocol_lease, broker,
+		profile, &session) == MISTER_RESULT_OK);
+	assert(CoreProtocolAuthorityTestPeer::RecordMutation(*protocol_lease, broker,
+		*session) != 0);
+
+	assert(CoreProtocolAuthorityTestPeer::CompleteInvalidOutcome(*protocol_lease,
+		broker, MISTER_RESULT_PLATFORM) == MISTER_RESULT_OK);
+	assert(!CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	std::unique_ptr<HardwareLeaseView> denied;
+	assert(broker.AcquireHardwareLeaseView(*preissued, &denied) ==
+		MISTER_RESULT_INVALID_STATE);
+	session.reset();
+	protocol_lease.reset();
+	clock.ForceTimeout(true);
+	assert(broker.Quiesce(generation, 7000) == MISTER_RESULT_DEADLINE);
+	preissued.reset();
+	clock.SetNow(7000);
+	clock.ForceTimeout(false);
+	assert(broker.Quiesce(generation, 7000) == MISTER_RESULT_OK);
+	std::unique_ptr<CleanupEpoch> cleanup;
+	assert(broker.BeginCleanup(generation, 9000, 12000, &cleanup) ==
+		MISTER_RESULT_OK);
+}
+
+void TestForeignActiveRegistrationCannotInvalidateCurrentSession()
+{
+	FakeClock clock(5000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> owner;
+	std::unique_ptr<OperationLease> foreign;
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&owner) == MISTER_RESULT_OK);
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&foreign) == MISTER_RESULT_OK);
+	std::unique_ptr<ActiveCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*owner, broker, profile,
+		&session) == MISTER_RESULT_OK);
+	assert(broker.mutation_sequence_for_test() == 0);
+	ActiveProtocolFailureReceipt residue = {};
+	assert(!broker.core_protocol_failure_receipt_for_test(&residue));
+
+	assert(CoreProtocolAuthorityTestPeer::CompleteInvalidOutcome(*foreign,
+		broker, MISTER_RESULT_PLATFORM) == MISTER_RESULT_INVALID_STATE);
+	assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	assert(broker.mutation_sequence_for_test() == 0);
+	assert(!broker.core_protocol_failure_receipt_for_test(&residue));
+
+	const uint64_t sequence = CoreProtocolAuthorityTestPeer::RecordMutation(
+		*owner, broker, *session);
+	assert(sequence == 1);
+	const ProtocolMappingReleaseReceipt receipt = {
+		MISTER_RESULT_OK, true, true, true, true, true, sequence};
+	assert(CoreProtocolAuthorityTestPeer::CompleteSuccess(*foreign, broker,
+		std::move(session), receipt) == MISTER_RESULT_INVALID_STATE);
+	assert(session != nullptr);
+	const CoreProtocolResidue failure_residue = {
+		false, false, false, false, false, true, true, sequence};
+	const ActiveProtocolFailureReceipt failure = {
+		MISTER_RESULT_PLATFORM, failure_residue, receipt, sequence};
+	assert(CoreProtocolAuthorityTestPeer::CompleteFailed(*foreign, broker,
+		std::move(session), failure) == MISTER_RESULT_INVALID_STATE);
+	assert(session != nullptr);
+	assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	assert(!broker.core_protocol_failure_receipt_for_test(&residue));
+	assert(CoreProtocolAuthorityTestPeer::CompleteSuccess(*owner, broker,
+		std::move(session), receipt) == MISTER_RESULT_OK);
+	assert(!CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	std::unique_ptr<ActiveCoreProtocolSession> foreign_session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*foreign, broker, profile,
+		&foreign_session) == MISTER_RESULT_OK);
+	const uint64_t foreign_sequence =
+		CoreProtocolAuthorityTestPeer::RecordMutation(*foreign, broker,
+			*foreign_session);
+	const ProtocolMappingReleaseReceipt foreign_receipt = {
+		MISTER_RESULT_OK, true, true, true, true, true, foreign_sequence};
+	assert(CoreProtocolAuthorityTestPeer::CompleteSuccess(*foreign, broker,
+		std::move(foreign_session), foreign_receipt) == MISTER_RESULT_OK);
+}
+
+void TestProtocolHandleAbandonmentRetainsBrokerFence()
+{
+	FakeClock clock(5000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> protocol_lease;
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&protocol_lease) == MISTER_RESULT_OK);
+	std::unique_ptr<ActiveCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*protocol_lease, broker,
+		profile, &session) == MISTER_RESULT_OK);
+	assert(!broker.core_protocol_session_abandoned_for_test(*protocol_lease));
+	session.reset();
+	assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	assert(broker.core_protocol_session_abandoned_for_test(*protocol_lease));
+	std::unique_ptr<OperationLease> foreign;
+	assert(broker.Begin(generation, OperationKind::core_protocol, 9000,
+		&foreign) == MISTER_RESULT_OK);
+	assert(CoreProtocolAuthorityTestPeer::CompleteInvalidOutcome(*foreign,
+		broker, MISTER_RESULT_PLATFORM) == MISTER_RESULT_INVALID_STATE);
+	assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+
+	std::unique_ptr<OperationLease> preissued;
+	assert(broker.Begin(generation, OperationKind::input, 9000, &preissued) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<HardwareLeaseView> denied;
+	assert(broker.AcquireHardwareLeaseView(*preissued, &denied) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(CoreProtocolAuthorityTestPeer::CompleteInvalidOutcome(*protocol_lease,
+		broker, MISTER_RESULT_PLATFORM) == MISTER_RESULT_OK);
+	assert(!CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+	protocol_lease.reset();
+	foreign.reset();
+	preissued.reset();
+	assert(broker.Quiesce(generation, 7000) == MISTER_RESULT_OK);
+	std::unique_ptr<CleanupEpoch> denied_cleanup;
+	assert(broker.BeginCleanup(generation, 7000, 10000, &denied_cleanup) ==
+		MISTER_RESULT_OK);
+}
+
+void TestCleanupAndRecoveryProtocolAbandonmentRetainBrokerFence()
+{
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	{
+		FakeClock clock(3000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		std::unique_ptr<CleanupEpoch> epoch;
+		PrepareCleanup(broker, clock, profile, &generation, &epoch);
+		std::unique_ptr<OperationLease> lease;
+		assert(broker.BeginCleanupOperation(*epoch, OperationKind::core_protocol,
+			&lease) == MISTER_RESULT_OK);
+		std::unique_ptr<CleanupCoreProtocolSession> session;
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*lease, broker,
+			&session) == MISTER_RESULT_OK);
+		assert(!broker.core_protocol_session_abandoned_for_test(*lease));
+		session.reset();
+		assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+		assert(broker.core_protocol_session_abandoned_for_test(*lease));
+		std::unique_ptr<OperationLease> denied;
+		assert(broker.BeginCleanupOperation(*epoch, OperationKind::input,
+			&denied) == MISTER_RESULT_OK);
+		std::unique_ptr<HardwareLeaseView> view;
+		assert(broker.AcquireHardwareLeaseView(*denied, &view) ==
+			MISTER_RESULT_INVALID_STATE);
+	}
+	{
+		FakeClock clock(7000);
+		HardwareBroker broker(clock);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL |
+			MISTER_RESOURCE_NATIVE_AUDIO, 9000, 12000, &epoch) ==
+			MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> lease;
+		assert(broker.BeginRecoveryOperation(*epoch, OperationKind::core_protocol,
+			&lease) == MISTER_RESULT_OK);
+		std::unique_ptr<RecoveryCoreProtocolSession> session;
+		assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*lease, broker,
+			&session) == MISTER_RESULT_OK);
+		assert(!broker.core_protocol_session_abandoned_for_test(*lease));
+		session.reset();
+		assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+		assert(broker.core_protocol_session_abandoned_for_test(*lease));
+		lease.reset();
+		std::unique_ptr<OperationLease> denied;
+		assert(broker.BeginRecoveryOperation(*epoch, OperationKind::audio,
+			&denied) == MISTER_RESULT_INVALID_STATE);
+	}
+}
+
+void TestCleanupAndRecoveryProtocolCompletionAreExplicit()
+{
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	{
+		FakeClock clock(3000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		std::unique_ptr<CleanupEpoch> epoch;
+		PrepareCleanup(broker, clock, profile, &generation, &epoch);
+		std::unique_ptr<OperationLease> lease;
+		assert(broker.BeginCleanupOperation(*epoch, OperationKind::core_protocol,
+			&lease) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> foreign;
+		assert(broker.BeginCleanupOperation(*epoch, OperationKind::core_protocol,
+			&foreign) == MISTER_RESULT_OK);
+		std::unique_ptr<CleanupCoreProtocolSession> session;
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*lease, broker,
+			&session) == MISTER_RESULT_OK);
+		const ProtocolMappingReleaseReceipt receipt = {
+			MISTER_RESULT_OK, true, true, true, true, true,
+			broker.mutation_sequence_for_test()};
+		assert(CoreProtocolAuthorityTestPeer::CompleteCleanup(*foreign, broker,
+			std::move(session), receipt) == MISTER_RESULT_INVALID_STATE);
+		assert(session != nullptr);
+		assert(CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+		assert(CoreProtocolAuthorityTestPeer::CompleteCleanup(*lease, broker,
+			std::move(session), receipt) == MISTER_RESULT_OK);
+		assert(!CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+		std::unique_ptr<CleanupCoreProtocolSession> duplicate;
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*lease, broker,
+			&duplicate) == MISTER_RESULT_INVALID_STATE);
+		assert(CoreProtocolAuthorityTestPeer::AcquireCleanup(*foreign, broker,
+			&duplicate) == MISTER_RESULT_OK);
+		assert(CoreProtocolAuthorityTestPeer::CompleteCleanup(*foreign, broker,
+			std::move(duplicate), receipt) == MISTER_RESULT_OK);
+	}
+	{
+		FakeClock clock(7000);
+		HardwareBroker broker(clock);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_PROTOCOL,
+			9000, 12000, &epoch) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> lease;
+		assert(broker.BeginRecoveryOperation(*epoch, OperationKind::core_protocol,
+			&lease) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> foreign;
+		assert(broker.BeginRecoveryOperation(*epoch, OperationKind::core_protocol,
+			&foreign) == MISTER_RESULT_INVALID_STATE);
+		std::unique_ptr<RecoveryCoreProtocolSession> session;
+		assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*lease, broker,
+			&session) == MISTER_RESULT_OK);
+		const ProtocolMappingReleaseReceipt receipt = {
+			MISTER_RESULT_OK, true, true, true, true, true,
+			broker.mutation_sequence_for_test()};
+		assert(CoreProtocolAuthorityTestPeer::CompleteRecovery(*lease, broker,
+			std::move(session), receipt) == MISTER_RESULT_OK);
+		assert(!CoreProtocolAuthorityTestPeer::SessionCurrent(broker));
+		std::unique_ptr<RecoveryCoreProtocolSession> duplicate;
+		assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*lease, broker,
+			&duplicate) == MISTER_RESULT_INVALID_STATE);
+		lease.reset();
+		assert(broker.BeginRecoveryOperation(*epoch, OperationKind::core_protocol,
+			&foreign) == MISTER_RESULT_OK);
+		assert(CoreProtocolAuthorityTestPeer::AcquireRecovery(*foreign, broker,
+			&duplicate) == MISTER_RESULT_OK);
+		assert(CoreProtocolAuthorityTestPeer::CompleteRecovery(*foreign, broker,
+			std::move(duplicate), receipt) == MISTER_RESULT_OK);
+	}
+}
+
 void TestCleanupCannotOvertakeQuiesceReturn()
 {
 	FakeClock clock(6000);
@@ -424,6 +898,18 @@ void TestOwningTokenMayOutliveBrokerSafely()
 	assert(broker->Begin(generation, OperationKind::input, 10000, &lease) ==
 		MISTER_RESULT_OK);
 	broker.reset();
+	lease.reset();
+
+	broker.reset(new HardwareBroker(clock));
+	assert(broker->EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+	assert(broker->Begin(generation, OperationKind::core_protocol, 10000,
+		&lease) == MISTER_RESULT_OK);
+	std::unique_ptr<ActiveCoreProtocolSession> session;
+	assert(CoreProtocolAuthorityTestPeer::AcquireActive(*lease, *broker, profile,
+		&session) == MISTER_RESULT_OK);
+	broker.reset();
+	assert(session != nullptr);
+	session.reset();
 	lease.reset();
 
 	broker.reset(new HardwareBroker(clock));
@@ -489,9 +975,18 @@ void TestForeignNullDuplicateAndDestructionRejection()
 int main()
 {
 	mister::native::TestOwningTypesAreNotForgeable();
+	mister::native::TestProtocolSessionsRequireExactAuthority();
 	mister::native::TestEnterRequiresExactTrustedFixtureAuthority();
 	mister::native::TestLeaseDurationQuiesceAndFreshGeneration();
 	mister::native::TestBoundedQuiesceNeverReopensAdmission();
+	mister::native::TestFailureLatchClosesPreissuedHardwareLeaseAdmission();
+	mister::native::TestFailedProtocolCompletionLatchesAndRequiresBoundedDrain();
+	mister::native::TestSuccessfulProtocolCompletionIsExplicitAndBrokerDominated();
+	mister::native::TestInvalidProtocolOutcomeClosesAdmissionWhileLeaseIsLive();
+	mister::native::TestForeignActiveRegistrationCannotInvalidateCurrentSession();
+	mister::native::TestProtocolHandleAbandonmentRetainsBrokerFence();
+	mister::native::TestCleanupAndRecoveryProtocolAbandonmentRetainBrokerFence();
+	mister::native::TestCleanupAndRecoveryProtocolCompletionAreExplicit();
 	mister::native::TestCleanupCannotOvertakeQuiesceReturn();
 	mister::native::TestOwningTokenMayOutliveBrokerSafely();
 	mister::native::TestForeignNullDuplicateAndDestructionRejection();

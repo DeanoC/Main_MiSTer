@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "runtime/native/native_core_protocol.hpp"
+#include "runtime/native/native_core_protocol_session_state.hpp"
 
 #include <string.h>
 
@@ -16,6 +17,7 @@ ActiveCoreProtocolSession::ActiveCoreProtocolSession() : state_()
 
 ActiveCoreProtocolSession::~ActiveCoreProtocolSession()
 {
+	MarkProtocolSessionAbandoned(state_);
 }
 
 ActiveSelectedTransaction::ActiveSelectedTransaction()
@@ -33,6 +35,7 @@ CleanupCoreProtocolSession::CleanupCoreProtocolSession() : state_()
 
 CleanupCoreProtocolSession::~CleanupCoreProtocolSession()
 {
+	MarkProtocolSessionAbandoned(state_);
 }
 
 RecoveryCoreProtocolSession::RecoveryCoreProtocolSession() : state_()
@@ -41,6 +44,7 @@ RecoveryCoreProtocolSession::RecoveryCoreProtocolSession() : state_()
 
 RecoveryCoreProtocolSession::~RecoveryCoreProtocolSession()
 {
+	MarkProtocolSessionAbandoned(state_);
 }
 
 namespace {
