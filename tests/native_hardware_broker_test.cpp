@@ -18,6 +18,21 @@
 namespace mister {
 namespace native {
 
+class BridgeActivationAuthorityTestPeer final {
+public:
+	static Result Mint(HardwareBroker &broker, const OperationLease &lease,
+		uint64_t current_sequence, uint64_t receipt_sequence,
+		std::unique_ptr<NativeBridgeActivationAuthority> *authority)
+	{
+		std::unique_ptr<HardwareLeaseView> view;
+		Result result = lease.AcquireHardwareLeaseView(&view);
+		if (result != MISTER_RESULT_OK) return result;
+		broker.SetBridgeMutationSequenceForTest(current_sequence);
+		return broker.MintBridgeActivationAuthority(*view, receipt_sequence,
+			authority);
+	}
+};
+
 namespace {
 
 class FakeClock final : public NativeClock {
@@ -175,6 +190,15 @@ void PrepareCleanup(HardwareBroker &broker, FakeClock &clock,
 
 void TestOwningTypesAreNotForgeable()
 {
+	static_assert(!std::is_default_constructible<
+		NativeBridgeActivationAuthority>::value,
+		"bridge activation authority must be broker-created");
+	static_assert(!std::is_copy_constructible<
+		NativeBridgeActivationAuthority>::value,
+		"bridge activation authority must not be copied");
+	static_assert(!std::is_move_constructible<
+		NativeBridgeActivationAuthority>::value,
+		"bridge activation authority must not be moved");
 	static_assert(!std::is_default_constructible<OperationInvocation>::value,
 		"callback invocations must be broker-created");
 	static_assert(!std::is_copy_constructible<OperationInvocation>::value,
@@ -216,6 +240,66 @@ void TestOwningTypesAreNotForgeable()
 	static_assert(!std::is_convertible<RecoveryCoreProtocolSession *,
 		ActiveCoreProtocolSession *>::value,
 		"recovery protocol authority cannot become active authority");
+}
+
+void TestBridgeAuthorityMintRequiresExactLiveProgramReceipt()
+{
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> program;
+		assert(broker.Begin(generation, OperationKind::program_fpga, 5000,
+			&program) == MISTER_RESULT_OK);
+		std::unique_ptr<NativeBridgeActivationAuthority> authority;
+		assert(BridgeActivationAuthorityTestPeer::Mint(broker, *program, 7, 7,
+			&authority) == MISTER_RESULT_OK);
+		assert(authority != nullptr);
+	}
+	const uint64_t bad_sequences[][2] = {
+		{7, 0}, {7, 6}, {7, 8}, {UINT64_MAX, UINT64_MAX}};
+	for (const auto &sequences : bad_sequences) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> program;
+		assert(broker.Begin(generation, OperationKind::program_fpga, 5000,
+			&program) == MISTER_RESULT_OK);
+		std::unique_ptr<NativeBridgeActivationAuthority> authority;
+		assert(BridgeActivationAuthorityTestPeer::Mint(broker, *program,
+			sequences[0], sequences[1], &authority) != MISTER_RESULT_OK);
+		assert(authority == nullptr);
+	}
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> input;
+		assert(broker.Begin(generation, OperationKind::input, 5000, &input) ==
+			MISTER_RESULT_OK);
+		std::unique_ptr<NativeBridgeActivationAuthority> authority;
+		assert(BridgeActivationAuthorityTestPeer::Mint(broker, *input, 7, 7,
+			&authority) == MISTER_RESULT_INVALID_STATE);
+		assert(authority == nullptr);
+	}
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(profile, &generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> program;
+		assert(broker.Begin(generation, OperationKind::program_fpga, 1100,
+			&program) == MISTER_RESULT_OK);
+		clock.SetNow(1100);
+		std::unique_ptr<NativeBridgeActivationAuthority> authority;
+		assert(BridgeActivationAuthorityTestPeer::Mint(broker, *program, 7, 7,
+			&authority) == MISTER_RESULT_DEADLINE);
+		assert(authority == nullptr);
+	}
 }
 
 void TestCleanupInvocationBoundsSequentialOperations()
@@ -1191,6 +1275,7 @@ void TestForeignNullDuplicateAndDestructionRejection()
 int main()
 {
 	mister::native::TestOwningTypesAreNotForgeable();
+	mister::native::TestBridgeAuthorityMintRequiresExactLiveProgramReceipt();
 	mister::native::TestCleanupInvocationBoundsSequentialOperations();
 	mister::native::TestInvocationRejectsAnUnrecordedOrdinaryOutcome();
 	mister::native::TestRetainedRegistrationSuspendsRebindsAndFailsClosed();

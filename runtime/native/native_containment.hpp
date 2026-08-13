@@ -76,6 +76,11 @@ private:
 			0, 0};
 		return receipt;
 	}
+	virtual Result InstallBridgeActivationAuthority(const Access &,
+		std::unique_ptr<NativeBridgeActivationAuthority>)
+	{
+		return MISTER_RESULT_UNSUPPORTED;
+	}
 	virtual NativeManagerNeutralReceipt ReconcileManager(const Access &)
 	{
 		const NativeManagerNeutralReceipt receipt = {

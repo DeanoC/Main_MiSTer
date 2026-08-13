@@ -47,6 +47,11 @@ public:
 	NativeLinuxMmioAdapter();
 #if defined(MISTER_NATIVE_MMIO_TESTING)
 	explicit NativeLinuxMmioAdapter(NativeMmioTestOperations &operations);
+	Result ValidateBridgeActivationAuthorityForTest(
+		const HardwareLeaseView &view) const;
+	Result InstallBridgeActivationAuthorityForTest(
+		std::unique_ptr<NativeBridgeActivationAuthority> authority);
+	bool HasBridgeActivationAuthorityForTest() const;
 #endif
 	~NativeLinuxMmioAdapter() override;
 	Result CloseMappingsForProcessExit();
@@ -58,6 +63,10 @@ private:
 	NativeMappingAcquisitionReceipt AcquireMappings(
 		const Access &access) override;
 	NativeBridgeEnableReceipt EnableBridges(const Access &access) override;
+	Result InstallBridgeActivationAuthority(const Access &access,
+		std::unique_ptr<NativeBridgeActivationAuthority> authority) override;
+	Result ValidateBridgeActivationAuthority(
+		const HardwareLeaseView &view) const;
 	NativeManagerNeutralReceipt ReconcileManager(const Access &access) override;
 	Result ReadManagerControl(const Access &access, uint32_t *value) override;
 	Result ReadManagerMode(const Access &access, uint32_t *value) override;

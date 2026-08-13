@@ -233,7 +233,8 @@ public:
 		: operations_(&posix_), descriptor_(-1), geometry_initialized_(false),
 		  release_started_(false), released_(false), descriptor_unknown_(false),
 		  programming_started_(false), program_complete_(false),
-		  bridges_attempted_(false), expected_bytes_(0), programmed_bytes_(0),
+		  bridges_attempted_(false), core_normal_observed_(false),
+		  bridge_authority_(), expected_bytes_(0), programmed_bytes_(0),
 		  manager_residue_(false), manager_neutral_step_(0), manager_control_(0),
 		  manager_mode_(0), mutation_applied_latch_(false)
 	{
@@ -244,7 +245,8 @@ public:
 		: test_(operations), operations_(&test_), descriptor_(-1),
 		  geometry_initialized_(false), release_started_(false), released_(false),
 		  descriptor_unknown_(false), programming_started_(false),
-		  program_complete_(false), bridges_attempted_(false), expected_bytes_(0),
+		  program_complete_(false), bridges_attempted_(false),
+		  core_normal_observed_(false), bridge_authority_(), expected_bytes_(0),
 		  programmed_bytes_(0), manager_residue_(false), manager_neutral_step_(0),
 		  manager_control_(0), manager_mode_(0), mutation_applied_latch_(false)
 	{
@@ -578,7 +580,41 @@ public:
 		}
 		receipt.result = result;
 		receipt.mutation_applied = ConsumeAppliedMutation();
+		core_normal_observed_ = result == MISTER_RESULT_OK &&
+			receipt.core_normal_observed;
 		return receipt;
+	}
+
+	Result InstallBridgeActivationAuthority(
+		std::unique_ptr<NativeBridgeActivationAuthority> authority)
+	{
+		if (!authority) return MISTER_RESULT_INVALID_ARGUMENT;
+		if (bridge_authority_ || !program_complete_ || !bridges_attempted_ ||
+			!core_normal_observed_ || release_started_ || released_ ||
+			descriptor_ >= 0 || descriptor_unknown_)
+			return MISTER_RESULT_INVALID_STATE;
+		for (const Slot &slot : slots_)
+			if (!slot.held) return MISTER_RESULT_INVALID_STATE;
+		bridge_authority_ = std::move(authority);
+		return MISTER_RESULT_OK;
+	}
+	bool BridgeActivationAuthorityLocallyCurrent() const
+	{
+		if (!bridge_authority_ || !program_complete_ ||
+			!core_normal_observed_ || release_started_ || released_ ||
+			descriptor_ >= 0 || descriptor_unknown_)
+			return false;
+		for (const Slot &slot : slots_)
+			if (!slot.held) return false;
+		return true;
+	}
+	const NativeBridgeActivationAuthority &BridgeActivationAuthority() const
+	{
+		return *bridge_authority_;
+	}
+	bool HasBridgeActivationAuthority() const
+	{
+		return bridge_authority_.get() != nullptr;
 	}
 
 	NativeManagerNeutralReceipt ReconcileManager(const Access &access)
@@ -794,7 +830,10 @@ public:
 			return first_failure == MISTER_RESULT_OK ?
 				MISTER_RESULT_CLEANUP_INCOMPLETE : first_failure;
 		}
-		if (first_failure == MISTER_RESULT_OK) released_ = true;
+		if (first_failure == MISTER_RESULT_OK) {
+			released_ = true;
+			bridge_authority_.reset();
+		}
 		return first_failure;
 	}
 	Result CloseMappingsForProcessExit()
@@ -1008,6 +1047,8 @@ private:
 	bool programming_started_;
 	bool program_complete_;
 	bool bridges_attempted_;
+	bool core_normal_observed_;
+	std::unique_ptr<NativeBridgeActivationAuthority> bridge_authority_;
 	uint64_t expected_bytes_;
 	uint64_t programmed_bytes_;
 	bool manager_residue_;
@@ -1065,6 +1106,37 @@ NativeBridgeEnableReceipt NativeLinuxMmioAdapter::EnableBridges(
 	}
 	return impl_->EnableBridges(access);
 }
+Result NativeLinuxMmioAdapter::InstallBridgeActivationAuthority(
+	const Access &, std::unique_ptr<NativeBridgeActivationAuthority> authority)
+{
+	if (impl_ == nullptr) return MISTER_RESULT_PLATFORM;
+	return impl_->InstallBridgeActivationAuthority(std::move(authority));
+}
+Result NativeLinuxMmioAdapter::ValidateBridgeActivationAuthority(
+	const HardwareLeaseView &view) const
+{
+	if (impl_ == nullptr || !impl_->BridgeActivationAuthorityLocallyCurrent())
+		return MISTER_RESULT_INVALID_STATE;
+	return view.ValidateBridgeActivationAuthority(
+		impl_->BridgeActivationAuthority());
+}
+#if defined(MISTER_NATIVE_MMIO_TESTING)
+Result NativeLinuxMmioAdapter::ValidateBridgeActivationAuthorityForTest(
+	const HardwareLeaseView &view) const
+{
+	return ValidateBridgeActivationAuthority(view);
+}
+Result NativeLinuxMmioAdapter::InstallBridgeActivationAuthorityForTest(
+	std::unique_ptr<NativeBridgeActivationAuthority> authority)
+{
+	if (impl_ == nullptr) return MISTER_RESULT_PLATFORM;
+	return impl_->InstallBridgeActivationAuthority(std::move(authority));
+}
+bool NativeLinuxMmioAdapter::HasBridgeActivationAuthorityForTest() const
+{
+	return impl_ != nullptr && impl_->HasBridgeActivationAuthority();
+}
+#endif
 NativeManagerNeutralReceipt NativeLinuxMmioAdapter::ReconcileManager(
 	const Access &access)
 {

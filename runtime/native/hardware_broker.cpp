@@ -204,6 +204,33 @@ Result HardwareLeaseView::AuthorizeFpgaProgrammingProfile(
 		profile);
 }
 
+Result HardwareLeaseView::MintBridgeActivationAuthority(
+	uint64_t bridge_mutation_sequence,
+	std::unique_ptr<NativeBridgeActivationAuthority> *authority) const
+{
+	if (authority == nullptr || authority->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->MintBridgeActivationAuthority(*this,
+		bridge_mutation_sequence, authority);
+}
+
+Result HardwareLeaseView::ValidateBridgeActivationAuthority(
+	const NativeBridgeActivationAuthority &authority) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->ValidateBridgeActivationAuthority(*this,
+		authority);
+}
+
 uint64_t HardwareLeaseView::absolute_deadline_ms() const
 {
 	return registration_->effective_deadline_ms;
@@ -3250,6 +3277,71 @@ Result HardwareBroker::AuthorizeFpgaProgrammingProfile(
 	return clock_.NowMs() >= registration->effective_deadline_ms ?
 		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
 }
+
+Result HardwareBroker::MintBridgeActivationAuthority(
+	const HardwareLeaseView &view, uint64_t bridge_mutation_sequence,
+	std::unique_ptr<NativeBridgeActivationAuthority> *authority)
+{
+	if (authority == nullptr || authority->get() != nullptr ||
+		bridge_mutation_sequence == 0)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		failure_latched_ || !registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::program_fpga ||
+		registration->authority != LeaseAuthority::active_generation ||
+		generation_ == 0 || registration->authority_identity != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		state_ != State::active || mutation_sequence_ == UINT64_MAX ||
+		bridge_mutation_sequence != mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	std::unique_ptr<NativeBridgeActivationAuthority> minted(
+		new (std::nothrow) NativeBridgeActivationAuthority(*this, lifetime_,
+			generation_, profile_, bridge_mutation_sequence));
+	if (!minted) return MISTER_RESULT_PLATFORM;
+	*authority = std::move(minted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::ValidateBridgeActivationAuthority(
+	const HardwareLeaseView &view,
+	const NativeBridgeActivationAuthority &authority)
+{
+	const std::shared_ptr<BrokerLifetime> authority_lifetime =
+		authority.lifetime_.lock();
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		failure_latched_ || !registration || !registration->registered ||
+		registration->broker != this || authority.broker_ != this ||
+		!authority_lifetime || authority_lifetime.get() != lifetime_.get() ||
+		registration->operation_kind != OperationKind::input ||
+		registration->authority != LeaseAuthority::active_generation ||
+		generation_ == 0 || registration->authority_identity != generation_ ||
+		authority.generation_ != generation_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		authority.profile_ != profile_ ||
+		state_ != State::active || authority.bridge_mutation_sequence_ == 0 ||
+		mutation_sequence_ == UINT64_MAX ||
+		authority.bridge_mutation_sequence_ > mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	return clock_.NowMs() >= registration->effective_deadline_ms ?
+		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
+}
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+void HardwareBroker::SetBridgeMutationSequenceForTest(uint64_t sequence)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	mutation_sequence_ = sequence;
+}
+#endif
 
 Result HardwareBroker::ValidateCleanupContainmentAuthority(
 	const CleanupEpoch &epoch, const OperationLease &terminal_lease)

@@ -2,7 +2,43 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "runtime/native/linux/native_mmio_adapter.hpp"
-#if defined(MISTER_NATIVE_MMIO_REACHABILITY_PROBE)
+#if defined(MISTER_NATIVE_BRIDGE_TOKEN_CONSTRUCT_REACHABILITY_PROBE)
+int main()
+{
+	mister::native::NativeBridgeActivationAuthority authority;
+	return sizeof(authority) == 0;
+}
+#elif defined(MISTER_NATIVE_BRIDGE_TOKEN_COPY_REACHABILITY_PROBE)
+#include <type_traits>
+static_assert(std::is_copy_constructible<
+	mister::native::NativeBridgeActivationAuthority>::value,
+	"probe succeeds only if bridge authority becomes copyable");
+int main() { return 0; }
+#elif defined(MISTER_NATIVE_BRIDGE_TOKEN_MOVE_REACHABILITY_PROBE)
+#include <type_traits>
+static_assert(std::is_move_constructible<
+	mister::native::NativeBridgeActivationAuthority>::value,
+	"probe succeeds only if bridge authority becomes movable");
+int main() { return 0; }
+#elif defined(MISTER_NATIVE_BRIDGE_TOKEN_MINT_REACHABILITY_PROBE)
+int main()
+{
+	return sizeof(&mister::native::HardwareLeaseView::
+		MintBridgeActivationAuthority) == 0;
+}
+#elif defined(MISTER_NATIVE_BRIDGE_TOKEN_INSTALL_REACHABILITY_PROBE)
+int main()
+{
+	return sizeof(&mister::native::linux_native::NativeLinuxMmioAdapter::
+		InstallBridgeActivationAuthority) == 0;
+}
+#elif defined(MISTER_NATIVE_BRIDGE_TOKEN_VALIDATE_REACHABILITY_PROBE)
+int main()
+{
+	return sizeof(&mister::native::linux_native::NativeLinuxMmioAdapter::
+		ValidateBridgeActivationAuthority) == 0;
+}
+#elif defined(MISTER_NATIVE_MMIO_REACHABILITY_PROBE)
 using LeakedRawMmioAuthority =
 	mister::native::linux_native::NativeMmioTestOperations;
 int main()
@@ -29,6 +65,46 @@ int main()
 
 namespace mister {
 namespace native {
+
+class BridgeActivationAuthorityTestPeer final {
+public:
+	static Result ValidateInput(linux_native::NativeLinuxMmioAdapter &adapter,
+		const OperationLease &lease, HardwareBroker &broker,
+		const NativeCoreProfile &profile)
+	{
+		std::unique_ptr<HardwareLeaseView> view;
+		const Result result = lease.AcquireInputHardwareLeaseView(
+			broker, profile, &view);
+		return result == MISTER_RESULT_OK ?
+			adapter.ValidateBridgeActivationAuthorityForTest(*view) : result;
+	}
+
+	static Result ValidateAny(linux_native::NativeLinuxMmioAdapter &adapter,
+		const OperationLease &lease)
+	{
+		std::unique_ptr<HardwareLeaseView> view;
+		const Result result = lease.AcquireHardwareLeaseView(&view);
+		return result == MISTER_RESULT_OK ?
+			adapter.ValidateBridgeActivationAuthorityForTest(*view) : result;
+	}
+
+	static void SetMutationSequence(HardwareBroker &broker, uint64_t sequence)
+	{
+		broker.SetBridgeMutationSequenceForTest(sequence);
+	}
+
+	static Result Mint(HardwareBroker &broker, const OperationLease &lease,
+		uint64_t sequence,
+		std::unique_ptr<NativeBridgeActivationAuthority> *authority)
+	{
+		std::unique_ptr<HardwareLeaseView> view;
+		Result result = lease.AcquireHardwareLeaseView(&view);
+		return result == MISTER_RESULT_OK ?
+			broker.MintBridgeActivationAuthority(*view, sequence, authority) :
+			result;
+	}
+};
+
 namespace linux_native {
 namespace {
 
@@ -371,7 +447,120 @@ void TestSixPageProgramBridgeAndTerminalCycle()
 		enabled.remap_observed && enabled.core_normal_write_attempted &&
 		enabled.core_normal_observed && enabled.mutation_sequence == 4);
 	assert((enabled.observed_core_gpo & 0xc0000000u) == 0x80000000u);
+	assert(adapter.HasBridgeActivationAuthorityForTest());
+	const size_t events_before_install_rejections = operations.events.size();
+	assert(adapter.InstallBridgeActivationAuthorityForTest(
+		std::unique_ptr<NativeBridgeActivationAuthority>()) ==
+		MISTER_RESULT_INVALID_ARGUMENT);
+	std::unique_ptr<NativeBridgeActivationAuthority> duplicate;
+	assert(BridgeActivationAuthorityTestPeer::Mint(broker, *program,
+		enabled.mutation_sequence, &duplicate) == MISTER_RESULT_OK);
+	assert(adapter.InstallBridgeActivationAuthorityForTest(std::move(duplicate)) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(duplicate == nullptr);
+	FakeLinuxOperations foreign_operations;
+	NativeLinuxMmioAdapter foreign_adapter(foreign_operations);
+	std::unique_ptr<NativeBridgeActivationAuthority> foreign;
+	assert(BridgeActivationAuthorityTestPeer::Mint(broker, *program,
+		enabled.mutation_sequence, &foreign) == MISTER_RESULT_OK);
+	assert(foreign_adapter.InstallBridgeActivationAuthorityForTest(
+		std::move(foreign)) == MISTER_RESULT_INVALID_STATE);
+	assert(foreign == nullptr);
+	assert(operations.events.size() == events_before_install_rejections);
+	assert(foreign_operations.events.empty());
 	program.reset();
+	std::unique_ptr<OperationLease> input;
+	assert(broker.Begin(generation, OperationKind::input, 5000, &input) ==
+		MISTER_RESULT_OK);
+	const size_t events_before_validation = operations.events.size();
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter, *input,
+		broker, *FixtureNativeCoreProfile("snes")) == MISTER_RESULT_OK);
+	assert(operations.events.size() == events_before_validation);
+	input.reset();
+
+	std::unique_ptr<OperationLease> wrong_kind;
+	assert(broker.Begin(generation, OperationKind::scheduler, 5000,
+		&wrong_kind) == MISTER_RESULT_OK);
+	assert(BridgeActivationAuthorityTestPeer::ValidateAny(adapter, *wrong_kind) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(operations.events.size() == events_before_validation);
+	wrong_kind.reset();
+
+	std::unique_ptr<OperationLease> wrong_profile;
+	assert(broker.Begin(generation, OperationKind::input, 5000,
+		&wrong_profile) == MISTER_RESULT_OK);
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter,
+		*wrong_profile, broker, *FixtureNativeCoreProfile("megadrive")) ==
+		MISTER_RESULT_UNSUPPORTED);
+	assert(operations.events.size() == events_before_validation);
+	wrong_profile.reset();
+
+	BridgeActivationAuthorityTestPeer::SetMutationSequence(broker, 5);
+	std::unique_ptr<OperationLease> later_input;
+	assert(broker.Begin(generation, OperationKind::input, 5000, &later_input) ==
+		MISTER_RESULT_OK);
+	operations.core = (operations.core & ~0xc0000000u) | 0x40000000u;
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter, *later_input,
+		broker, *FixtureNativeCoreProfile("snes")) == MISTER_RESULT_OK);
+	assert(operations.events.size() == events_before_validation);
+	operations.core = (operations.core & ~0xc0000000u) | 0x80000000u;
+	later_input.reset();
+
+	BridgeActivationAuthorityTestPeer::SetMutationSequence(broker, 3);
+	std::unique_ptr<OperationLease> rollback_input;
+	assert(broker.Begin(generation, OperationKind::input, 5000, &rollback_input) ==
+		MISTER_RESULT_OK);
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter,
+		*rollback_input, broker, *FixtureNativeCoreProfile("snes")) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(operations.events.size() == events_before_validation);
+	rollback_input.reset();
+
+	BridgeActivationAuthorityTestPeer::SetMutationSequence(broker, UINT64_MAX);
+	std::unique_ptr<OperationLease> saturated_input;
+	assert(broker.Begin(generation, OperationKind::input, 5000,
+		&saturated_input) == MISTER_RESULT_OK);
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter,
+		*saturated_input, broker, *FixtureNativeCoreProfile("snes")) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(operations.events.size() == events_before_validation);
+	saturated_input.reset();
+	BridgeActivationAuthorityTestPeer::SetMutationSequence(broker, 5);
+
+	std::unique_ptr<OperationLease> expired_input;
+	assert(broker.Begin(generation, OperationKind::input, 1100, &expired_input) ==
+		MISTER_RESULT_OK);
+	clock.SetNow(1100);
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter,
+		*expired_input, broker, *FixtureNativeCoreProfile("snes")) ==
+		MISTER_RESULT_DEADLINE);
+	assert(operations.events.size() == events_before_validation);
+	clock.SetNow(1000);
+	expired_input.reset();
+
+	FakeClock foreign_clock(1000);
+	HardwareBroker foreign_broker(foreign_clock);
+	PlatformGenerationId foreign_generation = 0;
+	assert(foreign_broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+		&foreign_generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> foreign_input;
+	assert(foreign_broker.Begin(foreign_generation, OperationKind::input, 5000,
+		&foreign_input) == MISTER_RESULT_OK);
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter,
+		*foreign_input, foreign_broker, *FixtureNativeCoreProfile("snes")) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(operations.events.size() == events_before_validation);
+	foreign_input.reset();
+
+	std::unique_ptr<OperationLease> failed_input;
+	assert(broker.Begin(generation, OperationKind::input, 5000, &failed_input) ==
+		MISTER_RESULT_OK);
+	assert(broker.LatchFailure(generation) == MISTER_RESULT_OK);
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter,
+		*failed_input, broker, *FixtureNativeCoreProfile("snes")) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(operations.events.size() == events_before_validation);
+	failed_input.reset();
 	assert(artifact.Close() == NativeArtifactResult::ok);
 	assert(unlink(file.c_str()) == 0 && rmdir(directory.c_str()) == 0 &&
 		rmdir(root.c_str()) == 0);
@@ -384,9 +573,37 @@ void TestSixPageProgramBridgeAndTerminalCycle()
 	assert(broker.BeginCleanupOperation(*epoch,
 		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
 	assert(containment.ResetAndContain(*epoch, *terminal) == MISTER_RESULT_OK);
+	assert(!adapter.HasBridgeActivationAuthorityForTest());
 	assert(!operations.AnyHeld() && !operations.descriptor_open);
 	terminal.reset();
 	assert(broker.Leave(generation, std::move(epoch)) == MISTER_RESULT_OK);
+}
+
+void TestMappingOnlyCannotValidateBridgeActivationAuthority()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeLinuxOperations operations;
+	NativeLinuxMmioAdapter adapter(operations);
+	NativeContainment containment(broker, adapter);
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+		&generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> program;
+	assert(broker.Begin(generation, OperationKind::program_fpga, 5000,
+		&program) == MISTER_RESULT_OK);
+	assert(containment.AcquireMappings(*program).complete);
+	program.reset();
+	std::unique_ptr<OperationLease> input;
+	assert(broker.Begin(generation, OperationKind::input, 5000, &input) ==
+		MISTER_RESULT_OK);
+	const size_t before = operations.events.size();
+	assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter, *input,
+		broker, *FixtureNativeCoreProfile("snes")) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(operations.events.size() == before);
+	input.reset();
+	assert(adapter.CloseMappingsForProcessExit() == MISTER_RESULT_OK);
 }
 
 struct ProgramBoundaryResult {
@@ -528,6 +745,15 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 		std::vector<Event>(operations.events.begin() + bridge_start,
 			operations.events.end())};
 	program.reset();
+	if (receipt.result == MISTER_RESULT_OK) {
+		std::unique_ptr<OperationLease> input;
+		assert(broker.Begin(generation, OperationKind::input, UINT64_MAX,
+			&input) == MISTER_RESULT_OK);
+		const size_t before_validation = operations.events.size();
+		assert(BridgeActivationAuthorityTestPeer::ValidateInput(adapter, *input,
+			broker, *FixtureNativeCoreProfile(system)) == MISTER_RESULT_OK);
+		assert(operations.events.size() == before_validation);
+	}
 	assert(artifact.Close() == NativeArtifactResult::ok);
 	operations.fail_event = 0;
 	operations.now_ms = 1000;
@@ -1493,6 +1719,7 @@ void RunAllTests()
 {
 	TestExactMappingsTraceAndPermanentClosure();
 	TestSixPageProgramBridgeAndTerminalCycle();
+	TestMappingOnlyCannotValidateBridgeActivationAuthority();
 	TestProgramReceiptsRetainAppliedStateAcrossLateBoundaries();
 	TestProgramFailureAndDeadlineAtEverySemanticPrimitive();
 	TestBridgeAcquiredAndAppliedReceiptsAreDistinctAtEveryPrimitive();

@@ -32,7 +32,13 @@ public:
 		: fail_at(0), calls(0), core_mask(0), core_value(0), interface_value(99),
 		  sdr_offset(0), sdr_value(99), bridge_value(99), remap_value(99),
 		  core_gpo(0x40000000u), interface_readback(0), sdr_readback(0),
-		  bridge_readback(7), remap_readback(1), release_called(false) {}
+		  bridge_readback(7), remap_readback(1), release_called(false),
+		  enable_result(MISTER_RESULT_OK), install_result(MISTER_RESULT_OK),
+		  enable_acquired(true), enable_mutation_applied(true),
+		  enable_sdr_observed(true), enable_bridge_observed(true),
+		  enable_remap_observed(true), enable_core_write_attempted(true),
+		  enable_core_observed(true), enable_core_gpo(0x80000000u),
+		  enable_calls(0), install_calls(0) {}
 
 	Result Step()
 	{
@@ -46,6 +52,23 @@ public:
 		core_mask = mask;
 		core_value = value;
 		return Step();
+	}
+	NativeBridgeEnableReceipt EnableBridges(const Access &) override
+	{
+		++enable_calls;
+		const NativeBridgeEnableReceipt receipt = {
+			enable_result, enable_acquired, enable_mutation_applied,
+			enable_sdr_observed, enable_bridge_observed, enable_remap_observed,
+			enable_core_write_attempted, enable_core_observed,
+			enable_core_gpo, 0};
+		return receipt;
+	}
+	Result InstallBridgeActivationAuthority(const Access &,
+		std::unique_ptr<NativeBridgeActivationAuthority> authority) override
+	{
+		++install_calls;
+		assert(authority != nullptr);
+		return install_result;
 	}
 	Result WriteInterfaceModule(const Access &,
 		uint32_t value) override
@@ -139,7 +162,114 @@ public:
 	uint32_t bridge_readback;
 	uint32_t remap_readback;
 	bool release_called;
+	Result enable_result;
+	Result install_result;
+	bool enable_acquired;
+	bool enable_mutation_applied;
+	bool enable_sdr_observed;
+	bool enable_bridge_observed;
+	bool enable_remap_observed;
+	bool enable_core_write_attempted;
+	bool enable_core_observed;
+	uint32_t enable_core_gpo;
+	int enable_calls;
+	int install_calls;
 };
+
+void TestBridgeSuccessRequiresAuthorityInstallation()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeContainmentIo io;
+	NativeContainment containment(broker, io);
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+		&generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> program;
+	assert(broker.Begin(generation, OperationKind::program_fpga, 5000,
+		&program) == MISTER_RESULT_OK);
+	NativeBridgeEnableReceipt receipt = containment.EnableBridges(*program);
+	assert(receipt.result == MISTER_RESULT_OK && receipt.acquired);
+	assert(receipt.mutation_sequence == 1);
+	assert(io.enable_calls == 1 && io.install_calls == 1);
+
+	FakeClock failed_clock(1000);
+	HardwareBroker failed_broker(failed_clock);
+	FakeContainmentIo failed_io;
+	failed_io.install_result = MISTER_RESULT_PLATFORM;
+	NativeContainment failed_containment(failed_broker, failed_io);
+	PlatformGenerationId failed_generation = 0;
+	assert(failed_broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+		&failed_generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> failed_program;
+	assert(failed_broker.Begin(failed_generation, OperationKind::program_fpga,
+		5000, &failed_program) == MISTER_RESULT_OK);
+	receipt = failed_containment.EnableBridges(*failed_program);
+	assert(receipt.result == MISTER_RESULT_PLATFORM && receipt.acquired);
+	assert(receipt.mutation_sequence == 1);
+	assert(failed_io.enable_calls == 1 && failed_io.install_calls == 1);
+}
+
+void TestBridgeAuthorityIsNotMintedFromIncompleteOrFailedReceipts()
+{
+	for (int missing = 0; missing != 7; ++missing) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeContainmentIo io;
+		if (missing == 0) io.enable_acquired = false;
+		if (missing == 1) io.enable_mutation_applied = false;
+		if (missing == 2) io.enable_sdr_observed = false;
+		if (missing == 3) io.enable_bridge_observed = false;
+		if (missing == 4) io.enable_remap_observed = false;
+		if (missing == 5) io.enable_core_write_attempted = false;
+		if (missing == 6) io.enable_core_observed = false;
+		NativeContainment containment(broker, io);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+			&generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> program;
+		assert(broker.Begin(generation, OperationKind::program_fpga, 5000,
+			&program) == MISTER_RESULT_OK);
+		const NativeBridgeEnableReceipt receipt =
+			containment.EnableBridges(*program);
+		assert(receipt.result == MISTER_RESULT_PLATFORM);
+		assert(io.enable_calls == 1 && io.install_calls == 0);
+	}
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeContainmentIo io;
+		io.enable_result = MISTER_RESULT_DEADLINE;
+		NativeContainment containment(broker, io);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+			&generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> program;
+		assert(broker.Begin(generation, OperationKind::program_fpga, 5000,
+			&program) == MISTER_RESULT_OK);
+		const NativeBridgeEnableReceipt receipt =
+			containment.EnableBridges(*program);
+		assert(receipt.result == MISTER_RESULT_DEADLINE && receipt.acquired);
+		assert(receipt.mutation_sequence == 1);
+		assert(io.enable_calls == 1 && io.install_calls == 0);
+	}
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeContainmentIo io;
+		NativeContainment containment(broker, io);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+			&generation) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> program;
+		assert(broker.Begin(generation, OperationKind::program_fpga, 1100,
+			&program) == MISTER_RESULT_OK);
+		clock.SetNow(1100);
+		assert(containment.EnableBridges(*program).result ==
+			MISTER_RESULT_DEADLINE);
+		assert(io.enable_calls == 0 && io.install_calls == 0);
+	}
+}
 
 void PrepareCleanup(HardwareBroker &broker, FakeClock &clock,
 	PlatformGenerationId *generation, std::unique_ptr<CleanupEpoch> *epoch,
@@ -421,6 +551,8 @@ void TestStagedEvidenceCannotTransferToReplacementLease()
 int main()
 {
 	using namespace mister::native;
+	TestBridgeSuccessRequiresAuthorityInstallation();
+	TestBridgeAuthorityIsNotMintedFromIncompleteOrFailedReceipts();
 	TestExactTerminalContractAndOnlyLeaveAfterReceipt();
 	TestCleanupResumeRejectsInterveningSameEpochMutationBeforeRelease();
 	TestRecoveryResumeRejectsInterveningSameEpochMutationBeforeRelease();

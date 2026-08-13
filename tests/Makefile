@@ -310,6 +310,19 @@ test-native-linux-mmio-containment-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-linux-mmio-sanitize-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-linux-mmio-containment
 
 test-native-linux-mmio-reachability: $(NATIVE_LINUX_MMIO_PRODUCTION_OBJECT)
+	@for probe in MISTER_NATIVE_BRIDGE_TOKEN_CONSTRUCT_REACHABILITY_PROBE \
+		MISTER_NATIVE_BRIDGE_TOKEN_COPY_REACHABILITY_PROBE \
+		MISTER_NATIVE_BRIDGE_TOKEN_MOVE_REACHABILITY_PROBE \
+		MISTER_NATIVE_BRIDGE_TOKEN_MINT_REACHABILITY_PROBE \
+		MISTER_NATIVE_BRIDGE_TOKEN_INSTALL_REACHABILITY_PROBE \
+		MISTER_NATIVE_BRIDGE_TOKEN_VALIDATE_REACHABILITY_PROBE; do \
+		if $(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_MMIO_TESTING \
+			-D$$probe -I. -fsyntax-only \
+			tests/native_linux_mmio_containment_test.cpp >/dev/null 2>&1; then \
+			echo "production header exposes bridge activation authority: $$probe" >&2; \
+			exit 1; \
+		fi; \
+	done
 	@if $(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_MMIO_TESTING \
 		-DMISTER_NATIVE_MMIO_REACHABILITY_PROBE -I. -fsyntax-only \
 		tests/native_linux_mmio_containment_test.cpp >/dev/null 2>&1; then \
@@ -492,9 +505,15 @@ test-native-linux-hardware-dependency-invalidation:
 			'runtime/native/linux/native_fpga_programmer.hpp:test-native-linux-artifact-programmer:-c tests/native_linux_artifact_programmer_test.cpp' \
 			'runtime/native/linux/native_fpga_programmer.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
 			'runtime/native/linux/native_mmio_adapter.hpp:test-native-linux-mmio-containment:-c tests/native_linux_mmio_containment_test.cpp' \
+			'runtime/native/linux/native_mmio_adapter.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
 			'runtime/native/native_containment.hpp:test-native-containment:-c runtime/native/native_containment.cpp' \
+			'runtime/native/native_containment.hpp:test-native-containment:-c tests/native_containment_test.cpp' \
 			'runtime/native/native_containment.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
+			'runtime/native/native_containment.hpp:test-native-linux-mmio-containment:-c tests/native_linux_mmio_containment_test.cpp' \
 			'runtime/native/hardware_broker.hpp:test-native-hardware-broker:-c runtime/native/hardware_broker.cpp' \
+			'runtime/native/hardware_broker.hpp:test-native-hardware-broker:-c tests/native_hardware_broker_test.cpp' \
+			'runtime/native/hardware_broker.hpp:test-native-containment:-c runtime/native/native_containment.cpp' \
+			'runtime/native/hardware_broker.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
 			'runtime/native/native_clock.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_fpga_programmer.cpp' \
 			'runtime/native/native_core_profile.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_core_artifact_adapter.cpp' \
 			'runtime/native/native_resources.hpp:test-native-linux-artifact-programmer:-c tests/native_linux_artifact_programmer_test.cpp' \

@@ -68,6 +68,9 @@ class NativeCoreProtocolTeardown;
 class NativeLifecycle;
 class CoreProtocolAuthorityTestPeer;
 class PeripheralAuthorityTestPeer;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+class BridgeActivationAuthorityTestPeer;
+#endif
 class ActiveCoreProtocolSession;
 class CleanupCoreProtocolSession;
 class RecoveryCoreProtocolSession;
@@ -80,6 +83,7 @@ class RecoveryVideoSession;
 class ActiveAudioVideoSession;
 class CleanupAudioVideoSession;
 class RecoveryAudioVideoSession;
+class NativeBridgeActivationAuthority;
 class ContainmentResumeKey;
 enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
@@ -92,6 +96,7 @@ class NativeSchedulerAdapter;
 class NativeOffloadAdapter;
 class NativeCoreProtocolIoAdapter;
 class NativeCoreProtocolIoAdapterImpl;
+class NativeLinuxMmioAdapter;
 class NativeCoreProtocolActiveAdapterView;
 class NativeCoreProtocolCleanupAdapterView;
 class NativeCoreProtocolRecoveryAdapterView;
@@ -128,6 +133,35 @@ private:
 	bool lifetime_registered_;
 };
 
+class NativeBridgeActivationAuthority final {
+public:
+	~NativeBridgeActivationAuthority() {}
+	NativeBridgeActivationAuthority(
+		const NativeBridgeActivationAuthority &) = delete;
+	NativeBridgeActivationAuthority &operator=(
+		const NativeBridgeActivationAuthority &) = delete;
+	NativeBridgeActivationAuthority(
+		NativeBridgeActivationAuthority &&) = delete;
+	NativeBridgeActivationAuthority &operator=(
+		NativeBridgeActivationAuthority &&) = delete;
+
+private:
+	friend class HardwareBroker;
+	NativeBridgeActivationAuthority(HardwareBroker &broker,
+		const std::shared_ptr<BrokerLifetime> &lifetime,
+		PlatformGenerationId generation, const NativeCoreProfile *profile,
+		uint64_t bridge_mutation_sequence)
+		: broker_(&broker), lifetime_(lifetime), generation_(generation),
+		  profile_(profile),
+		  bridge_mutation_sequence_(bridge_mutation_sequence) {}
+
+	HardwareBroker *broker_;
+	std::weak_ptr<BrokerLifetime> lifetime_;
+	PlatformGenerationId generation_;
+	const NativeCoreProfile *profile_;
+	uint64_t bridge_mutation_sequence_;
+};
+
 class HardwareLeaseView final {
 public:
 	~HardwareLeaseView();
@@ -144,6 +178,7 @@ private:
 	friend class RecoveryCoreProtocolSession;
 	friend class linux_native::NativeFpgaProgrammer;
 	friend class linux_native::NativeCoreProtocolIoAdapterImpl;
+	friend class linux_native::NativeLinuxMmioAdapter;
 	explicit HardwareLeaseView(
 		const std::shared_ptr<OperationRegistration> &registration);
 	uint64_t RecordMutation();
@@ -152,6 +187,10 @@ private:
 		uint64_t *mutation_sequence);
 	Result AuthorizeFpgaProgrammingProfile(
 		const NativeCoreProfile &profile) const;
+	Result MintBridgeActivationAuthority(uint64_t bridge_mutation_sequence,
+		std::unique_ptr<NativeBridgeActivationAuthority> *authority) const;
+	Result ValidateBridgeActivationAuthority(
+		const NativeBridgeActivationAuthority &authority) const;
 	uint64_t absolute_deadline_ms() const;
 
 	std::shared_ptr<OperationRegistration> registration_;
@@ -206,6 +245,9 @@ private:
 	friend class NativeRecovery;
 	friend class CoreProtocolAuthorityTestPeer;
 	friend class PeripheralAuthorityTestPeer;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	friend class BridgeActivationAuthorityTestPeer;
+#endif
 	friend class linux_native::NativeInputAdapter;
 	friend class linux_native::NativeSchedulerAdapter;
 	friend class linux_native::NativeOffloadAdapter;
@@ -501,6 +543,9 @@ private:
 	friend class NativeRecovery;
 	friend class NativeLifecycle;
 	friend class PeripheralAuthorityTestPeer;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	friend class BridgeActivationAuthorityTestPeer;
+#endif
 	friend class linux_native::NativeAvIoAdapter;
 	friend class linux_native::NativeAudioAdapter;
 	friend class linux_native::NativeVideoAdapter;
@@ -684,6 +729,14 @@ private:
 		size_t accepted_bytes, uint64_t *mutation_sequence);
 	Result AuthorizeFpgaProgrammingProfile(const HardwareLeaseView &view,
 		const NativeCoreProfile &profile);
+	Result MintBridgeActivationAuthority(const HardwareLeaseView &view,
+		uint64_t bridge_mutation_sequence,
+		std::unique_ptr<NativeBridgeActivationAuthority> *authority);
+	Result ValidateBridgeActivationAuthority(const HardwareLeaseView &view,
+		const NativeBridgeActivationAuthority &authority);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	void SetBridgeMutationSequenceForTest(uint64_t sequence);
+#endif
 	Result ValidateCleanupContainmentAuthority(const CleanupEpoch &epoch,
 		const OperationLease &terminal_lease);
 	Result ValidateRecoveryContainmentAuthority(const RecoveryEpoch &epoch,

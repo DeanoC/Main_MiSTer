@@ -68,6 +68,14 @@ NativeBridgeEnableReceipt NativeContainment::EnableBridges(
 		 (receipt.observed_core_gpo & 0xc0000000u) != 0x80000000u ||
 		 receipt.mutation_sequence == 0))
 		receipt.result = MISTER_RESULT_PLATFORM;
+	if (receipt.result == MISTER_RESULT_OK) {
+		std::unique_ptr<NativeBridgeActivationAuthority> authority;
+		receipt.result = view->MintBridgeActivationAuthority(
+			receipt.mutation_sequence, &authority);
+		if (receipt.result == MISTER_RESULT_OK)
+			receipt.result = io_.InstallBridgeActivationAuthority(access,
+				std::move(authority));
+	}
 	return receipt;
 }
 
