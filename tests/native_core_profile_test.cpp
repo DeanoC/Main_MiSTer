@@ -171,6 +171,7 @@ void TestFixtureProtocolProfilesRequireExactHandshakeRecords()
 	assert(snes->protocol.sdram_size_word == 0x1234);
 	assert(snes->protocol.transform ==
 		NativeContentTransform::snes_header_and_mirror);
+	assert(snes->protocol.minimum_source_bytes == 0x8000);
 	assert(megadrive->protocol.exact_core_type == 0xa8);
 	assert(megadrive->protocol.file_io_width ==
 		NativeFileIoWidth::little_endian_byte_pairs);

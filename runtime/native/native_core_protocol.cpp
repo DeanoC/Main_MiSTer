@@ -5,6 +5,7 @@
 #include "runtime/native/native_core_protocol_session_state.hpp"
 #include "runtime/native/native_recovery.hpp"
 #include "runtime/native/native_resources.hpp"
+#include "runtime/native/native_snes_content.hpp"
 
 #include <string.h>
 
@@ -103,6 +104,21 @@ public:
 private:
 	NativeContentResource &content_;
 	char description_[4];
+};
+
+class SnesContentBridge final : public NativeSnesContentSource {
+public:
+	explicit SnesContentBridge(NativeCoreProtocolContent &content)
+		: content_(content)
+	{
+	}
+	MisterResult ReadAt(uint64_t offset, void *bytes, size_t count,
+		uint64_t absolute_deadline_ms) override
+	{
+		return content_.ReadAt(offset, bytes, count, absolute_deadline_ms);
+	}
+private:
+	NativeCoreProtocolContent &content_;
 };
 
 bool BeforeDeadline(const NativeClock &clock, uint64_t deadline)
@@ -421,18 +437,76 @@ MisterResult NativeCoreProtocol::ValidateLive(const NativeCoreProfile &profile,
 	return MISTER_RESULT_OK;
 }
 
+MisterResult NativeCoreProtocol::TransferRawContent(
+	NativeCoreProtocolContent &content, uint64_t size,
+	const NativeCoreProfile &profile, uint64_t absolute_deadline_ms)
+{
+	for (uint64_t offset = 0; offset < size;) {
+		const size_t remaining = static_cast<size_t>(size - offset >
+			kMaximumPayloadBytes ? kMaximumPayloadBytes : size - offset);
+		std::vector<uint8_t> bytes(remaining);
+		MisterResult result = content.ReadAt(offset, bytes.data(), bytes.size(),
+			absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		std::vector<uint16_t> words;
+		words.push_back(0x0054);
+		if (profile.protocol.file_io_width == NativeFileIoWidth::byte_per_word) {
+			for (size_t index = 0; index < bytes.size(); ++index)
+				words.push_back(bytes[index]);
+		} else {
+			for (size_t index = 0; index < bytes.size(); index += 2) {
+				uint16_t word = bytes[index];
+				if (index + 1 < bytes.size())
+					word |= static_cast<uint16_t>(bytes[index + 1]) << 8;
+				words.push_back(word);
+			}
+		}
+		result = Exchange(NativeSpiTarget::file_io, words.data(), words.size(),
+			nullptr, 0, false, false, absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		offset += remaining;
+	}
+	return MISTER_RESULT_OK;
+}
+
+MisterResult NativeCoreProtocol::TransferNativeSnesContent(
+	NativeCoreProtocolContent &content,
+	const NativeSnesContentPlan &plan, uint64_t absolute_deadline_ms)
+{
+	SnesContentBridge source(content);
+	std::vector<uint16_t> header_words(1 + sizeof(plan.metadata));
+	header_words[0] = 0x0054;
+	for (size_t index = 0; index < sizeof(plan.metadata); ++index)
+		header_words[index + 1] = plan.metadata[index];
+	MisterResult result = Exchange(NativeSpiTarget::file_io, header_words.data(),
+		header_words.size(), nullptr, 0, false, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	for (uint64_t offset = 0; offset < plan.rom_wire_size;) {
+		const size_t remaining = static_cast<size_t>(plan.rom_wire_size - offset >
+			kMaximumPayloadBytes ? kMaximumPayloadBytes :
+			plan.rom_wire_size - offset);
+		uint8_t bytes[kMaximumPayloadBytes] = {};
+		result = ReadNativeSnesRomWindow(source, plan, offset, bytes, remaining,
+			clock_, absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		std::vector<uint16_t> words(remaining + 1);
+		words[0] = 0x0054;
+		for (size_t index = 0; index < remaining; ++index)
+			words[index + 1] = bytes[index];
+		result = Exchange(NativeSpiTarget::file_io, words.data(), words.size(),
+			nullptr, 0, false, false, absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		offset += remaining;
+	}
+	return MISTER_RESULT_OK;
+}
+
 MisterResult NativeCoreProtocol::ActivateFixtureForTest(
 	const NativeCoreProfile &profile, NativeCoreProtocolContent &content,
 	uint64_t absolute_deadline_ms)
 {
 	if (!capabilities_available_) return MISTER_RESULT_PLATFORM;
 	if (!ValidateNativeCoreProfileRecord(profile)) return MISTER_RESULT_UNSUPPORTED;
-	// The independent SNES normalizer is not yet connected to this intermediate
-	// protocol checkpoint. Reject its transform before opening content or
-	// touching hardware rather than sending an untransformed raw image.
-	if (profile.protocol.transform ==
-		NativeContentTransform::snes_header_and_mirror)
-		return MISTER_RESULT_UNSUPPORTED;
 	NativeCoreProtocolContentDescription description = {};
 	if (!BeforeDeadline(clock_, absolute_deadline_ms)) return MISTER_RESULT_DEADLINE;
 	MisterResult result = content.Describe(&description, absolute_deadline_ms);
@@ -442,6 +516,17 @@ MisterResult NativeCoreProtocol::ActivateFixtureForTest(
 		description.size > profile.protocol.maximum_source_bytes ||
 		!NativeCoreProfileAcceptsExtension(profile, description.extension))
 		return MISTER_RESULT_UNSUPPORTED;
+	NativeSnesContentPlan snes_plan = {};
+	if (profile.protocol.transform ==
+		NativeContentTransform::snes_header_and_mirror) {
+		SnesContentBridge source(content);
+		result = PrepareNativeSnesContent(source, description.size,
+			profile.protocol.minimum_source_bytes,
+			profile.protocol.maximum_source_bytes,
+			profile.protocol.maximum_wire_bytes, clock_, absolute_deadline_ms,
+			&snes_plan);
+		if (result != MISTER_RESULT_OK) return result;
+	}
 	uint16_t extension_first = 0;
 	uint16_t extension_second = 0;
 	if (!ExtensionWords(description.extension, &extension_first, &extension_second))
@@ -484,30 +569,14 @@ MisterResult NativeCoreProtocol::ActivateFixtureForTest(
 	result = Exchange(NativeSpiTarget::file_io, start_words, 2,
 		nullptr, 0, false, false, absolute_deadline_ms);
 	if (result != MISTER_RESULT_OK) return result;
-	for (uint64_t offset = 0; offset < description.size;) {
-		const size_t remaining = static_cast<size_t>(description.size - offset >
-			kMaximumPayloadBytes ? kMaximumPayloadBytes : description.size - offset);
-		std::vector<uint8_t> bytes(remaining);
-		result = content.ReadAt(offset, bytes.data(), bytes.size(), absolute_deadline_ms);
-		if (result != MISTER_RESULT_OK) return result;
-		std::vector<uint16_t> words;
-		words.push_back(0x0054);
-		if (profile.protocol.file_io_width == NativeFileIoWidth::byte_per_word) {
-			for (size_t index = 0; index < bytes.size(); ++index)
-				words.push_back(bytes[index]);
-		} else {
-			for (size_t index = 0; index < bytes.size(); index += 2) {
-				uint16_t word = bytes[index];
-				if (index + 1 < bytes.size())
-					word |= static_cast<uint16_t>(bytes[index + 1]) << 8;
-				words.push_back(word);
-			}
-		}
-		result = Exchange(NativeSpiTarget::file_io, words.data(),
-			words.size(), nullptr, 0, false, false, absolute_deadline_ms);
-		if (result != MISTER_RESULT_OK) return result;
-		offset += remaining;
-	}
+	if (profile.protocol.transform ==
+		NativeContentTransform::snes_header_and_mirror)
+		result = TransferNativeSnesContent(content, snes_plan,
+			absolute_deadline_ms);
+	else
+		result = TransferRawContent(content, description.size, profile,
+			absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
 	uint16_t status_words[] = {0x0029};
 	uint16_t status_response[] = {0};
 	result = Exchange(NativeSpiTarget::user_io, status_words, 1,
@@ -555,8 +624,8 @@ NativeCoreProtocolOutcome NativeCoreProtocol::Activate(
 		outcome.result = MISTER_RESULT_UNSUPPORTED;
 		return outcome;
 	}
-	// D6.4 owns the full SNES transform. Do not acquire a session, describe
-	// content, or map hardware until that exact transform is available.
+	// Production remains fail-closed. The fixture-only entry point above is
+	// the sole Task 6D.4 route for the bounded SNES transform.
 	if (profile.protocol.transform ==
 		NativeContentTransform::snes_header_and_mirror) {
 		outcome.result = MISTER_RESULT_UNSUPPORTED;

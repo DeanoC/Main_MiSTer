@@ -8,6 +8,7 @@
 #include "runtime/native/native_clock.hpp"
 #include "runtime/native/native_core_profile.hpp"
 #include "runtime/native/native_hardware_io.hpp"
+#include "runtime/native/native_snes_content.hpp"
 #include "runtime/native/hardware_broker.hpp"
 
 #include <stddef.h>
@@ -233,6 +234,11 @@ private:
 	MisterResult CloseSelected(NativeSpiTarget target,
 		uint64_t absolute_deadline_ms);
 	MisterResult ValidateLive(const NativeCoreProfile &profile,
+		uint64_t absolute_deadline_ms);
+	MisterResult TransferNativeSnesContent(NativeCoreProtocolContent &content,
+		const NativeSnesContentPlan &plan, uint64_t absolute_deadline_ms);
+	MisterResult TransferRawContent(NativeCoreProtocolContent &content,
+		uint64_t size, const NativeCoreProfile &profile,
 		uint64_t absolute_deadline_ms);
 	NativeClock &clock_;
 	HardwareBroker *broker_;

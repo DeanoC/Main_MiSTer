@@ -17,7 +17,7 @@ const NativeCoreProfile kSnesProfile = {
 	{0xa4, NativeFileIoWidth::byte_per_word, 0x1234,
 		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 		NativeContentTransform::snes_header_and_mirror,
-		1, 8 * 1024 * 1024, 16 * 1024 * 1024},
+		0x8000, 8 * 1024 * 1024, 16 * 1024 * 1024},
 	NativeProfileAuthority::fixture
 };
 

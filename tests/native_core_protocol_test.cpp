@@ -51,6 +51,50 @@ private:
 	const std::vector<uint8_t> &bytes_;
 };
 
+class FailingContent final : public NativeCoreProtocolContent {
+public:
+	FailingContent(const char *extension, const std::vector<uint8_t> &bytes,
+		size_t fail_after_read)
+		: extension_(extension), bytes_(bytes), fail_after_read_(fail_after_read),
+		  reads_(0) {}
+	MisterResult Describe(NativeCoreProtocolContentDescription *description,
+		uint64_t) override
+	{
+		if (description == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+		description->size = bytes_.size();
+		description->extension = extension_.c_str();
+		return MISTER_RESULT_OK;
+	}
+	MisterResult ReadAt(uint64_t offset, void *output, size_t count,
+		uint64_t) override
+	{
+		if (++reads_ > fail_after_read_) return MISTER_RESULT_PLATFORM;
+		if (output == nullptr || offset > bytes_.size() ||
+			count > bytes_.size() - static_cast<size_t>(offset))
+			return MISTER_RESULT_PLATFORM;
+		memcpy(output, bytes_.data() + offset, count);
+		return MISTER_RESULT_OK;
+	}
+private:
+	std::string extension_;
+	const std::vector<uint8_t> &bytes_;
+	size_t fail_after_read_;
+	size_t reads_;
+};
+
+std::vector<uint8_t> ValidSnesBytes()
+{
+	std::vector<uint8_t> bytes(0x8000, 0);
+	bytes[0] = 0x78;
+	bytes[0x7fc0 + 0x15] = 0x20;
+	bytes[0x7fc0 + 0x1a] = 0x33;
+	bytes[0x7fc0 + 0x1c] = 0xff;
+	bytes[0x7fc0 + 0x1d] = 0xff;
+	bytes[0x7fc0 + 0x3c] = 0x00;
+	bytes[0x7fc0 + 0x3d] = 0x80;
+	return bytes;
+}
+
 struct Trace {
 	NativeSpiTarget target;
 	bool begins_selected;
@@ -100,6 +144,55 @@ public:
 	NativeLiveCoreObservation live_;
 	std::vector<uint16_t> responses_;
 	std::vector<Trace> traces_;
+};
+
+class PlanLockedSnesContent final : public NativeCoreProtocolContent {
+public:
+	PlanLockedSnesContent(const std::vector<uint8_t> &bytes, const TraceIo &io)
+		: bytes_(bytes), io_(io), post_start_reads_(0),
+		  unexpected_post_start_read_(false) {}
+	MisterResult Describe(NativeCoreProtocolContentDescription *description,
+		uint64_t) override
+	{
+		if (description == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+		description->size = bytes_.size();
+		description->extension = "sfc";
+		return MISTER_RESULT_OK;
+	}
+	MisterResult ReadAt(uint64_t offset, void *output, size_t count,
+		uint64_t) override
+	{
+		if (output == nullptr || offset > bytes_.size() ||
+			count > bytes_.size() - static_cast<size_t>(offset))
+			return MISTER_RESULT_PLATFORM;
+		if (DownloadStarted()) {
+			if (count != 1 || offset != post_start_reads_) {
+				unexpected_post_start_read_ = true;
+				return MISTER_RESULT_PLATFORM;
+			}
+			++post_start_reads_;
+		}
+		memcpy(output, bytes_.data() + offset, count);
+		return MISTER_RESULT_OK;
+	}
+	bool unexpected_post_start_read() const { return unexpected_post_start_read_; }
+	uint64_t post_start_reads() const { return post_start_reads_; }
+private:
+	bool DownloadStarted() const
+	{
+		for (size_t index = 0; index < io_.traces_.size(); ++index) {
+			const Trace &trace = io_.traces_[index];
+			if (trace.target == NativeSpiTarget::file_io &&
+				trace.words.size() == 2 && trace.words[0] == 0x0053 &&
+				trace.words[1] == 0x00ff)
+				return true;
+		}
+		return false;
+	}
+	const std::vector<uint8_t> &bytes_;
+	const TraceIo &io_;
+	uint64_t post_start_reads_;
+	bool unexpected_post_start_read_;
 };
 
 void TestMegaDriveRecipeUsesTypedHandshakeAndExactFileWords()
@@ -174,16 +267,96 @@ void TestSnesFixtureActivationIsClosedBeforeAnyHardwareExchange()
 {
 	const NativeCoreProfile *profile = FixtureNativeCoreProfile("snes");
 	assert(profile != nullptr);
-	const std::vector<uint8_t> bytes(0x8000, 0x42);
+	const std::vector<uint8_t> bytes = ValidSnesBytes();
 	MemoryContent content("sfc", bytes);
 	TraceIo io;
 	io.live_ = {0x005ca623, profile->protocol.exact_core_type,
 		profile->protocol.file_io_width, profile->input.fpga_io_version};
+	io.responses_.push_back(0);
+	const char *name = "SNES";
+	for (size_t index = 0; name[index] != '\0'; ++index)
+		io.responses_.push_back(static_cast<uint8_t>(name[index]));
+	io.responses_.push_back(';');
+	io.responses_.push_back(0);
 	FixedClock clock(1);
 	NativeCoreProtocol protocol(clock, io);
 	assert(protocol.ActivateFixtureForTest(*profile, content, 100) ==
+		MISTER_RESULT_OK);
+	assert(io.traces_.size() == 19);
+	assert((io.traces_[3].words == std::vector<uint16_t>{0x0055, 0x0000}));
+	assert((io.traces_[4].words == std::vector<uint16_t>{0x0056, 0x2e53, 0x4643}));
+	assert((io.traces_[5].words == std::vector<uint16_t>{0x0053, 0x00ff}));
+	assert(io.traces_[6].words.front() == 0x0054);
+	assert(io.traces_[6].words.size() == 513);
+	assert(io.traces_[6].words[5] == 0x00c0);
+	assert(io.traces_[6].words[6] == 0x007f);
+	assert(io.traces_[6].words[9] == 0x0000);
+	assert(io.traces_[6].words[10] == 0x0080);
+	assert(io.traces_[7].words.front() == 0x0054);
+	assert(io.traces_[7].words.size() == 4097);
+	assert(io.traces_[14].words.front() == 0x0054);
+	assert(io.traces_[14].words.size() == 4097);
+	assert((io.traces_[15].words == std::vector<uint16_t>{0x0029}));
+	assert(io.traces_[16].target == NativeSpiTarget::user_io);
+	assert((io.traces_[17].words == std::vector<uint16_t>{0x0053, 0x0000}));
+}
+
+void TestSnesShortAndMutatedContentDoNotReportActivationSuccess()
+{
+	const NativeCoreProfile *profile = FixtureNativeCoreProfile("snes");
+	assert(profile != nullptr);
+	const std::vector<uint8_t> short_bytes(0x7fff, 0);
+	MemoryContent short_content("sfc", short_bytes);
+	TraceIo short_io;
+	short_io.live_ = {0x005ca623, profile->protocol.exact_core_type,
+		profile->protocol.file_io_width, profile->input.fpga_io_version};
+	FixedClock clock(1);
+	NativeCoreProtocol short_protocol(clock, short_io);
+	assert(short_protocol.ActivateFixtureForTest(*profile, short_content, 100) ==
 		MISTER_RESULT_UNSUPPORTED);
-	assert(io.traces_.empty());
+	assert(short_io.traces_.empty());
+
+	const std::vector<uint8_t> bytes = ValidSnesBytes();
+	FailingContent preflight_content("sfc", bytes, 0);
+	TraceIo preflight_io;
+	preflight_io.live_ = {0x005ca623, profile->protocol.exact_core_type,
+		profile->protocol.file_io_width, profile->input.fpga_io_version};
+	NativeCoreProtocol preflight_protocol(clock, preflight_io);
+	assert(preflight_protocol.ActivateFixtureForTest(*profile, preflight_content,
+		100) == MISTER_RESULT_PLATFORM);
+	assert(preflight_io.traces_.empty());
+
+	FailingContent changed_content("sfc", bytes, 35);
+	TraceIo changed_io;
+	changed_io.live_ = {0x005ca623, profile->protocol.exact_core_type,
+		profile->protocol.file_io_width, profile->input.fpga_io_version};
+	NativeCoreProtocol changed_protocol(clock, changed_io);
+	assert(changed_protocol.ActivateFixtureForTest(*profile, changed_content,
+		100) == MISTER_RESULT_PLATFORM);
+	assert(!changed_io.traces_.empty());
+}
+
+void TestSnesFixtureConsumesThePreflightPlanAfterDownloadStart()
+{
+	const NativeCoreProfile *profile = FixtureNativeCoreProfile("snes");
+	assert(profile != nullptr);
+	const std::vector<uint8_t> bytes = ValidSnesBytes();
+	TraceIo io;
+	io.live_ = {0x005ca623, profile->protocol.exact_core_type,
+		profile->protocol.file_io_width, profile->input.fpga_io_version};
+	io.responses_.push_back(0);
+	const char *name = "SNES";
+	for (size_t index = 0; name[index] != '\0'; ++index)
+		io.responses_.push_back(static_cast<uint8_t>(name[index]));
+	io.responses_.push_back(';');
+	io.responses_.push_back(0);
+	PlanLockedSnesContent content(bytes, io);
+	FixedClock clock(1);
+	NativeCoreProtocol protocol(clock, io);
+	assert(protocol.ActivateFixtureForTest(*profile, content, 100) ==
+		MISTER_RESULT_OK);
+	assert(!content.unexpected_post_start_read());
+	assert(content.post_start_reads() == bytes.size());
 }
 
 } // namespace
@@ -195,5 +368,7 @@ int main()
 	mister::native::TestMegaDriveRecipeUsesTypedHandshakeAndExactFileWords();
 	mister::native::TestNewStatusResponseStaysSelectedForEightWordsThenClearsBeforeStop();
 	mister::native::TestSnesFixtureActivationIsClosedBeforeAnyHardwareExchange();
+	mister::native::TestSnesShortAndMutatedContentDoNotReportActivationSuccess();
+	mister::native::TestSnesFixtureConsumesThePreflightPlanAfterDownloadStart();
 	return 0;
 }
