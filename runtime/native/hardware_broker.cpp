@@ -2382,7 +2382,8 @@ Result HardwareBroker::AcquireProcessOperationGuardFor(
 	if (&owner != this) return MISTER_RESULT_INVALID_STATE;
 	if (required_operation_kind != OperationKind::scheduler &&
 		required_operation_kind != OperationKind::offload &&
-		required_operation_kind != OperationKind::input_descriptors)
+		required_operation_kind != OperationKind::input_descriptors &&
+		required_operation_kind != OperationKind::save)
 		return MISTER_RESULT_INVALID_STATE;
 
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -2401,7 +2402,13 @@ Result HardwareBroker::AcquireProcessOperationGuardFor(
 		registration->authority == LeaseAuthority::cleanup_epoch &&
 		registration->authority_identity == cleanup_identity_ &&
 		state_ == State::cleanup;
-	if (!active_authority && !cleanup_authority)
+	const bool recovery_authority =
+		registration->authority == LeaseAuthority::recovery_epoch &&
+		registration->authority_identity == recovery_identity_ &&
+		state_ == State::recovery && !recovery_terminal_neutral_ &&
+		IsRecoveryOperation(registration->operation_kind,
+			recovery_requested_resource_flags_);
+	if (!active_authority && !cleanup_authority && !recovery_authority)
 		return MISTER_RESULT_INVALID_STATE;
 	if (clock_.NowMs() >= registration->absolute_deadline_ms)
 		return MISTER_RESULT_DEADLINE;

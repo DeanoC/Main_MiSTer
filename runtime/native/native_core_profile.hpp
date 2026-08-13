@@ -103,6 +103,66 @@ struct NativeVideoProfile {
 	bool coupled_transmitter;
 };
 
+enum class NativeSaveDirectoryRole : uint8_t {
+	root_anchor,
+	immutable_parent,
+	save_root,
+	system_directory
+};
+
+enum class NativeSaveMountRelation : uint8_t {
+	root_anchor,
+	same_mount_as_parent,
+	distinct_mount_from_parent
+};
+
+enum class NativeSaveDeviceRelation : uint8_t {
+	root_anchor,
+	same_device_as_parent,
+	distinct_device_from_parent
+};
+
+struct NativeSaveDirectoryAuthority {
+	const char *component;
+	uint32_t uid;
+	uint32_t gid;
+	uint16_t exact_mode;
+	NativeSaveDirectoryRole role;
+	NativeSaveMountRelation mount_relation;
+	NativeSaveDeviceRelation device_relation;
+};
+
+struct NativeSaveRootAuthority {
+	const char *absolute_root;
+	const NativeSaveDirectoryAuthority *chain;
+	size_t chain_count;
+	uint32_t file_uid;
+	uint32_t file_gid;
+	uint16_t file_mode;
+};
+
+enum class NativeSaveMode : uint8_t {
+	single_slot_growable_block_file,
+	unsupported
+};
+
+struct NativeSaveProfile {
+	NativeSaveMode mode;
+	uint32_t sector_bytes;
+	uint64_t maximum_bytes;
+	uint64_t advertised_empty_bytes;
+	uint8_t empty_fill_byte;
+	uint8_t slot;
+	const NativeSaveRootAuthority *root_authority;
+};
+
+struct SafeSaveRecoveryRecord {
+	NativeProfileAuthority authority;
+	NativeSystem system_id;
+	const NativeSaveRootAuthority *root_authority;
+	uint8_t content_sha256[32];
+};
+
 struct SafePeripheralRecoveryRecord {
 	NativeProfileAuthority authority;
 	NativeSystem system_id;
@@ -148,6 +208,7 @@ struct NativeCoreProfile {
 	NativeCoreProtocolProfile protocol;
 	NativeAudioProfile audio;
 	NativeVideoProfile video;
+	NativeSaveProfile save;
 	NativeProfileAuthority authority;
 };
 
@@ -169,8 +230,16 @@ const SafeVideoRecoveryRecord *FixtureSafeVideoRecoveryRecordForTest(
 	NativeSystem system_id);
 const SafeAudioVideoRecoveryRecord *FixtureSafeAudioVideoRecoveryRecordForTest(
 	NativeSystem system_id);
+const SafeSaveRecoveryRecord *FixtureSafeSaveRecoveryRecordForTest(
+	NativeSystem system_id);
+const NativeCoreProfile *FixtureNativeCoreProfileForSafeSaveRecoveryRecordForTest(
+	const SafeSaveRecoveryRecord *record);
 bool IsExactFixtureSafePeripheralRecoveryRecordForTest(
 	const SafePeripheralRecoveryRecord *record);
+bool IsExactFixtureNativeSaveRootAuthorityForTest(
+	const NativeSaveRootAuthority *authority);
+bool IsExactFixtureSafeSaveRecoveryRecordForTest(
+	const SafeSaveRecoveryRecord *record);
 #endif
 
 } // namespace native

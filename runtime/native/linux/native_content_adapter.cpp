@@ -79,6 +79,18 @@ Result NativeContentAdapter::Configure(const NativeArtifactAuthority &authority)
 	return MISTER_RESULT_OK;
 }
 
+Result NativeContentAdapter::DeriveSaveKey(const NativeCoreProfile &profile,
+	NativeSaveKey *key)
+{
+	const char *const system = NativeSaveSystemToken(profile.system_id);
+	if (!configured_ || !content_.valid() || authority_.system == nullptr ||
+		system == nullptr || strcmp(authority_.system, system) != 0 ||
+		authority_.sha256 == nullptr ||
+		!MakeNativeSaveKey(profile, authority_.sha256, key))
+		return MISTER_RESULT_UNSUPPORTED;
+	return MISTER_RESULT_OK;
+}
+
 NativeAcquisitionOutcome NativeContentAdapter::RetainContent(
 	uint64_t absolute_deadline_ms)
 {

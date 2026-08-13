@@ -92,6 +92,7 @@ class NativeCoreProtocolRecoveryAdapterView;
 class NativeAudioAdapter;
 class NativeVideoAdapter;
 class NativeAvIoAdapter;
+class NativeSaveAdapter;
 }
 
 class ProcessOperationGuard final {
@@ -113,6 +114,7 @@ private:
 	friend class linux_native::NativeAudioAdapter;
 	friend class linux_native::NativeVideoAdapter;
 	friend class linux_native::NativeAvIoAdapter;
+	friend class linux_native::NativeSaveAdapter;
 	explicit ProcessOperationGuard(
 		const std::shared_ptr<OperationRegistration> &registration);
 	LeaseAuthority authority() const;
@@ -202,6 +204,7 @@ private:
 	friend class linux_native::NativeOffloadAdapter;
 	friend class linux_native::NativeAudioAdapter;
 	friend class linux_native::NativeVideoAdapter;
+	friend class linux_native::NativeSaveAdapter;
 	explicit OperationLease(
 		const std::shared_ptr<OperationRegistration> &registration);
 	Result AcquireHardwareLeaseView(

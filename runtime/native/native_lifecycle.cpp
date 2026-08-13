@@ -53,6 +53,7 @@ NativeLifecycle::~NativeLifecycle()
 	// This only releases the registration. The protocol resource owns the
 	// process-exit close path and session-handle destruction performs no I/O.
 	core_protocol_cleanup_lease_.reset();
+	save_cleanup_lease_.reset();
 	audio_cleanup_lease_.reset();
 	video_cleanup_lease_.reset();
 	coupled_audio_video_cleanup_lease_.reset();
@@ -271,13 +272,18 @@ Result NativeLifecycle::ActivateLocked(const NativeCoreProfile &profile,
 		&ledger_.input_descriptors, activation_deadline_ms);
 	if (result != MISTER_RESULT_OK) return result;
 
-	result = broker_.Begin(generation_, OperationKind::save,
-		activation_deadline_ms, &lease);
-	outcome = {result, false};
-	if (result == MISTER_RESULT_OK) outcome = resources_.save.OpenSave(*lease);
+	NativeSaveKey save_key = {};
+	result = resources_.content.DeriveSaveKey(profile, &save_key);
+	NativeSaveOpenOutcome save_outcome = {result, false};
+	if (result == MISTER_RESULT_OK) {
+		result = broker_.Begin(generation_, OperationKind::save,
+			activation_deadline_ms, &lease);
+		save_outcome = {result, false};
+		if (result == MISTER_RESULT_OK)
+			save_outcome = resources_.save.OpenSave(*lease, profile, save_key);
+	}
 	lease.reset();
-	result = FinishAcquisitionLocked(outcome, MISTER_RESOURCE_SAVES, nullptr,
-		activation_deadline_ms);
+	result = FinishSaveAcquisitionLocked(save_outcome, activation_deadline_ms);
 	if (result != MISTER_RESULT_OK) return result;
 
 	result = broker_.Begin(generation_, OperationKind::scheduler,
@@ -338,6 +344,27 @@ Result NativeLifecycle::FinishPeripheralAcquisitionLocked(
 		outcome.acquired};
 	return FinishAcquisitionLocked(normalized, resource_flags, nullptr,
 		activation_deadline_ms);
+}
+
+Result NativeLifecycle::FinishSaveAcquisitionLocked(
+	NativeSaveOpenOutcome outcome, uint64_t activation_deadline_ms)
+{
+	const NativeAcquisitionOutcome normalized = {outcome.result, outcome.acquired};
+	return FinishAcquisitionLocked(normalized, MISTER_RESOURCE_SAVES, nullptr,
+		activation_deadline_ms);
+}
+
+Result NativeLifecycle::FinishSaveCleanupLocked(
+	const NativeSaveCloseOutcome &outcome) const
+{
+	if (outcome.result != MISTER_RESULT_OK ||
+		(outcome.data_synchronization_required && !outcome.data_synchronized) ||
+		(outcome.metadata_synchronization_required &&
+		 !outcome.metadata_synchronized) || !outcome.descriptors_absent ||
+		outcome.closure_unknown)
+		return CleanupFailure(outcome.result == MISTER_RESULT_OK ?
+			MISTER_RESULT_CLEANUP_INCOMPLETE : outcome.result);
+	return MISTER_RESULT_OK;
 }
 
 Result NativeLifecycle::FinishPeripheralCleanupLocked(
@@ -630,12 +657,18 @@ Result NativeLifecycle::RunCleanupLocked()
 		ledger_.offload = false;
 	}
 	if ((ledger_.resource_flags & MISTER_RESOURCE_SAVES) != 0) {
-		result = BeginCleanupOperationLocked(OperationKind::save, &lease);
+		if (!save_cleanup_lease_) {
+			result = BeginCleanupOperationLocked(OperationKind::save,
+				&save_cleanup_lease_);
+			if (result != MISTER_RESULT_OK) return result;
+		}
+		const NativeSaveCloseOutcome save_outcome =
+			resources_.save.FlushAndCloseSave(*save_cleanup_lease_);
+		result = FinishSaveCleanupLocked(save_outcome);
+		if (result == MISTER_RESULT_OK)
+			result = FinishCleanupOperationLocked(result, *save_cleanup_lease_);
 		if (result != MISTER_RESULT_OK) return result;
-		result = resources_.save.FlushAndCloseSave(*lease);
-		result = FinishCleanupOperationLocked(result, *lease);
-		lease.reset();
-		if (result != MISTER_RESULT_OK) return result;
+		save_cleanup_lease_.reset();
 		ledger_.resource_flags &= ~MISTER_RESOURCE_SAVES;
 	}
 	if (!ledger_.digital_neutral_captured &&
@@ -819,6 +852,7 @@ void NativeLifecycle::ClearGenerationLocked()
 	latched_activation_result_ = MISTER_RESULT_OK;
 	profile_ = nullptr;
 	core_protocol_cleanup_lease_.reset();
+	save_cleanup_lease_.reset();
 	audio_cleanup_lease_.reset();
 	video_cleanup_lease_.reset();
 	coupled_audio_video_cleanup_lease_.reset();

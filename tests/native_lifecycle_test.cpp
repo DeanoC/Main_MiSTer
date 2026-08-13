@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "runtime/native/native_lifecycle.hpp"
+#include "runtime/native/native_containment.hpp"
+#include "runtime/native/linux/native_save_adapter.hpp"
 #include "tests/native_core_protocol_authority_test_peer.hpp"
 #include "tests/native_peripheral_authority_test_peer.hpp"
 
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
+#include <string.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -51,6 +57,153 @@ public:
 private:
 	uint64_t now_ms_;
 	bool force_timeout_;
+};
+
+struct LifecycleSaveNode {
+	int descriptor;
+	struct stat identity;
+	uint64_t mount_id;
+};
+
+// The real adapter is kept intact; this is only its filesystem boundary. The
+// bug caught below is that a positive adapter close receipt was not composable
+// through the real lifecycle after a retained root-prefix acquisition failure.
+class LifecycleSaveFileSystem final : public linux_native::NativeSaveFileSystem {
+public:
+	explicit LifecycleSaveFileSystem(int failing_mount_call,
+		bool corrupt_system_entry_after_create = false,
+		bool fail_first_root_open_once = false, uint64_t now_ms = 100)
+		: failing_mount_call_(failing_mount_call), mount_calls_(0), trace_(),
+		  corrupt_system_entry_after_create_(corrupt_system_entry_after_create),
+		  file_created_(false), fail_first_root_open_once_(fail_first_root_open_once),
+		  now_ms_(now_ms), operation_count_(0),
+		  root_(Node(10, 1, S_IFDIR | 0755, 0, 0)),
+		  parent_(Node(11, 2, S_IFDIR | 0755, 0, 0)),
+		  save_root_(Node(12, 3, S_IFDIR | 0700, 1000, 1000)),
+		  system_(Node(13, 4, S_IFDIR | 0700, 1000, 1000)),
+		  file_(Node(14, 5, S_IFREG | 0600, 1000, 1000)) {}
+
+	uint64_t NowMs() const override { return now_ms_; }
+	linux_native::NativeSaveOpenResult OpenAt(int parent, const char *name,
+		int flags, mode_t) override
+	{
+		++operation_count_;
+		assert((flags & O_NOFOLLOW) != 0);
+		if (parent == AT_FDCWD && strcmp(name, "/") == 0 &&
+			fail_first_root_open_once_) {
+			fail_first_root_open_once_ = false;
+			return {-1, EIO};
+		}
+		if (parent == AT_FDCWD && strcmp(name, "/") == 0) return {10, 0};
+		if (parent == 10 && strcmp(name, "fogcast-fixture") == 0) return {11, 0};
+		if (parent == 11 && strcmp(name, "saves") == 0) return {12, 0};
+		if (parent == 12 && strcmp(name, "snes") == 0) return {13, 0};
+		if (parent == 13 && strstr(name, ".sav") != nullptr) {
+			if (corrupt_system_entry_after_create_ && !file_created_) {
+				if ((flags & O_CREAT) == 0) return {-1, ENOENT};
+				file_created_ = true;
+			}
+			return {14, 0};
+		}
+		return {-1, ENOENT};
+	}
+	int Stat(int descriptor, struct stat *info) override
+	{
+		++operation_count_;
+		const LifecycleSaveNode *const node = NodeFor(descriptor);
+		if (node == nullptr || info == nullptr) return -1;
+		*info = node->identity;
+		return 0;
+	}
+	int StatAt(int parent, const char *name, struct stat *info, int flags) override
+	{
+		++operation_count_;
+		assert((flags & AT_SYMLINK_NOFOLLOW) != 0);
+		const LifecycleSaveNode *node = nullptr;
+		if (parent == 10 && strcmp(name, "fogcast-fixture") == 0) node = &parent_;
+		else if (parent == 11 && strcmp(name, "saves") == 0) node = &save_root_;
+		else if (parent == 12 && strcmp(name, "snes") == 0) node = &system_;
+		else if (parent == 13 && strstr(name, ".sav") != nullptr) node = &file_;
+		if (node == nullptr || info == nullptr) return -1;
+		*info = node->identity;
+		if (corrupt_system_entry_after_create_ && parent == 12 &&
+			strcmp(name, "snes") == 0)
+			++info->st_ino;
+		return 0;
+	}
+	Result MountId(int descriptor, uint64_t *mount_id) override
+	{
+		++operation_count_;
+		++mount_calls_;
+		if (mount_calls_ == failing_mount_call_) return MISTER_RESULT_PLATFORM;
+		const LifecycleSaveNode *const node = NodeFor(descriptor);
+		if (node == nullptr || mount_id == nullptr) return MISTER_RESULT_PLATFORM;
+		*mount_id = node->mount_id;
+		return MISTER_RESULT_OK;
+	}
+	int Fdatasync(int descriptor) override
+	{
+		++operation_count_;
+		trace_.push_back('d');
+		return NodeFor(descriptor) == nullptr ? -1 : 0;
+	}
+	int Fsync(int descriptor) override
+	{
+		++operation_count_;
+		trace_.push_back(descriptor == 14 ? 'f' : 's');
+		return NodeFor(descriptor) == nullptr ? -1 : 0;
+	}
+	int Close(int descriptor) override
+	{
+		++operation_count_;
+		trace_.push_back(static_cast<char>('0' + descriptor - 10));
+		return NodeFor(descriptor) == nullptr ? -1 : 0;
+	}
+	const std::vector<char> &trace() const { return trace_; }
+	size_t operation_count() const { return operation_count_; }
+	void SetNow(uint64_t now_ms) { now_ms_ = now_ms; }
+	void RestoreSystemDirectoryEntry()
+	{
+		corrupt_system_entry_after_create_ = false;
+	}
+
+private:
+	static LifecycleSaveNode Node(int descriptor, ino_t inode, mode_t mode,
+		uid_t uid, gid_t gid)
+	{
+		LifecycleSaveNode node = {};
+		node.descriptor = descriptor;
+		node.identity.st_dev = static_cast<dev_t>(0x6f6f);
+		node.identity.st_ino = static_cast<ino_t>(0x6f600 + inode);
+		node.identity.st_mode = mode;
+		node.identity.st_nlink = 1;
+		node.identity.st_uid = uid;
+		node.identity.st_gid = gid;
+		node.mount_id = 77;
+		return node;
+	}
+	const LifecycleSaveNode *NodeFor(int descriptor) const
+	{
+		const LifecycleSaveNode *const nodes[] = {
+			&root_, &parent_, &save_root_, &system_, &file_};
+		for (size_t index = 0; index < sizeof(nodes) / sizeof(nodes[0]); ++index)
+			if (nodes[index]->descriptor == descriptor) return nodes[index];
+		return nullptr;
+	}
+
+	int failing_mount_call_;
+	int mount_calls_;
+	std::vector<char> trace_;
+	bool corrupt_system_entry_after_create_;
+	bool file_created_;
+	bool fail_first_root_open_once_;
+	uint64_t now_ms_;
+	size_t operation_count_;
+	LifecycleSaveNode root_;
+	LifecycleSaveNode parent_;
+	LifecycleSaveNode save_root_;
+	LifecycleSaveNode system_;
+	LifecycleSaveNode file_;
 };
 
 enum class Event : uint8_t {
@@ -172,6 +325,11 @@ public:
 	{
 		activation_delay_event_ = event;
 		activation_delay_ms_ = delay_ms;
+	}
+
+	void AdvanceBrokerClockAfterSaveCleanup(uint64_t now_ms)
+	{
+		advance_broker_clock_after_save_cleanup_ms_ = now_ms;
 	}
 
 	void ExpectActivationDeadline(uint64_t deadline_ms)
@@ -411,15 +569,40 @@ public:
 			lease.absolute_deadline_ms());
 	}
 	void CloseOffloadForProcessExit() override { Record(Event::destruct_offload); }
-	NativeAcquisitionOutcome OpenSave(const OperationLease &lease) override
+	NativeSaveOpenOutcome OpenSave(const OperationLease &lease,
+		const NativeCoreProfile &profile, const NativeSaveKey &key) override
 	{
-		return Acquire(Event::open_save, lease.absolute_deadline_ms());
+		save_profile_ = &profile;
+		save_key_ = key;
+		const NativeAcquisitionOutcome outcome = Acquire(Event::open_save,
+			lease.absolute_deadline_ms());
+		return {outcome.result, outcome.acquired};
 	}
-	Result FlushAndCloseSave(const OperationLease &lease) override
+	NativeSaveCloseOutcome FlushAndCloseSave(const OperationLease &lease) override
 	{
-		return RunBounded(Event::flush_close_save, lease.absolute_deadline_ms());
+		if (first_save_cleanup_lease_ == nullptr)
+			first_save_cleanup_lease_ = &lease;
+		else
+			save_cleanup_lease_reused_ = first_save_cleanup_lease_ == &lease;
+		bounded_events.push_back(Event::flush_close_save);
+		bounded_deadlines.push_back(lease.absolute_deadline_ms());
+		const Result result = Run(Event::flush_close_save);
+		if (result == MISTER_RESULT_OK &&
+			advance_broker_clock_after_save_cleanup_ms_ != 0)
+			clock_.SetNow(advance_broker_clock_after_save_cleanup_ms_);
+		const bool complete = result == MISTER_RESULT_OK;
+		return {result, complete, complete, complete, false};
 	}
+	NativeSaveCloseOutcome RecoverSave(const OperationLease &,
+		const SafeSaveRecoveryRecord &) override
+	{ return {MISTER_RESULT_UNSUPPORTED, false, false, false, false}; }
 	void CloseSaveForProcessExit() override { Record(Event::destruct_save); }
+	Result DeriveSaveKey(const NativeCoreProfile &profile, NativeSaveKey *key) override
+	{
+		return key != nullptr && MakeNativeSaveKey(profile,
+			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			key) ? MISTER_RESULT_OK : MISTER_RESULT_PLATFORM;
+	}
 	NativeAcquisitionOutcome RetainContent(uint64_t absolute_deadline_ms) override
 	{
 		content_saw_live_generation_ = broker_.has_live_generation_for_test();
@@ -521,6 +704,7 @@ public:
 	bool fail_enabled_;
 	Event activation_delay_event_;
 	uint64_t activation_delay_ms_;
+	uint64_t advance_broker_clock_after_save_cleanup_ms_ = 0;
 	uint64_t expected_deadline_ms_;
 	bool saw_wrong_deadline_;
 	bool content_saw_live_generation_;
@@ -530,6 +714,10 @@ public:
 	std::vector<NativeDigitalNeutral> neutral_;
 	const NativeCoreProfile *protocol_profile_;
 	NativeContentResource *protocol_content_;
+	const NativeCoreProfile *save_profile_ = nullptr;
+	NativeSaveKey save_key_ = {};
+	const OperationLease *first_save_cleanup_lease_ = nullptr;
+	bool save_cleanup_lease_reused_ = false;
 	const NativeCoreProfile *shutdown_protocol_profile_;
 	MalformedProtocolOutcome malformed_protocol_outcome_;
 	bool abandon_core_protocol_release_once_ = false;
@@ -695,6 +883,60 @@ private:
 	}
 };
 
+class LifecycleContainmentIo final : public NativeContainmentIo {
+public:
+	Result WriteCoreReset(const Access &, uint32_t, uint32_t) override
+	{ return MISTER_RESULT_OK; }
+	Result WriteInterfaceModule(const Access &, uint32_t) override
+	{ return MISTER_RESULT_OK; }
+	Result WriteSdrPortControl(const Access &, uint32_t, uint32_t) override
+	{ return MISTER_RESULT_OK; }
+	Result WriteBridgeReset(const Access &, uint32_t) override
+	{ return MISTER_RESULT_OK; }
+	Result WriteRemap(const Access &, uint32_t) override
+	{ return MISTER_RESULT_OK; }
+	Result ReadCoreGpo(const Access &, uint32_t *value) override
+	{ if (value == nullptr) return MISTER_RESULT_INVALID_ARGUMENT; *value = 0x40000000u; return MISTER_RESULT_OK; }
+	Result ReadInterfaceModule(const Access &, uint32_t *value) override
+	{ if (value == nullptr) return MISTER_RESULT_INVALID_ARGUMENT; *value = 0; return MISTER_RESULT_OK; }
+	Result ReadSdrPortControl(const Access &, uint32_t, uint32_t *value) override
+	{ if (value == nullptr) return MISTER_RESULT_INVALID_ARGUMENT; *value = 0; return MISTER_RESULT_OK; }
+	Result ReadBridgeReset(const Access &, uint32_t *value) override
+	{ if (value == nullptr) return MISTER_RESULT_INVALID_ARGUMENT; *value = 7; return MISTER_RESULT_OK; }
+	Result ReadRemap(const Access &, uint32_t *value) override
+	{ if (value == nullptr) return MISTER_RESULT_INVALID_ARGUMENT; *value = 1; return MISTER_RESULT_OK; }
+	Result ReleaseMappings(const Access &) override { return MISTER_RESULT_OK; }
+};
+
+class LifecycleHardwareWithContainment final : public NativeHardwareResources {
+public:
+	LifecycleHardwareWithContainment(FakeResources &delegate,
+		NativeContainment &containment)
+		: delegate_(delegate), containment_(containment) {}
+	NativeAcquisitionOutcome AcquireFpga(const OperationLease &lease) override
+	{ return delegate_.AcquireFpga(lease); }
+	NativeAcquisitionOutcome EnableBridges(const OperationLease &lease) override
+	{ return delegate_.EnableBridges(lease); }
+	NativeCoreProtocolOutcome StartCoreProtocol(const OperationLease &lease,
+		const NativeCoreProfile &profile, NativeContentResource &content) override
+	{ return delegate_.StartCoreProtocol(lease, profile, content); }
+	Result ReplayDigitalNeutral(const OperationLease &lease,
+		const NativeDigitalNeutral &neutral) override
+	{ return delegate_.ReplayDigitalNeutral(lease, neutral); }
+	Result ShutdownCoreProtocol(const OperationLease &lease) override
+	{ return delegate_.ShutdownCoreProtocol(lease); }
+	Result TerminalFpgaCleanup(const OperationLease &lease) override
+	{ return containment_.ResetAndContain(lease); }
+	void CloseCoreProtocolForProcessExit() override
+	{ delegate_.CloseCoreProtocolForProcessExit(); }
+	void CloseFpgaMappingsForProcessExit() override
+	{ delegate_.CloseFpgaMappingsForProcessExit(); }
+
+private:
+	FakeResources &delegate_;
+	NativeContainment &containment_;
+};
+
 const Event kActivationEvents[] = {
 	Event::acquire_fpga,
 	Event::enable_bridges,
@@ -799,10 +1041,178 @@ void TestSuccessfulInitializationRecordsEveryAcquisition()
 	assert(fixture.lifecycle.ledger().input_descriptors);
 	assert(!fixture.resources.saw_wrong_deadline_);
 	assert(fixture.resources.Count(Event::retain_content) == 1);
+	assert(fixture.resources.save_profile_ == &fixture.profile);
+	assert(fixture.resources.save_key_.system_id == NativeSystem::snes);
 	for (size_t index = 0;
 		index < sizeof(kActivationEvents) / sizeof(kActivationEvents[0]); ++index) {
 		assert(fixture.resources.Count(kActivationEvents[index]) == 1);
 	}
+}
+
+void TestRealAdapterRootPrefixFailuresReleaseSavesAndLeaveTheGeneration()
+{
+	const int mount_failures[] = {1, 4};
+	for (int failing_mount_call : mount_failures) {
+		FakeClock clock(100);
+		HardwareBroker broker(clock);
+		FakeResources resources(clock, broker);
+		LifecycleContainmentIo containment_io;
+		NativeContainment containment(broker, containment_io);
+		LifecycleHardwareWithContainment hardware(resources, containment);
+		LifecycleSaveFileSystem filesystem(failing_mount_call);
+		linux_native::NativeSaveAdapter save(broker, filesystem);
+		NativeResourceSet set = {resources, hardware, resources, resources,
+			resources, resources, resources, save, resources, resources};
+		NativeLifecycle lifecycle(clock, broker, set);
+		const NativeCoreProfile *const profile = FixtureNativeCoreProfile("snes");
+		assert(profile != nullptr);
+
+		// Removing the lifecycle's positive cleanup handling makes this remain
+		// in cleanup with SAVES set despite the real adapter closing every fd.
+		assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
+			MISTER_RESULT_PLATFORM);
+		assert(lifecycle.state() == NativeLifecycleState::idle);
+		assert(lifecycle.generation() == 0);
+		assert(lifecycle.ledger().resource_flags == 0);
+		assert(lifecycle.Stop() == MISTER_RESULT_OK);
+		assert(filesystem.trace().size() ==
+			static_cast<size_t>(failing_mount_call));
+		assert(filesystem.trace().back() == '0');
+	}
+}
+
+void TestRealAdapterZeroDescriptorFailuresClearStateForReuse()
+{
+	struct FailureCase {
+		bool fail_first_root_open_once;
+		uint64_t save_clock_now_ms;
+		Result expected_result;
+		size_t filesystem_operations;
+	};
+	const FailureCase cases[] = {
+		{true, 100, MISTER_RESULT_PLATFORM, 1},
+		{false, 1000, MISTER_RESULT_DEADLINE, 0}
+	};
+	for (const FailureCase &test : cases) {
+		LifecycleSaveFileSystem filesystem(0, false,
+			test.fail_first_root_open_once, test.save_clock_now_ms);
+		size_t operations_before_adapter_destructor = 0;
+		{
+			FakeClock clock(100);
+			HardwareBroker broker(clock);
+			FakeResources resources(clock, broker);
+			LifecycleContainmentIo containment_io;
+			NativeContainment containment(broker, containment_io);
+			LifecycleHardwareWithContainment hardware(resources, containment);
+			linux_native::NativeSaveAdapter save(broker, filesystem);
+			NativeResourceSet set = {resources, hardware, resources, resources,
+				resources, resources, resources, save, resources, resources};
+			NativeLifecycle lifecycle(clock, broker, set);
+			const NativeCoreProfile *const profile = FixtureNativeCoreProfile("snes");
+			assert(profile != nullptr);
+
+			// These leaves acquired no descriptor, so lifecycle does not own SAVES;
+			// the real adapter must also discard every provisional authority state.
+			assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
+				test.expected_result);
+			assert(lifecycle.state() == NativeLifecycleState::idle);
+			assert(lifecycle.generation() == 0);
+			assert((lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) == 0);
+			assert(filesystem.operation_count() == test.filesystem_operations);
+			assert(lifecycle.Stop() == MISTER_RESULT_OK);
+			assert(filesystem.operation_count() == test.filesystem_operations);
+
+			filesystem.SetNow(100);
+			assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
+				MISTER_RESULT_OK);
+			assert(lifecycle.Stop() == MISTER_RESULT_OK);
+			operations_before_adapter_destructor = filesystem.operation_count();
+		}
+		assert(filesystem.operation_count() == operations_before_adapter_destructor);
+	}
+}
+
+void TestRealAdapterZeroDescriptorFailureDestructorPerformsNoIo()
+{
+	struct FailureCase {
+		bool fail_first_root_open_once;
+		uint64_t save_clock_now_ms;
+		Result expected_result;
+		size_t filesystem_operations;
+	};
+	const FailureCase cases[] = {
+		{true, 100, MISTER_RESULT_PLATFORM, 1},
+		{false, 1000, MISTER_RESULT_DEADLINE, 0}
+	};
+	for (const FailureCase &test : cases) {
+		LifecycleSaveFileSystem filesystem(0, false,
+			test.fail_first_root_open_once, test.save_clock_now_ms);
+		{
+			FakeClock clock(100);
+			HardwareBroker broker(clock);
+			FakeResources resources(clock, broker);
+			LifecycleContainmentIo containment_io;
+			NativeContainment containment(broker, containment_io);
+			LifecycleHardwareWithContainment hardware(resources, containment);
+			linux_native::NativeSaveAdapter save(broker, filesystem);
+			NativeResourceSet set = {resources, hardware, resources, resources,
+				resources, resources, resources, save, resources, resources};
+			NativeLifecycle lifecycle(clock, broker, set);
+			const NativeCoreProfile *const profile = FixtureNativeCoreProfile("snes");
+			assert(profile != nullptr);
+
+			assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
+				test.expected_result);
+			assert(lifecycle.state() == NativeLifecycleState::idle);
+			assert((lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) == 0);
+			assert(filesystem.operation_count() == test.filesystem_operations);
+		}
+		assert(filesystem.operation_count() == test.filesystem_operations);
+	}
+}
+
+void TestRealAdapterPostCreateAuthorityLossRetainsSavesUntilStableCleanup()
+{
+	FakeClock clock(100);
+	HardwareBroker broker(clock);
+	FakeResources resources(clock, broker);
+	LifecycleContainmentIo containment_io;
+	NativeContainment containment(broker, containment_io);
+	LifecycleHardwareWithContainment hardware(resources, containment);
+	LifecycleSaveFileSystem filesystem(0, true);
+	linux_native::NativeSaveAdapter save(broker, filesystem);
+	NativeResourceSet set = {resources, hardware, resources, resources,
+		resources, resources, resources, save, resources, resources};
+	NativeLifecycle lifecycle(clock, broker, set);
+	const NativeCoreProfile *const profile = FixtureNativeCoreProfile("snes");
+	assert(profile != nullptr);
+
+	// A created inode whose system entry cannot be revalidated has neither the
+	// unconditional final data-sync fact nor a stable entry proof.  Returning a
+	// positive close receipt here would incorrectly clear SAVES and Leave.
+	assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
+		MISTER_RESULT_PLATFORM);
+	assert(lifecycle.state() == NativeLifecycleState::cleanup);
+	assert(lifecycle.generation() != 0);
+	assert((lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) != 0);
+	assert(filesystem.trace().size() == 2);
+	assert(filesystem.trace()[0] == 'f');
+	assert(filesystem.trace()[1] == 's');
+
+	assert(lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(lifecycle.state() == NativeLifecycleState::cleanup);
+	assert((lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) != 0);
+	assert(filesystem.trace().size() == 2);
+
+	filesystem.RestoreSystemDirectoryEntry();
+	assert(lifecycle.Stop() == MISTER_RESULT_OK);
+	assert(lifecycle.state() == NativeLifecycleState::idle);
+	assert(lifecycle.generation() == 0);
+	assert(lifecycle.ledger().resource_flags == 0);
+	const char expected[] = {'f', 's', 'd', '4', '3', '2', '1', '0'};
+	assert(filesystem.trace().size() == sizeof(expected));
+	for (size_t index = 0; index < sizeof(expected); ++index)
+		assert(filesystem.trace()[index] == expected[index]);
 }
 
 void TestCoreProtocolReceivesAdmittedProfileAndRetainedContent()
@@ -1180,6 +1590,54 @@ void TestCoreProtocolReleaseRetryRetainsItsCleanupLease()
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
 }
 
+void TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline()
+{
+	Fixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	fixture.resources.Fail(Event::flush_close_save);
+	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+	assert(fixture.resources.Count(Event::flush_close_save) == 1);
+	assert((fixture.lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) != 0);
+	assert(fixture.resources.LastBoundedDeadline(Event::flush_close_save) ==
+		timing.non_fpga_deadline_ms);
+
+	fixture.resources.ClearFailure();
+	fixture.clock.SetNow(200);
+	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.resources.Count(Event::flush_close_save) == 2);
+	assert(fixture.resources.save_cleanup_lease_reused_);
+	assert(fixture.resources.LastBoundedDeadline(Event::flush_close_save) ==
+		timing.non_fpga_deadline_ms);
+	assert((fixture.lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) == 0);
+}
+
+void TestSaveCleanupChecksTheBrokerClockAtLedgerCommit()
+{
+	struct Case {
+		uint64_t completion_time;
+		bool save_clears;
+	};
+	const Case cases[] = {
+		{2099, true},
+		{2100, false},
+		{2101, false}
+	};
+	for (const Case &test : cases) {
+		Fixture fixture(100);
+		assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+			MISTER_RESULT_OK);
+		fixture.resources.AdvanceBrokerClockAfterSaveCleanup(test.completion_time);
+		const Result result = fixture.lifecycle.Stop();
+		const bool save_owned = (fixture.lifecycle.ledger().resource_flags &
+			MISTER_RESOURCE_SAVES) != 0;
+		assert(save_owned == !test.save_clears);
+		if (test.save_clears) assert(result == MISTER_RESULT_CLEANUP_INCOMPLETE);
+		else assert(result == MISTER_RESULT_DEADLINE);
+	}
+}
+
 void TestNormalStopUsesTheNormativeOrder()
 {
 	Fixture fixture(100);
@@ -1366,6 +1824,10 @@ int main()
 	mister::native::TestContentIsResolvedBeforeOwnershipAndRetainedOnFirstHardwareFailure();
 	mister::native::TestFirstAcquisitionIsLedgeredBeforeFollowingFailure();
 	mister::native::TestSuccessfulInitializationRecordsEveryAcquisition();
+	mister::native::TestRealAdapterRootPrefixFailuresReleaseSavesAndLeaveTheGeneration();
+	mister::native::TestRealAdapterZeroDescriptorFailuresClearStateForReuse();
+	mister::native::TestRealAdapterZeroDescriptorFailureDestructorPerformsNoIo();
+	mister::native::TestRealAdapterPostCreateAuthorityLossRetainsSavesUntilStableCleanup();
 	mister::native::TestCoreProtocolReceivesAdmittedProfileAndRetainedContent();
 	mister::native::TestRetainedContentDescriptionAndReadStayBounded();
 	mister::native::TestFailureAfterEveryAcquisitionUnwindsWithoutChangingResult();
@@ -1379,6 +1841,8 @@ int main()
 	mister::native::TestCleanupDeadlineArithmeticSaturatesWithoutWrapping();
 	mister::native::TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates();
 	mister::native::TestCoreProtocolReleaseRetryRetainsItsCleanupLease();
+	mister::native::TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline();
+	mister::native::TestSaveCleanupChecksTheBrokerClockAtLedgerCommit();
 	mister::native::TestNormalStopUsesTheNormativeOrder();
 	mister::native::TestCleanupFailureRetainsTheFailedResourceLedger();
 	mister::native::TestCleanupSuccessAtDeadlineDoesNotClearTheLedger();

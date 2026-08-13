@@ -76,8 +76,6 @@ public:
 	explicit ProtocolRecoveryIo(NativeCoreProtocol &protocol) : protocol_(protocol) {}
 	Result CloseInputDescriptors(const OperationLease &, RecoveryResourceState *)
 		override { return MISTER_RESULT_INVALID_STATE; }
-	Result FlushAndCloseSave(const OperationLease &, RecoveryResourceState *)
-		override { return MISTER_RESULT_INVALID_STATE; }
 	Result MuteAudio(const OperationLease &, RecoveryResourceState *)
 		override { return MISTER_RESULT_INVALID_STATE; }
 	Result PowerDownVideo(const OperationLease &, RecoveryResourceState *)

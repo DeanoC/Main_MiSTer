@@ -87,6 +87,9 @@ private:
 		NativePeripheralAcquisitionOutcome outcome,
 		PeripheralBrokerDisposition disposition, uint64_t resource_flags,
 		uint64_t activation_deadline_ms);
+	Result FinishSaveAcquisitionLocked(NativeSaveOpenOutcome outcome,
+		uint64_t activation_deadline_ms);
+	Result FinishSaveCleanupLocked(const NativeSaveCloseOutcome &outcome) const;
 	Result FinishPeripheralCleanupLocked(
 		const NativePeripheralReleaseOutcome &outcome,
 		PeripheralBrokerDisposition disposition) const;
@@ -129,6 +132,7 @@ private:
 	const NativeCoreProfile *profile_;
 	std::unique_ptr<CleanupEpoch> cleanup_epoch_;
 	std::unique_ptr<OperationLease> core_protocol_cleanup_lease_;
+	std::unique_ptr<OperationLease> save_cleanup_lease_;
 	std::unique_ptr<OperationLease> audio_cleanup_lease_;
 	std::unique_ptr<OperationLease> video_cleanup_lease_;
 	std::unique_ptr<OperationLease> coupled_audio_video_cleanup_lease_;

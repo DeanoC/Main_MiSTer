@@ -78,6 +78,11 @@ NATIVE_AUDIO_VIDEO_ADAPTER_OBJECTS = \
 	$(HOST_TEST_DIR)/native_av_io_adapter.o \
 	$(HOST_TEST_DIR)/native_audio_adapter.o \
 	$(HOST_TEST_DIR)/native_video_adapter.o
+NATIVE_SAVE_ADAPTER_TEST_OBJECT = $(HOST_TEST_DIR)/native_save_adapter_test.o
+NATIVE_SAVE_ADAPTER_OBJECTS = \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(HOST_TEST_DIR)/native_save_key.o \
+	$(HOST_TEST_DIR)/native_save_adapter.o
 NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT = \
 	$(HOST_TEST_DIR)/native_linux_artifact_programmer_test.o
 NATIVE_LINUX_ARTIFACT_PROGRAMMER_OBJECTS = \
@@ -128,7 +133,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 test-native-linux-core-protocol-io: \
 	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test \
@@ -154,6 +159,64 @@ test-native-audio-video-adapter-tsan:
 test-native-audio-video-adapter-production:
 	mkdir -p $(HOST_TEST_DIR)/native-audio-video-production
 	for f in runtime/native/hardware_broker.cpp runtime/native/native_peripheral_session.cpp runtime/native/native_core_profile.cpp runtime/native/native_lifecycle.cpp runtime/native/native_recovery.cpp runtime/native/linux/native_av_io_adapter.cpp runtime/native/linux/native_audio_adapter.cpp runtime/native/linux/native_video_adapter.cpp; do $(HOST_CXX) -std=c++14 $(HOST_FLAGS) -fno-exceptions -fno-rtti -I. -pthread -c $$f -o $(HOST_TEST_DIR)/native-audio-video-production/$$(basename $$f).o || exit 1; done
+
+test-native-save-adapter: $(HOST_TEST_DIR)/native_save_adapter_test
+	@privacy_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-save.XXXXXX"); \
+		trap 'rm -r "$$privacy_dir"' EXIT; \
+		if ! $(HOST_TEST_DIR)/native_save_adapter_test \
+			>"$$privacy_dir/stdout" 2>"$$privacy_dir/stderr"; then \
+			echo "native save adapter test failed; captured output withheld" >&2; \
+			exit 1; \
+		fi; \
+		if test -s "$$privacy_dir/stdout" || test -s "$$privacy_dir/stderr"; then \
+			echo "native save adapter test emitted private output" >&2; \
+			exit 1; \
+		fi; \
+		for sentinel in \
+			'/task6f-root-sentinel-2f5a' \
+			'task6f-system-sentinel-6b91' \
+			'c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de' \
+			'task6f-basename-sentinel-1d6f' \
+			'/task6f-device-sentinel-73bc' \
+			'61951' \
+			'task6f-profile-sentinel-4cd3' \
+			'task6f-core-sentinel-8e20' \
+			'task6f-game-sentinel-9a47' \
+			'456192'; do \
+			if grep -F -q "$$sentinel" "$$privacy_dir/stdout" "$$privacy_dir/stderr"; then \
+				echo "native save adapter test leaked a seeded privacy sentinel" >&2; \
+				exit 1; \
+			fi; \
+		done
+
+test-native-save-adapter-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-save-sanitize-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-save-adapter
+
+test-native-save-adapter-tsan:
+	TSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-save-tsan-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' test-native-save-adapter
+
+test-native-save-adapter-production: test-native-save-adapter-reachability
+	mkdir -p $(HOST_TEST_DIR)/native-save-production
+	for f in runtime/native/hardware_broker.cpp runtime/native/native_core_profile.cpp runtime/native/native_save_key.cpp runtime/native/native_lifecycle.cpp runtime/native/native_recovery.cpp runtime/native/linux/native_save_adapter.cpp; do $(HOST_CXX) -std=c++14 $(HOST_FLAGS) -fno-exceptions -fno-rtti -I. -pthread -c $$f -o $(HOST_TEST_DIR)/native-save-production/$$(basename $$f).o || exit 1; done
+	@if nm -g $(HOST_TEST_DIR)/native-save-production/native_save_adapter.cpp.o | \
+		grep -E 'NativeSave(FileSystem|OpenResult)|HardwareLeaseView|NativeAvIo' >/dev/null; then \
+		echo "production save adapter exports fixture or hardware authority" >&2; \
+		exit 1; \
+	fi
+
+test-native-save-adapter-reachability:
+	@probe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-save-probe.XXXXXX"); \
+		trap 'rm -r "$$probe_dir"' EXIT; \
+		if $(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_SAVE_TESTING \
+			-DMISTER_NATIVE_SAVE_REACHABILITY_PROBE -I. -fsyntax-only \
+			tests/native_save_adapter_test.cpp >"$$probe_dir/out" 2>"$$probe_dir/err"; then \
+			echo "production save header exposes fixture filesystem authority" >&2; \
+			exit 1; \
+		fi; \
+		if ! grep 'NativeSaveFileSystem' "$$probe_dir/err" >/dev/null; then \
+			echo "save fixture-authority probe failed for an unrelated reason" >&2; \
+			exit 1; \
+		fi
 
 test-native-core-protocol-capability-reachability: \
 	$(HOST_TEST_DIR)/native_core_protocol_capability_reachability_test
@@ -397,7 +460,27 @@ test-native-core-protocol-dependency-invalidation:
 			if ! $(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" -W "$$header" -n "$$target" | grep -F -- "$$expected" >/dev/null; then \
 				echo "missing timestamp invalidation: $$header -> $$target" >&2; \
 				exit 1; \
-			fi; \
+		fi; \
+	done
+
+test-native-save-dependency-invalidation:
+	@probe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-save-deps.XXXXXX"); \
+		trap 'rm -r "$$probe_dir"' EXIT; \
+		for check in \
+			'native_lifecycle.o:runtime/native/native_lifecycle.cpp' \
+			'native_recovery.o:runtime/native/native_recovery.cpp' \
+			'native_content_adapter.o:runtime/native/linux/native_content_adapter.cpp' \
+			'native_linux_artifact_programmer_test.o:tests/native_linux_artifact_programmer_test.cpp' \
+			'native_save_adapter_test.o:tests/native_save_adapter_test.cpp'; do \
+			object=$${check%%:*}; source=$${check#*:}; target="$$probe_dir/$$object"; \
+			$(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" "$$target" >/dev/null || exit 1; \
+			for header in runtime/native/native_save_key.hpp runtime/native/native_resources.hpp; do \
+				if ! $(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" -W "$$header" -n "$$target" | \
+					grep -F -- "-c $$source" >/dev/null; then \
+					echo "save dependency invalidation missing: $$object <- $$header" >&2; \
+					exit 1; \
+				fi; \
+			done; \
 		done
 
 test-native-input: $(HOST_TEST_DIR)/native_input_test
@@ -692,13 +775,15 @@ $(NATIVE_INPUT_OBJECT): runtime/native/native_input.cpp \
 $(NATIVE_LIFECYCLE_TEST_OBJECT): tests/native_lifecycle_test.cpp \
 	tests/native_core_protocol_authority_test_peer.hpp \
 	runtime/native/native_lifecycle.hpp runtime/native/native_resources.hpp \
+	runtime/native/native_save_key.hpp runtime/native/linux/native_save_adapter.hpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp \
 	runtime/native/native_core_profile.hpp \
 	runtime/native/native_core_protocol.hpp | $(HOST_TEST_DIR)
-	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_SAVE_TESTING -I. -pthread -c $< -o $@
 
 $(NATIVE_LIFECYCLE_OBJECT): runtime/native/native_lifecycle.cpp \
 	runtime/native/native_lifecycle.hpp runtime/native/native_resources.hpp \
+	runtime/native/native_save_key.hpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp \
 	runtime/native/native_core_profile.hpp | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
@@ -717,12 +802,15 @@ $(NATIVE_CONTAINMENT_OBJECT): runtime/native/native_containment.cpp \
 $(NATIVE_RECOVERY_TEST_OBJECT): tests/native_recovery_test.cpp \
 	tests/native_core_protocol_authority_test_peer.hpp \
 	runtime/native/native_recovery.hpp runtime/native/native_containment.hpp \
+	runtime/native/linux/native_save_adapter.hpp runtime/native/native_save_key.hpp \
+	runtime/native/native_resources.hpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_core_profile.hpp \
 	runtime/native/native_core_protocol.hpp | $(HOST_TEST_DIR)
-	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_SAVE_TESTING -I. -pthread -c $< -o $@
 
 $(NATIVE_RECOVERY_OBJECT): runtime/native/native_recovery.cpp \
 	runtime/native/native_recovery.hpp runtime/native/hardware_broker.hpp \
+	runtime/native/native_resources.hpp runtime/native/native_save_key.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
@@ -737,8 +825,9 @@ $(HOST_TEST_DIR)/native_input_test: $(NATIVE_INPUT_TEST_OBJECT) \
 
 $(HOST_TEST_DIR)/native_lifecycle_test: $(NATIVE_LIFECYCLE_TEST_OBJECT) \
 	$(NATIVE_LIFECYCLE_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
-	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
-	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) $(NATIVE_SAVE_ADAPTER_OBJECTS) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CONTAINMENT_OBJECT) \
+	$(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -752,7 +841,7 @@ $(HOST_TEST_DIR)/native_containment_test: $(NATIVE_CONTAINMENT_TEST_OBJECT) \
 $(HOST_TEST_DIR)/native_recovery_test: $(NATIVE_RECOVERY_TEST_OBJECT) \
 	$(NATIVE_RECOVERY_OBJECT) $(NATIVE_CONTAINMENT_OBJECT) \
 	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
-	$(NATIVE_CORE_PROFILE_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_SAVE_ADAPTER_OBJECTS) \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -806,6 +895,27 @@ $(HOST_TEST_DIR)/native_audio_video_adapter_test: \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
+$(NATIVE_SAVE_ADAPTER_TEST_OBJECT): tests/native_save_adapter_test.cpp \
+	runtime/native/native_save_key.hpp runtime/native/native_core_profile.hpp \
+	runtime/native/linux/native_save_adapter.hpp runtime/native/hardware_broker.hpp \
+	runtime/native/native_resources.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_SAVE_TESTING -I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_save_key.o: runtime/native/native_save_key.cpp \
+	runtime/native/native_save_key.hpp runtime/native/native_core_profile.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_SAVE_TESTING -I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_save_adapter.o: runtime/native/linux/native_save_adapter.cpp \
+	runtime/native/linux/native_save_adapter.hpp runtime/native/native_save_key.hpp \
+	runtime/native/native_resources.hpp runtime/native/hardware_broker.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_SAVE_TESTING -I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_save_adapter_test: $(NATIVE_SAVE_ADAPTER_TEST_OBJECT) \
+	$(NATIVE_SAVE_ADAPTER_OBJECTS) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_SNES_CONTENT_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
+
 $(NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT): \
 	tests/native_linux_artifact_programmer_test.cpp \
 	runtime/native/linux/native_core_artifact_adapter.hpp \
@@ -813,6 +923,7 @@ $(NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT): \
 	runtime/native/linux/native_fpga_programmer.hpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_core_profile.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_resources.hpp \
+	runtime/native/native_save_key.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
 
@@ -820,7 +931,7 @@ $(HOST_TEST_DIR)/native_linux_artifact_programmer_test: \
 	$(NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT) \
 	$(NATIVE_LINUX_ARTIFACT_PROGRAMMER_OBJECTS) \
 	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
-	$(NATIVE_CORE_PROFILE_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(HOST_TEST_DIR)/native_save_key.o \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -841,6 +952,7 @@ $(HOST_TEST_DIR)/native_content_adapter.o: runtime/native/linux/native_content_a
 	runtime/native/linux/native_core_artifact_adapter.hpp \
 	runtime/native/native_resources.hpp runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
+	runtime/native/native_save_key.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -pthread -c $< -o $@
 

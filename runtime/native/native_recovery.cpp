@@ -10,7 +10,7 @@ namespace native {
 
 NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io)
 	: broker_(broker), io_(io), audio_(nullptr), video_(nullptr),
-	  audio_video_(nullptr), containment_(nullptr), retained_epoch_(nullptr),
+	  audio_video_(nullptr), save_(nullptr), containment_(nullptr), retained_epoch_(nullptr),
 	  retained_kind_(RetainedRecoveryKind::none), retained_lease_()
 {
 }
@@ -19,7 +19,7 @@ NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
 	NativeAudioResource &audio, NativeVideoResource &video,
 	NativeAudioVideoResource &audio_video)
 	: broker_(broker), io_(io), audio_(&audio), video_(&video),
-	  audio_video_(&audio_video), containment_(nullptr), retained_epoch_(nullptr),
+	  audio_video_(&audio_video), save_(nullptr), containment_(nullptr), retained_epoch_(nullptr),
 	  retained_kind_(RetainedRecoveryKind::none), retained_lease_()
 {
 }
@@ -28,7 +28,28 @@ NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
 	NativeAudioResource &audio, NativeVideoResource &video,
 	NativeAudioVideoResource &audio_video, NativeContainment &containment)
 	: broker_(broker), io_(io), audio_(&audio), video_(&video),
-	  audio_video_(&audio_video), containment_(&containment),
+	  audio_video_(&audio_video), save_(nullptr), containment_(&containment),
+	  retained_epoch_(nullptr), retained_kind_(RetainedRecoveryKind::none),
+	  retained_lease_()
+{
+}
+
+NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
+	NativeAudioResource &audio, NativeVideoResource &video,
+	NativeAudioVideoResource &audio_video, NativeSaveResource &save)
+	: broker_(broker), io_(io), audio_(&audio), video_(&video),
+	  audio_video_(&audio_video), save_(&save), containment_(nullptr),
+	  retained_epoch_(nullptr), retained_kind_(RetainedRecoveryKind::none),
+	  retained_lease_()
+{
+}
+
+NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
+	NativeAudioResource &audio, NativeVideoResource &video,
+	NativeAudioVideoResource &audio_video, NativeSaveResource &save,
+	NativeContainment &containment)
+	: broker_(broker), io_(io), audio_(&audio), video_(&video),
+	  audio_video_(&audio_video), save_(&save), containment_(&containment),
 	  retained_epoch_(nullptr), retained_kind_(RetainedRecoveryKind::none),
 	  retained_lease_()
 {
@@ -40,7 +61,8 @@ Result NativeRecovery::BeginTypedRecovery(const RecoveryEpoch &epoch,
 	const RetainedRecoveryKind kind = operation_kind == OperationKind::audio ?
 		RetainedRecoveryKind::audio : operation_kind == OperationKind::video ?
 		RetainedRecoveryKind::video : operation_kind == OperationKind::audio_video ?
-		RetainedRecoveryKind::audio_video : RetainedRecoveryKind::none;
+		RetainedRecoveryKind::audio_video : operation_kind == OperationKind::save ?
+		RetainedRecoveryKind::save : RetainedRecoveryKind::none;
 	if (kind == RetainedRecoveryKind::none) return MISTER_RESULT_INVALID_ARGUMENT;
 	if (retained_kind_ != RetainedRecoveryKind::none) {
 		return retained_epoch_ == &epoch && retained_kind_ == kind &&
@@ -88,7 +110,8 @@ Result NativeRecovery::Perform(const RecoveryEpoch &epoch,
 		  RetainedRecoveryKind::core_protocol : operation_kind == OperationKind::audio ?
 		  RetainedRecoveryKind::audio : operation_kind == OperationKind::video ?
 		  RetainedRecoveryKind::video : operation_kind == OperationKind::audio_video ?
-		  RetainedRecoveryKind::audio_video : RetainedRecoveryKind::none) !=
+		  RetainedRecoveryKind::audio_video : operation_kind == OperationKind::save ?
+		  RetainedRecoveryKind::save : RetainedRecoveryKind::none) !=
 			retained_kind_))
 		return MISTER_RESULT_INVALID_STATE;
 	if (operation_kind == OperationKind::core_protocol) {
@@ -220,6 +243,26 @@ Result NativeRecovery::Perform(const RecoveryEpoch &epoch,
 		if (result == MISTER_RESULT_OK) ClearRetainedRecovery();
 		return result;
 	}
+	if (operation_kind == OperationKind::save && save_ != nullptr) {
+		const SafeSaveRecoveryRecord *const record = io_.SafeSaveRecord();
+		if (record == nullptr) return MISTER_RESULT_UNSUPPORTED;
+		Result result = BeginTypedRecovery(epoch, operation_kind);
+		if (result != MISTER_RESULT_OK) return result;
+		const NativeSaveCloseOutcome outcome = save_->RecoverSave(*retained_lease_,
+			*record);
+		if (outcome.result != MISTER_RESULT_OK || !outcome.data_synchronized ||
+			!outcome.metadata_synchronized || !outcome.descriptors_absent ||
+			outcome.closure_unknown)
+			return outcome.result == MISTER_RESULT_OK ?
+				MISTER_RESULT_CLEANUP_INCOMPLETE : outcome.result;
+		result = broker_.RecordRecoveryOperation(epoch, *retained_lease_,
+			RecoveryResourceState::neutral, outcome.result);
+		if (result == MISTER_RESULT_OK) ClearRetainedRecovery();
+		return result;
+	}
+	// Save recovery has no generic scalar route. It must be performed by the
+	// typed save resource with an exact safe recovery identity.
+	if (operation_kind == OperationKind::save) return MISTER_RESULT_UNSUPPORTED;
 	std::unique_ptr<OperationLease> lease;
 	Result result = broker_.BeginRecoveryOperation(epoch, operation_kind,
 		&lease);
@@ -234,8 +277,7 @@ Result NativeRecovery::Perform(const RecoveryEpoch &epoch,
 		result = io_.CloseInputDescriptors(*lease, &state);
 		break;
 	case OperationKind::save:
-		result = io_.FlushAndCloseSave(*lease, &state);
-		break;
+		return MISTER_RESULT_UNSUPPORTED;
 	case OperationKind::audio:
 		result = io_.MuteAudio(*lease, &state);
 		break;

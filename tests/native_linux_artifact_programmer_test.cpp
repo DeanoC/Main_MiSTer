@@ -212,6 +212,10 @@ void TestContentRetainsExactDescriptorAndRechecksEntry()
 	NativeAcquisitionOutcome retained = content.RetainContent(deadline);
 	assert(retained.result == MISTER_RESULT_OK);
 	assert(retained.acquired);
+	NativeSaveKey save_key = {};
+	assert(content.DeriveSaveKey(*FixtureNativeCoreProfile("snes"), &save_key) ==
+		MISTER_RESULT_OK);
+	assert(save_key.system_id == NativeSystem::snes);
 	char bytes[5] = {};
 	assert(content.ReadAt(0, bytes, sizeof(bytes), deadline) == MISTER_RESULT_OK);
 	assert(memcmp(bytes, "hello", sizeof(bytes)) == 0);
@@ -223,6 +227,42 @@ void TestContentRetainsExactDescriptorAndRechecksEntry()
 	assert(content.CloseContent(deadline) == MISTER_RESULT_OK);
 	assert(!content.active());
 	RemoveArtifactTree(root, "snes", name);
+}
+
+void TestRetainedContentSystemMustMatchTheAdmittedSaveProfile()
+{
+	struct Case {
+		const char *retained_system;
+		size_t retained_system_length;
+		const char *extension;
+		const char *admitted_system;
+	};
+	const Case cases[] = {
+		{"snes", 4, "sfc", "megadrive"},
+		{"megadrive", 9, "gen", "snes"}
+	};
+	for (const Case &test : cases) {
+		const std::string root = TemporaryRoot();
+		assert(mkdir(Join(root, test.retained_system).c_str(), 0700) == 0);
+		const std::string name =
+			"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824." +
+			std::string(test.extension);
+		WriteFile(Join(Join(root, test.retained_system), name), "hello");
+		NativePosixFileSystem filesystem;
+		NativeContentAdapter content(root.c_str(), filesystem);
+		NativeArtifactAuthority authority = HelloAuthority(test.retained_system,
+			test.retained_system_length);
+		authority.extension = test.extension;
+		authority.extension_length = strlen(test.extension);
+		assert(content.Configure(authority) == MISTER_RESULT_OK);
+		const uint64_t deadline = filesystem.NowMs() + 1000;
+		assert(content.RetainContent(deadline).result == MISTER_RESULT_OK);
+		NativeSaveKey key = {};
+		assert(content.DeriveSaveKey(*FixtureNativeCoreProfile(test.admitted_system),
+			&key) == MISTER_RESULT_UNSUPPORTED);
+		assert(content.CloseContent(deadline) == MISTER_RESULT_OK);
+		RemoveArtifactTree(root, test.retained_system, name);
+	}
 }
 
 class TestClock final : public NativeClock {
@@ -1184,6 +1224,7 @@ void RunAllTests()
 	TestSha256KnownAnswersAndExactLength();
 	TestSecureArtifactResolutionAndComponents();
 	TestContentRetainsExactDescriptorAndRechecksEntry();
+	TestRetainedContentSystemMustMatchTheAdmittedSaveProfile();
 	TestContentCloseIsObservedAndRetryable();
 	TestContentCloseHonorsEveryObservationDeadline();
 	TestContentReadAtFailureAndDeadlineBoundaries();

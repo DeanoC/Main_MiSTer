@@ -21,6 +21,8 @@ public:
 	NativeContentAdapter(const char *root, NativeFileSystem &filesystem);
 	~NativeContentAdapter() override;
 	Result Configure(const NativeArtifactAuthority &authority);
+	Result DeriveSaveKey(const NativeCoreProfile &profile,
+		NativeSaveKey *key) override;
 	NativeAcquisitionOutcome RetainContent(
 		uint64_t absolute_deadline_ms) override;
 	Result DescribeRetained(NativeRetainedContentDescription *description,

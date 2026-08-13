@@ -13,6 +13,62 @@ namespace {
 
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 
+const NativeSaveDirectoryAuthority kSnesSaveChain[] = {
+	{"/", 0, 0, 0755, NativeSaveDirectoryRole::root_anchor,
+		NativeSaveMountRelation::root_anchor,
+		NativeSaveDeviceRelation::root_anchor},
+	{"fogcast-fixture", 0, 0, 0755,
+		NativeSaveDirectoryRole::immutable_parent,
+		NativeSaveMountRelation::same_mount_as_parent,
+		NativeSaveDeviceRelation::same_device_as_parent},
+	{"saves", 1000, 1000, 0700, NativeSaveDirectoryRole::save_root,
+		NativeSaveMountRelation::same_mount_as_parent,
+		NativeSaveDeviceRelation::same_device_as_parent},
+	{"snes", 1000, 1000, 0700,
+		NativeSaveDirectoryRole::system_directory,
+		NativeSaveMountRelation::same_mount_as_parent,
+		NativeSaveDeviceRelation::same_device_as_parent}
+};
+
+const NativeSaveDirectoryAuthority kMegaDriveSaveChain[] = {
+	{"/", 0, 0, 0755, NativeSaveDirectoryRole::root_anchor,
+		NativeSaveMountRelation::root_anchor,
+		NativeSaveDeviceRelation::root_anchor},
+	{"fogcast-fixture", 0, 0, 0755,
+		NativeSaveDirectoryRole::immutable_parent,
+		NativeSaveMountRelation::same_mount_as_parent,
+		NativeSaveDeviceRelation::same_device_as_parent},
+	{"saves", 1000, 1000, 0700, NativeSaveDirectoryRole::save_root,
+		NativeSaveMountRelation::same_mount_as_parent,
+		NativeSaveDeviceRelation::same_device_as_parent},
+	{"megadrive", 1000, 1000, 0700,
+		NativeSaveDirectoryRole::system_directory,
+		NativeSaveMountRelation::same_mount_as_parent,
+		NativeSaveDeviceRelation::same_device_as_parent}
+};
+
+const NativeSaveRootAuthority kSnesSaveRoot = {
+	"/fogcast-fixture/saves/snes", kSnesSaveChain,
+	sizeof(kSnesSaveChain) / sizeof(kSnesSaveChain[0]), 1000, 1000, 0600};
+const NativeSaveRootAuthority kMegaDriveSaveRoot = {
+	"/fogcast-fixture/saves/megadrive", kMegaDriveSaveChain,
+	sizeof(kMegaDriveSaveChain) / sizeof(kMegaDriveSaveChain[0]),
+	1000, 1000, 0600};
+
+const SafeSaveRecoveryRecord kSnesSaveRecovery = {
+	NativeProfileAuthority::fixture, NativeSystem::snes, &kSnesSaveRoot,
+	{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+	 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+	 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+	 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}};
+const SafeSaveRecoveryRecord kMegaDriveSaveRecovery = {
+	NativeProfileAuthority::fixture, NativeSystem::megadrive,
+	&kMegaDriveSaveRoot,
+	{0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+	 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+	 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+	 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10}};
+
 const NativeCoreProfile kSnesProfile = {
 	NativeSystem::snes, "snes", "SNES", {"sfc", "smc", "bin"},
 	{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -38,6 +94,8 @@ const NativeCoreProfile kSnesProfile = {
 		MISTER_RESOURCE_NATIVE_VIDEO, {0x0400, 0x0000}, 0,
 		0, 0, 0, 0x39, 0x10, 0x50, 0xff, 0x10, 0x50,
 		true, true, true, true, true, true},
+	{NativeSaveMode::single_slot_growable_block_file, 512, 512 * 1024,
+		0, 0, 0, &kSnesSaveRoot},
 	NativeProfileAuthority::fixture
 };
 
@@ -66,6 +124,8 @@ const NativeCoreProfile kMegaDriveProfile = {
 		MISTER_RESOURCE_NATIVE_VIDEO, {0x0500, 0x0000}, 0,
 		0, 0, 0, 0x39, 0x10, 0x50, 0xff, 0x10, 0x50,
 		true, true, true, true, true, true},
+	{NativeSaveMode::single_slot_growable_block_file, 512, 512 * 1024,
+		0, 0, 0, &kMegaDriveSaveRoot},
 	NativeProfileAuthority::fixture
 };
 
@@ -114,6 +174,13 @@ bool SameRecord(const NativeCoreProfile &left,
 		left.protocol.maximum_wire_bytes != right.protocol.maximum_wire_bytes ||
 		memcmp(&left.audio, &right.audio, sizeof(left.audio)) != 0 ||
 		memcmp(&left.video, &right.video, sizeof(left.video)) != 0 ||
+		left.save.mode != right.save.mode ||
+		left.save.sector_bytes != right.save.sector_bytes ||
+		left.save.maximum_bytes != right.save.maximum_bytes ||
+		left.save.advertised_empty_bytes != right.save.advertised_empty_bytes ||
+		left.save.empty_fill_byte != right.save.empty_fill_byte ||
+		left.save.slot != right.save.slot ||
+		left.save.root_authority != right.save.root_authority ||
 		left.authority != right.authority)
 		return false;
 	for (size_t index = 0; index < 3; ++index)
@@ -165,6 +232,28 @@ bool ValidAudioVideoRecord(const NativeCoreProfile &profile)
 	return true;
 }
 
+bool ValidSaveRecord(const NativeCoreProfile &profile)
+{
+	const NativeSaveProfile &save = profile.save;
+	const NativeSaveRootAuthority *const root = save.root_authority;
+	if (save.mode != NativeSaveMode::single_slot_growable_block_file ||
+		save.sector_bytes == 0 ||
+		(save.sector_bytes & (save.sector_bytes - 1)) != 0 ||
+		save.maximum_bytes == 0 ||
+		save.maximum_bytes % save.sector_bytes != 0 ||
+		save.advertised_empty_bytes > save.maximum_bytes ||
+		(save.advertised_empty_bytes != 0 &&
+		 save.advertised_empty_bytes % save.sector_bytes != 0) ||
+		save.slot != 0 || root == nullptr || root->absolute_root == nullptr ||
+		root->chain == nullptr || root->chain_count != 4 ||
+		root->file_mode != 0600 || root->chain[0].component == nullptr ||
+		strcmp(root->chain[0].component, "/") != 0 ||
+		root->chain[0].role != NativeSaveDirectoryRole::root_anchor ||
+		root->chain[3].role != NativeSaveDirectoryRole::system_directory)
+		return false;
+	return true;
+}
+
 #endif
 
 } // namespace
@@ -209,7 +298,7 @@ bool ValidateNativeCoreProfileRecord(const NativeCoreProfile &profile)
 		profile.input.player_command[0] != 0x02 ||
 		profile.input.player_command[1] != 0x03 ||
 		profile.input.joystick_swap || !ValidProtocolRecord(profile) ||
-		!ValidAudioVideoRecord(profile))
+		!ValidAudioVideoRecord(profile) || !ValidSaveRecord(profile))
 		return false;
 	return SameRecord(profile, profile.system != nullptr &&
 		strcmp(profile.system, "snes") == 0 ? kSnesProfile : kMegaDriveProfile);
@@ -241,6 +330,20 @@ const SafeAudioVideoRecoveryRecord *FixtureSafeAudioVideoRecoveryRecordForTest(
 		system_id == NativeSystem::megadrive ? &kMegaDriveAudioVideoRecovery : nullptr;
 }
 
+const SafeSaveRecoveryRecord *FixtureSafeSaveRecoveryRecordForTest(
+	NativeSystem system_id)
+{
+	return system_id == NativeSystem::snes ? &kSnesSaveRecovery :
+		system_id == NativeSystem::megadrive ? &kMegaDriveSaveRecovery : nullptr;
+}
+
+const NativeCoreProfile *FixtureNativeCoreProfileForSafeSaveRecoveryRecordForTest(
+	const SafeSaveRecoveryRecord *record)
+{
+	return record == &kSnesSaveRecovery ? &kSnesProfile :
+		record == &kMegaDriveSaveRecovery ? &kMegaDriveProfile : nullptr;
+}
+
 bool IsExactFixtureSafePeripheralRecoveryRecordForTest(
 	const SafePeripheralRecoveryRecord *record)
 {
@@ -250,6 +353,18 @@ bool IsExactFixtureSafePeripheralRecoveryRecordForTest(
 		record == &kMegaDriveVideoRecovery.base ||
 		record == &kSnesAudioVideoRecovery.base ||
 		record == &kMegaDriveAudioVideoRecovery.base;
+}
+
+bool IsExactFixtureNativeSaveRootAuthorityForTest(
+	const NativeSaveRootAuthority *authority)
+{
+	return authority == &kSnesSaveRoot || authority == &kMegaDriveSaveRoot;
+}
+
+bool IsExactFixtureSafeSaveRecoveryRecordForTest(
+	const SafeSaveRecoveryRecord *record)
+{
+	return record == &kSnesSaveRecovery || record == &kMegaDriveSaveRecovery;
 }
 #endif
 

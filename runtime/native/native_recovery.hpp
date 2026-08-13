@@ -35,12 +35,14 @@ public:
 	{
 		return nullptr;
 	}
+	virtual const SafeSaveRecoveryRecord *SafeSaveRecord() const
+	{
+		return nullptr;
+	}
 
 private:
 	friend class NativeRecovery;
 	virtual Result CloseInputDescriptors(const OperationLease &lease,
-		RecoveryResourceState *state) = 0;
-	virtual Result FlushAndCloseSave(const OperationLease &lease,
 		RecoveryResourceState *state) = 0;
 	virtual Result MuteAudio(const OperationLease &lease,
 		RecoveryResourceState *state) = 0;
@@ -61,6 +63,13 @@ public:
 	NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
 		NativeAudioResource &audio, NativeVideoResource &video,
 		NativeAudioVideoResource &audio_video, NativeContainment &containment);
+	NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
+		NativeAudioResource &audio, NativeVideoResource &video,
+		NativeAudioVideoResource &audio_video, NativeSaveResource &save);
+	NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
+		NativeAudioResource &audio, NativeVideoResource &video,
+		NativeAudioVideoResource &audio_video, NativeSaveResource &save,
+		NativeContainment &containment);
 	Result Perform(const RecoveryEpoch &epoch, OperationKind operation_kind);
 	Result Snapshot(const RecoveryEpoch &epoch,
 		MisterRecoveryObservationV2 *observation) const;
@@ -75,7 +84,8 @@ private:
 		core_protocol,
 		audio,
 		video,
-		audio_video
+		audio_video,
+		save
 	};
 	Result BeginTypedRecovery(const RecoveryEpoch &epoch,
 		OperationKind operation_kind);
@@ -88,6 +98,7 @@ private:
 	NativeAudioResource *audio_;
 	NativeVideoResource *video_;
 	NativeAudioVideoResource *audio_video_;
+	NativeSaveResource *save_;
 	NativeContainment *containment_;
 	const RecoveryEpoch *retained_epoch_;
 	RetainedRecoveryKind retained_kind_;

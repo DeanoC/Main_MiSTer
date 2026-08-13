@@ -5,6 +5,7 @@
 #define MISTER_RUNTIME_NATIVE_NATIVE_RESOURCES_HPP
 
 #include "runtime/native/hardware_broker.hpp"
+#include "runtime/native/native_save_key.hpp"
 
 #include <stdint.h>
 
@@ -61,6 +62,35 @@ struct NativeCoupledReleaseOutcome {
 	bool local_resources_absent;
 	bool closure_unknown;
 	uint64_t mutation_sequence;
+};
+
+struct NativeSaveOpenOutcome {
+	Result result;
+	bool acquired;
+};
+
+struct NativeSaveCloseOutcome {
+	NativeSaveCloseOutcome(Result result_value = MISTER_RESULT_INVALID_STATE,
+		bool data_value = false, bool metadata_value = false,
+		bool descriptors_value = false, bool closure_value = false,
+		bool data_required_value = true,
+		bool metadata_required_value = true)
+		: result(result_value), data_synchronized(data_value),
+		  metadata_synchronized(metadata_value),
+		  descriptors_absent(descriptors_value), closure_unknown(closure_value),
+		  data_synchronization_required(data_required_value),
+		  metadata_synchronization_required(metadata_required_value) {}
+
+	Result result;
+	bool data_synchronized;
+	bool metadata_synchronized;
+	bool descriptors_absent;
+	bool closure_unknown;
+	// A partial acquisition that never gained a file has no data or metadata
+	// synchronization obligation. The activation result remains independently
+	// latched by lifecycle; this outcome describes only cleanup completion.
+	bool data_synchronization_required;
+	bool metadata_synchronization_required;
 };
 
 struct NativeRetainedContentDescription {
@@ -157,14 +187,24 @@ public:
 class NativeSaveResource {
 public:
 	virtual ~NativeSaveResource() {}
-	virtual NativeAcquisitionOutcome OpenSave(const OperationLease &lease) = 0;
-	virtual Result FlushAndCloseSave(const OperationLease &lease) = 0;
+	virtual NativeSaveOpenOutcome OpenSave(const OperationLease &lease,
+		const NativeCoreProfile &profile, const NativeSaveKey &key) = 0;
+	virtual NativeSaveCloseOutcome FlushAndCloseSave(
+		const OperationLease &lease) = 0;
+	virtual NativeSaveCloseOutcome RecoverSave(const OperationLease &lease,
+		const SafeSaveRecoveryRecord &record) = 0;
 	virtual void CloseSaveForProcessExit() = 0;
 };
 
 class NativeContentResource {
 public:
 	virtual ~NativeContentResource() {}
+	// The retained content authority is the only private source permitted to
+	// derive a save key. Implementations without such authority fail closed.
+	virtual Result DeriveSaveKey(const NativeCoreProfile &, NativeSaveKey *)
+	{
+		return MISTER_RESULT_UNSUPPORTED;
+	}
 	virtual NativeAcquisitionOutcome RetainContent(
 		uint64_t absolute_deadline_ms) = 0;
 	virtual Result DescribeRetained(NativeRetainedContentDescription *description,
