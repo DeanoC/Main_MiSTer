@@ -26,10 +26,13 @@ namespace {
 class FakeClock final : public NativeClock {
 public:
 	explicit FakeClock(uint64_t now_ms)
-		: now_ms_(now_ms), force_timeout_(false) {}
+		: now_ms_(now_ms), force_timeout_(false), reads_until_advance_(0),
+		  advance_to_ms_(0) {}
 
 	uint64_t NowMs() const override
 	{
+		if (reads_until_advance_ != 0 && --reads_until_advance_ == 0)
+			now_ms_ = advance_to_ms_;
 		return now_ms_;
 	}
 
@@ -54,9 +57,17 @@ public:
 		force_timeout_ = force_timeout;
 	}
 
+	void AdvanceOnRead(size_t reads, uint64_t now_ms)
+	{
+		reads_until_advance_ = reads;
+		advance_to_ms_ = now_ms;
+	}
+
 private:
-	uint64_t now_ms_;
+	mutable uint64_t now_ms_;
 	bool force_timeout_;
+	mutable size_t reads_until_advance_;
+	uint64_t advance_to_ms_;
 };
 
 struct LifecycleSaveNode {
@@ -209,6 +220,7 @@ private:
 enum class Event : uint8_t {
 	preflight,
 	retain_content,
+	acquire_containment_mappings,
 	acquire_fpga,
 	enable_bridges,
 	start_core_protocol,
@@ -271,7 +283,9 @@ public:
 		  captured_valid_{false, false}, captured_(), neutral_(),
 		  protocol_profile_(nullptr), protocol_content_(nullptr),
 		  shutdown_protocol_profile_(nullptr),
-		  malformed_protocol_outcome_(MalformedProtocolOutcome::none)
+		  malformed_protocol_outcome_(MalformedProtocolOutcome::none),
+		  expire_checkout_kind_(OperationKind::program_fpga),
+		  expire_checkout_at_ms_(0)
 	{
 	}
 
@@ -337,9 +351,20 @@ public:
 		expected_deadline_ms_ = deadline_ms;
 	}
 
+	void ExpectCleanupDeadline(uint64_t deadline_ms)
+	{
+		expected_deadline_ms_ = deadline_ms;
+	}
+
 	void AbandonCoreProtocolReleaseOnce()
 	{
 		abandon_core_protocol_release_once_ = true;
+	}
+
+	void ExpireCleanupCheckout(OperationKind kind, uint64_t now_ms)
+	{
+		expire_checkout_kind_ = kind;
+		expire_checkout_at_ms_ = now_ms;
 	}
 
 	Result Validate(const NativeCoreProfile &, uint64_t absolute_deadline_ms) override
@@ -350,6 +375,12 @@ public:
 	NativeAcquisitionOutcome AcquireFpga(const OperationLease &lease) override
 	{
 		return AcquireHardware(Event::acquire_fpga, lease);
+	}
+
+	NativeAcquisitionOutcome AcquireContainmentMappings(
+		const OperationLease &lease) override
+	{
+		return AcquireHardware(Event::acquire_containment_mappings, lease);
 	}
 
 	NativeAcquisitionOutcome EnableBridges(const OperationLease &lease) override
@@ -435,13 +466,19 @@ public:
 	NativePeripheralReleaseOutcome StopVideo(
 		std::unique_ptr<CleanupVideoSessionBundle> &&session) override
 	{
-		return StopPeripheral(Event::stop_video, std::move(session));
+		const NativePeripheralReleaseOutcome outcome =
+			StopPeripheral(Event::stop_video, std::move(session));
+		ArmCleanupCheckout(OperationKind::audio);
+		return outcome;
 	}
 
 	NativePeripheralReleaseOutcome StopAudio(
 		std::unique_ptr<CleanupAudioSessionBundle> &&session) override
 	{
-		return StopPeripheral(Event::stop_audio, std::move(session));
+		const NativePeripheralReleaseOutcome outcome =
+			StopPeripheral(Event::stop_audio, std::move(session));
+		ArmCleanupCheckout(OperationKind::audio_video);
+		return outcome;
 	}
 
 	NativePeripheralReleaseOutcome RecoverVideo(
@@ -501,9 +538,12 @@ public:
 			broker_.mutation_sequence_for_test(), true, 0xa55a};
 		const Result completed = PeripheralAuthorityTestPeer::CompleteAudioVideo(
 			broker_, std::move(session), receipt);
-		return {completed == MISTER_RESULT_OK ? primary : completed, affected, 0,
+		const NativeCoupledReleaseOutcome outcome = {
+			completed == MISTER_RESULT_OK ? primary : completed, affected, 0,
 			MISTER_RESOURCE_NATIVE_VIDEO, true, false,
 			broker_.mutation_sequence_for_test()};
+		ArmCleanupCheckout(OperationKind::core_protocol);
+		return outcome;
 	}
 
 	NativeCoupledReleaseOutcome RecoverAudioVideo(
@@ -526,6 +566,7 @@ public:
 			abandon_core_protocol_release_once_ = false;
 			return MISTER_RESULT_PLATFORM;
 		}
+		if (primary != MISTER_RESULT_OK) return primary;
 		const ProtocolMappingReleaseReceipt release = {
 			MISTER_RESULT_OK, true, true, true, true, true,
 			broker_.mutation_sequence_for_test()};
@@ -610,7 +651,8 @@ public:
 	}
 	Result CloseContent(uint64_t absolute_deadline_ms) override
 	{
-		return RunBounded(Event::close_content, absolute_deadline_ms);
+		const Result result = RunBounded(Event::close_content, absolute_deadline_ms);
+		return result;
 	}
 	Result DescribeRetained(NativeRetainedContentDescription *description,
 		uint64_t absolute_deadline_ms) override
@@ -647,8 +689,10 @@ public:
 	}
 	Result CloseInputDescriptors(const OperationLease &lease) override
 	{
-		return RunBounded(Event::close_input_descriptors,
+		const Result result = RunBounded(Event::close_input_descriptors,
 			lease.absolute_deadline_ms());
+		ArmCleanupCheckout(OperationKind::video);
+		return result;
 	}
 	void CloseInputDescriptorsForProcessExit() override
 	{
@@ -723,8 +767,16 @@ public:
 	bool abandon_core_protocol_release_once_ = false;
 	bool hold_concurrent_protocol_peer_ = false;
 	std::unique_ptr<OperationLease> concurrent_protocol_peer_;
+	OperationKind expire_checkout_kind_;
+	uint64_t expire_checkout_at_ms_;
 
 private:
+	void ArmCleanupCheckout(OperationKind kind)
+	{
+		if (expire_checkout_kind_ != kind || expire_checkout_at_ms_ == 0) return;
+		clock_.AdvanceOnRead(3, expire_checkout_at_ms_);
+		expire_checkout_at_ms_ = 0;
+	}
 	template <typename Session>
 	NativePeripheralAcquisitionOutcome StartPeripheral(Event event,
 		std::unique_ptr<Session> &&session)
@@ -915,6 +967,9 @@ public:
 		: delegate_(delegate), containment_(containment) {}
 	NativeAcquisitionOutcome AcquireFpga(const OperationLease &lease) override
 	{ return delegate_.AcquireFpga(lease); }
+	NativeAcquisitionOutcome AcquireContainmentMappings(
+		const OperationLease &lease) override
+	{ return delegate_.AcquireContainmentMappings(lease); }
 	NativeAcquisitionOutcome EnableBridges(const OperationLease &lease) override
 	{ return delegate_.EnableBridges(lease); }
 	NativeCoreProtocolOutcome StartCoreProtocol(const OperationLease &lease,
@@ -938,6 +993,8 @@ private:
 };
 
 const Event kActivationEvents[] = {
+	Event::acquire_containment_mappings,
+	Event::start_offload,
 	Event::acquire_fpga,
 	Event::enable_bridges,
 	Event::start_core_protocol,
@@ -946,11 +1003,12 @@ const Event kActivationEvents[] = {
 	Event::start_audio_video,
 	Event::open_input_descriptors,
 	Event::open_save,
-	Event::start_scheduler,
-	Event::start_offload
+	Event::start_scheduler
 };
 
 const Event kCleanupForFailedAcquisition[] = {
+	Event::terminal_fpga_cleanup,
+	Event::reject_join_offload,
 	Event::terminal_fpga_cleanup,
 	Event::terminal_fpga_cleanup,
 	Event::shutdown_core_protocol,
@@ -959,8 +1017,7 @@ const Event kCleanupForFailedAcquisition[] = {
 	Event::stop_audio_video,
 	Event::close_input_descriptors,
 	Event::flush_close_save,
-	Event::stop_scheduler,
-	Event::reject_join_offload
+	Event::stop_scheduler
 };
 
 static_assert(sizeof(kActivationEvents) == sizeof(kCleanupForFailedAcquisition),
@@ -1007,8 +1064,10 @@ void TestContentIsResolvedBeforeOwnershipAndRetainedOnFirstHardwareFailure()
 	assert(fixture.resources.events[0] == Event::preflight);
 	assert(fixture.resources.events[1] == Event::retain_content);
 	assert(!fixture.resources.content_saw_live_generation_);
-	assert(fixture.resources.events[2] == Event::acquire_fpga);
-	assert(fixture.resources.events[3] == Event::close_content);
+	assert(fixture.resources.events[2] == Event::acquire_containment_mappings);
+	assert(fixture.resources.events[3] == Event::start_offload);
+	assert(fixture.resources.events[4] == Event::acquire_fpga);
+	assert(fixture.resources.Count(Event::close_content) == 1);
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
 }
 
@@ -1049,6 +1108,67 @@ void TestSuccessfulInitializationRecordsEveryAcquisition()
 	}
 }
 
+void TestActivationUsesAcceptedContainmentFirstOrder()
+{
+	Fixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	const Event expected[] = {
+		Event::preflight, Event::retain_content,
+		Event::acquire_containment_mappings, Event::start_offload,
+		Event::acquire_fpga, Event::enable_bridges,
+		Event::start_core_protocol, Event::start_video, Event::start_audio,
+		Event::start_audio_video, Event::open_input_descriptors,
+		Event::open_save, Event::start_scheduler};
+	assert(fixture.resources.events.size() ==
+		sizeof(expected) / sizeof(expected[0]));
+	for (size_t index = 0; index < sizeof(expected) / sizeof(expected[0]); ++index)
+		assert(fixture.resources.events[index] == expected[index]);
+}
+
+void TestStopCallbackDeadlineBoundsFirstCleanupOperation()
+{
+	Fixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	fixture.resources.ExpectCleanupDeadline(150);
+	assert(fixture.lifecycle.Stop(150) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(!fixture.resources.saw_wrong_deadline_);
+	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 2100);
+}
+
+void TestStopQuiesceExpiryFreezesDrainAndCleanupTiming()
+{
+	Fixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> held;
+	assert(fixture.broker.Begin(fixture.lifecycle.generation(),
+		OperationKind::input, 10000, &held) == MISTER_RESULT_OK);
+	fixture.clock.ForceTimeout(true);
+	assert(fixture.lifecycle.Stop(150) == MISTER_RESULT_DEADLINE);
+	const NativeFailureDrainTiming drain =
+		fixture.lifecycle.failure_drain_timing_for_test();
+	const NativeCleanupTiming cleanup = fixture.lifecycle.cleanup_timing();
+	assert(drain.established && drain.drain_start_ms == 100 &&
+		drain.drain_deadline_ms == 2100);
+	assert(cleanup.established && cleanup.cleanup_start_ms == 100 &&
+		cleanup.non_fpga_deadline_ms == 2100 &&
+		cleanup.fpga_deadline_ms == 5100);
+	fixture.clock.SetNow(200);
+	held.reset();
+	fixture.clock.ForceTimeout(false);
+	assert(fixture.lifecycle.Stop(500) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.failure_drain_timing_for_test().drain_deadline_ms ==
+		drain.drain_deadline_ms);
+	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms ==
+		cleanup.cleanup_start_ms);
+	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms ==
+		cleanup.non_fpga_deadline_ms);
+	assert(fixture.lifecycle.cleanup_timing().fpga_deadline_ms ==
+		cleanup.fpga_deadline_ms);
+}
+
 void TestRealAdapterRootPrefixFailuresReleaseSavesAndLeaveTheGeneration()
 {
 	const int mount_failures[] = {1, 4};
@@ -1074,7 +1194,7 @@ void TestRealAdapterRootPrefixFailuresReleaseSavesAndLeaveTheGeneration()
 		assert(lifecycle.state() == NativeLifecycleState::idle);
 		assert(lifecycle.generation() == 0);
 		assert(lifecycle.ledger().resource_flags == 0);
-		assert(lifecycle.Stop() == MISTER_RESULT_OK);
+		assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
 		assert(filesystem.trace().size() ==
 			static_cast<size_t>(failing_mount_call));
 		assert(filesystem.trace().back() == '0');
@@ -1119,13 +1239,13 @@ void TestRealAdapterZeroDescriptorFailuresClearStateForReuse()
 			assert(lifecycle.generation() == 0);
 			assert((lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) == 0);
 			assert(filesystem.operation_count() == test.filesystem_operations);
-			assert(lifecycle.Stop() == MISTER_RESULT_OK);
+			assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
 			assert(filesystem.operation_count() == test.filesystem_operations);
 
 			filesystem.SetNow(100);
 			assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
 				MISTER_RESULT_OK);
-			assert(lifecycle.Stop() == MISTER_RESULT_OK);
+			assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
 			operations_before_adapter_destructor = filesystem.operation_count();
 		}
 		assert(filesystem.operation_count() == operations_before_adapter_destructor);
@@ -1199,13 +1319,13 @@ void TestRealAdapterPostCreateAuthorityLossRetainsSavesUntilStableCleanup()
 	assert(filesystem.trace()[0] == 'f');
 	assert(filesystem.trace()[1] == 's');
 
-	assert(lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(lifecycle.state() == NativeLifecycleState::cleanup);
 	assert((lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) != 0);
 	assert(filesystem.trace().size() == 2);
 
 	filesystem.RestoreSystemDirectoryEntry();
-	assert(lifecycle.Stop() == MISTER_RESULT_OK);
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
 	assert(lifecycle.state() == NativeLifecycleState::idle);
 	assert(lifecycle.generation() == 0);
 	assert(lifecycle.ledger().resource_flags == 0);
@@ -1289,12 +1409,14 @@ void TestContentFailureOrOverrunNeverMintsOwnership()
 	overrun.resources.Delay(Event::retain_content, 900);
 	assert(overrun.lifecycle.ActivateFixtureForTest(overrun.profile, 1000) ==
 		MISTER_RESULT_DEADLINE);
-	assert(overrun.lifecycle.state() == NativeLifecycleState::idle);
+	assert(overrun.lifecycle.state() == NativeLifecycleState::cleanup);
 	assert(overrun.lifecycle.generation() == 0);
 	assert(overrun.resources.Count(Event::acquire_fpga) == 0);
 	assert(overrun.resources.Count(Event::close_content) == 1);
 	assert((overrun.lifecycle.ledger().resource_flags &
-		MISTER_RESOURCE_CONTENT) == 0);
+		MISTER_RESOURCE_CONTENT) != 0);
+	overrun.clock.SetNow(1001);
+	assert(overrun.lifecycle.Stop(1500) == MISTER_RESULT_OK);
 }
 
 void TestPreownershipContentCloseFailureBlocksReactivationAndRetriesLocally()
@@ -1310,12 +1432,12 @@ void TestPreownershipContentCloseFailureBlocksReactivationAndRetriesLocally()
 		MISTER_RESOURCE_CONTENT) != 0);
 	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 1000);
 	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 3000);
-	assert(fixture.resources.LastBoundedDeadline(Event::close_content) == 3000);
+	assert(fixture.resources.LastBoundedDeadline(Event::close_content) == 1000);
 	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 2000) ==
 		MISTER_RESULT_INVALID_STATE);
 	assert(fixture.resources.Count(Event::retain_content) == 1);
 	fixture.resources.ClearFailure();
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_OK);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
 	assert(fixture.lifecycle.state() == NativeLifecycleState::idle);
 	assert(fixture.lifecycle.ledger().resource_flags == 0);
 	assert(fixture.resources.Count(Event::close_content) == 2);
@@ -1348,7 +1470,7 @@ void TestOverrunAfterEverySuccessfulAcquisitionIsLedgeredAndUnwound()
 void TestActivationOverrunStaysFailedAndStartsFreshCleanupClocksOnce()
 {
 	Fixture fixture(100);
-	fixture.resources.Delay(Event::start_offload, 100);
+	fixture.resources.Delay(Event::start_scheduler, 100);
 	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 200) ==
 		MISTER_RESULT_DEADLINE);
 	assert(fixture.lifecycle.latched_activation_result() == MISTER_RESULT_DEADLINE);
@@ -1358,11 +1480,12 @@ void TestActivationOverrunStaysFailedAndStartsFreshCleanupClocksOnce()
 	assert(first.cleanup_start_ms == 200);
 	assert(first.non_fpga_deadline_ms == 2200);
 	assert(first.fpga_deadline_ms == 5200);
-	const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
-	assert(epoch != 0);
+	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
 
 	fixture.clock.SetNow(300);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
+	assert(epoch != 0);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
 	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 200);
 	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 2200);
@@ -1403,7 +1526,7 @@ void TestMutatingProtocolFailureDrainsBeforeOneCleanupEpoch()
 	assert(fixture.broker.core_protocol_failure_receipt_for_test(&retained));
 	assert(retained.primary_result == MISTER_RESULT_PLATFORM);
 
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
 	assert(fixture.lifecycle.failure_drain_timing_for_test().drain_deadline_ms ==
 		2100);
@@ -1432,7 +1555,10 @@ void TestFailedProtocolDrainDeadlineNeverRefreshes()
 	assert(fixture.lifecycle.failure_drain_timing_for_test().drain_start_ms == 100);
 	assert(fixture.lifecycle.failure_drain_timing_for_test().drain_deadline_ms ==
 		2100);
-	assert(!fixture.lifecycle.cleanup_timing().established);
+	assert(fixture.lifecycle.cleanup_timing().established);
+	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 100);
+	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 2100);
+	assert(fixture.lifecycle.cleanup_timing().fpga_deadline_ms == 5100);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
 	assert((fixture.lifecycle.ledger().resource_flags &
 		MISTER_RESOURCE_CORE_PROTOCOL) != 0);
@@ -1442,20 +1568,21 @@ void TestFailedProtocolDrainDeadlineNeverRefreshes()
 		OperationKind::input, 3000, &denied) == MISTER_RESULT_INVALID_STATE);
 
 	fixture.clock.SetNow(2100);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_DEADLINE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
 	assert(fixture.lifecycle.failure_drain_timing_for_test().drain_deadline_ms ==
 		2100);
-	assert(!fixture.lifecycle.cleanup_timing().established);
+	assert(fixture.lifecycle.cleanup_timing().established);
+	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 100);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
 
 	fixture.resources.ReleaseConcurrentProtocolPeer();
 	fixture.clock.ForceTimeout(false);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
 	assert(fixture.lifecycle.failure_drain_timing_for_test().drain_deadline_ms ==
 		2100);
-	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 2100);
-	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 4100);
-	assert(fixture.lifecycle.cleanup_timing().fpga_deadline_ms == 7100);
+	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 100);
+	assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 2100);
+	assert(fixture.lifecycle.cleanup_timing().fpga_deadline_ms == 5100);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() != 0);
 }
 
@@ -1483,7 +1610,8 @@ void TestMalformedProtocolOutcomesCloseBeforeReleaseAndUseFrozenDrain()
 		assert(drain.established);
 		assert(drain.drain_start_ms == 100);
 		assert(drain.drain_deadline_ms == 2100);
-		assert(!fixture.lifecycle.cleanup_timing().established);
+		assert(fixture.lifecycle.cleanup_timing().established);
+		assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 100);
 		assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
 		std::unique_ptr<OperationLease> denied;
 		assert(fixture.broker.Begin(fixture.lifecycle.generation(),
@@ -1491,7 +1619,7 @@ void TestMalformedProtocolOutcomesCloseBeforeReleaseAndUseFrozenDrain()
 
 		fixture.resources.ReleaseConcurrentProtocolPeer();
 		fixture.clock.ForceTimeout(false);
-		assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+		assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 		assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms == 100);
 		assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms == 2100);
 		assert(fixture.lifecycle.cleanup_timing().fpga_deadline_ms == 5100);
@@ -1504,7 +1632,7 @@ void TestCleanupDeadlineArithmeticSaturatesWithoutWrapping()
 	Fixture fixture(UINT64_MAX - 1000);
 	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, UINT64_MAX) ==
 		MISTER_RESULT_OK);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
 	assert(timing.cleanup_start_ms == UINT64_MAX - 1000);
 	assert(timing.non_fpga_deadline_ms == UINT64_MAX);
@@ -1522,7 +1650,7 @@ void TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates()
 	fixture.resources.AddDigitalNeutral(second);
 
 	fixture.resources.Fail(Event::reject_join_offload);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
 	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
 	assert(fixture.resources.Count(Event::stop_scheduler) == 1);
@@ -1532,7 +1660,7 @@ void TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates()
 
 	fixture.resources.ClearFailure();
 	fixture.clock.SetNow(200);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
 	assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms ==
 		timing.cleanup_start_ms);
@@ -1559,7 +1687,7 @@ void TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates()
 		assert(fixture.resources.Count(kActivationEvents[index]) == 1);
 	}
 
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 2);
 	assert(fixture.resources.Count(Event::replay_digital_neutral) == 2);
@@ -1573,7 +1701,7 @@ void TestCoreProtocolReleaseRetryRetainsItsCleanupLease()
 	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
 		MISTER_RESULT_OK);
 	fixture.resources.AbandonCoreProtocolReleaseOnce();
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
 	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 1);
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
@@ -1582,12 +1710,45 @@ void TestCoreProtocolReleaseRetryRetainsItsCleanupLease()
 	assert(!fixture.lifecycle.ledger().core_protocol_shutdown_complete);
 
 	fixture.clock.SetNow(200);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 2);
 	assert(fixture.resources.LastHardwareDeadline(Event::shutdown_core_protocol) ==
 		timing.fpga_deadline_ms);
 	assert(fixture.lifecycle.ledger().core_protocol_shutdown_complete);
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
+}
+
+void TestTypedCheckoutDeadlineDropsNonresumableRegistration()
+{
+	const OperationKind kinds[] = {OperationKind::video, OperationKind::audio,
+		OperationKind::audio_video, OperationKind::core_protocol};
+	const Event events[] = {Event::stop_video, Event::stop_audio,
+		Event::stop_audio_video, Event::shutdown_core_protocol};
+	const uint64_t boundaries[] = {2099, 2100, 2101};
+	for (size_t index = 0; index != sizeof(kinds) / sizeof(kinds[0]); ++index) {
+		for (size_t boundary = 0; boundary !=
+			sizeof(boundaries) / sizeof(boundaries[0]); ++boundary) {
+			Fixture fixture(100);
+			assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+				MISTER_RESULT_OK);
+			fixture.resources.ExpireCleanupCheckout(kinds[index],
+				boundaries[boundary]);
+			const Result first = fixture.lifecycle.Stop(UINT64_MAX);
+			if (boundaries[boundary] < 2100) {
+				assert(first != MISTER_RESULT_DEADLINE);
+				assert(fixture.resources.Count(events[index]) == 1);
+				continue;
+			}
+			assert(first == MISTER_RESULT_DEADLINE);
+			assert(fixture.resources.Count(events[index]) == 0);
+			fixture.clock.SetNow(200);
+			assert(fixture.lifecycle.Stop(UINT64_MAX) ==
+				MISTER_RESULT_CLEANUP_INCOMPLETE);
+			assert(fixture.resources.Count(events[index]) == 1);
+			assert(fixture.lifecycle.Stop(UINT64_MAX) ==
+				MISTER_RESULT_CLEANUP_INCOMPLETE);
+		}
+	}
 }
 
 void TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline()
@@ -1596,7 +1757,7 @@ void TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline()
 	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
 		MISTER_RESULT_OK);
 	fixture.resources.Fail(Event::flush_close_save);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
 	assert(fixture.resources.Count(Event::flush_close_save) == 1);
 	assert((fixture.lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) != 0);
@@ -1605,7 +1766,7 @@ void TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline()
 
 	fixture.resources.ClearFailure();
 	fixture.clock.SetNow(200);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.resources.Count(Event::flush_close_save) == 2);
 	assert(fixture.resources.save_cleanup_lease_reused_);
 	assert(fixture.resources.LastBoundedDeadline(Event::flush_close_save) ==
@@ -1629,7 +1790,7 @@ void TestSaveCleanupChecksTheBrokerClockAtLedgerCommit()
 		assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
 			MISTER_RESULT_OK);
 		fixture.resources.AdvanceBrokerClockAfterSaveCleanup(test.completion_time);
-		const Result result = fixture.lifecycle.Stop();
+		const Result result = fixture.lifecycle.Stop(UINT64_MAX);
 		const bool save_owned = (fixture.lifecycle.ledger().resource_flags &
 			MISTER_RESOURCE_SAVES) != 0;
 		assert(save_owned == !test.save_clears);
@@ -1646,7 +1807,7 @@ void TestNormalStopUsesTheNormativeOrder()
 	const NativeDigitalNeutral neutral = {0, {0x02, 0}};
 	fixture.resources.AddDigitalNeutral(neutral);
 	const size_t activation_events = fixture.resources.events.size();
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const Event expected[] = {
 		Event::stop_scheduler,
 		Event::reject_join_offload,
@@ -1715,7 +1876,7 @@ void TestCleanupFailureRetainsTheFailedResourceLedger()
 		const NativeDigitalNeutral neutral = {0, {0x02, 0}};
 		fixture.resources.AddDigitalNeutral(neutral);
 		fixture.resources.Fail(failures[index]);
-		assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+		assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 		assert(!fixture.resources.events.empty());
 		assert(fixture.resources.events.back() == failures[index]);
 		const NativeResourceLedger ledger = fixture.lifecycle.ledger();
@@ -1767,7 +1928,7 @@ void TestCapturedNeutralMustMatchTheActiveProfile()
 		MISTER_RESULT_OK);
 	const NativeDigitalNeutral forged = {0, {0x03, 0}};
 	fixture.resources.AddDigitalNeutral(forged);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.resources.Count(Event::capture_digital_neutral) == 1);
 	assert(fixture.resources.Count(Event::replay_digital_neutral) == 0);
 	assert((fixture.lifecycle.ledger().resource_flags &
@@ -1780,7 +1941,7 @@ void TestCleanupSuccessAtDeadlineDoesNotClearTheLedger()
 	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
 		MISTER_RESULT_OK);
 	fixture.resources.Delay(Event::stop_video, 2000);
-	assert(fixture.lifecycle.Stop() == MISTER_RESULT_DEADLINE);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
 	assert((fixture.lifecycle.ledger().resource_flags &
 		MISTER_RESOURCE_NATIVE_VIDEO) != 0);
 	assert((fixture.lifecycle.ledger().resource_flags &
@@ -1824,6 +1985,9 @@ int main()
 	mister::native::TestContentIsResolvedBeforeOwnershipAndRetainedOnFirstHardwareFailure();
 	mister::native::TestFirstAcquisitionIsLedgeredBeforeFollowingFailure();
 	mister::native::TestSuccessfulInitializationRecordsEveryAcquisition();
+	mister::native::TestActivationUsesAcceptedContainmentFirstOrder();
+	mister::native::TestStopCallbackDeadlineBoundsFirstCleanupOperation();
+	mister::native::TestStopQuiesceExpiryFreezesDrainAndCleanupTiming();
 	mister::native::TestRealAdapterRootPrefixFailuresReleaseSavesAndLeaveTheGeneration();
 	mister::native::TestRealAdapterZeroDescriptorFailuresClearStateForReuse();
 	mister::native::TestRealAdapterZeroDescriptorFailureDestructorPerformsNoIo();
@@ -1841,6 +2005,7 @@ int main()
 	mister::native::TestCleanupDeadlineArithmeticSaturatesWithoutWrapping();
 	mister::native::TestRetryRetainsEpochLedgersDeadlinesAndNeverReactivates();
 	mister::native::TestCoreProtocolReleaseRetryRetainsItsCleanupLease();
+	mister::native::TestTypedCheckoutDeadlineDropsNonresumableRegistration();
 	mister::native::TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline();
 	mister::native::TestSaveCleanupChecksTheBrokerClockAtLedgerCommit();
 	mister::native::TestNormalStopUsesTheNormativeOrder();

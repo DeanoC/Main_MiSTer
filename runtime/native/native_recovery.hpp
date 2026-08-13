@@ -70,7 +70,11 @@ public:
 		NativeAudioResource &audio, NativeVideoResource &video,
 		NativeAudioVideoResource &audio_video, NativeSaveResource &save,
 		NativeContainment &containment);
+	Result Perform(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation, OperationKind operation_kind);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result Perform(const RecoveryEpoch &epoch, OperationKind operation_kind);
+#endif
 	Result Snapshot(const RecoveryEpoch &epoch,
 		MisterRecoveryObservationV2 *observation) const;
 	Result ValidateCallbackRequestedFlags(const RecoveryEpoch &epoch,
@@ -88,7 +92,7 @@ private:
 		save
 	};
 	Result BeginTypedRecovery(const RecoveryEpoch &epoch,
-		OperationKind operation_kind);
+		const OperationInvocation &invocation, OperationKind operation_kind);
 	void ClearRetainedRecovery();
 	NativeRecovery(const NativeRecovery &) = delete;
 	NativeRecovery &operator=(const NativeRecovery &) = delete;

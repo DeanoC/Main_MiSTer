@@ -175,6 +175,10 @@ void PrepareCleanup(HardwareBroker &broker, FakeClock &clock,
 
 void TestOwningTypesAreNotForgeable()
 {
+	static_assert(!std::is_default_constructible<OperationInvocation>::value,
+		"callback invocations must be broker-created");
+	static_assert(!std::is_copy_constructible<OperationInvocation>::value,
+		"callback invocations must not be copied");
 	static_assert(!std::is_default_constructible<OperationLease>::value,
 		"operation leases must be broker-created");
 	static_assert(!std::is_copy_constructible<OperationLease>::value,
@@ -212,6 +216,161 @@ void TestOwningTypesAreNotForgeable()
 	static_assert(!std::is_convertible<RecoveryCoreProtocolSession *,
 		ActiveCoreProtocolSession *>::value,
 		"recovery protocol authority cannot become active authority");
+}
+
+void TestCleanupInvocationBoundsSequentialOperations()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	std::unique_ptr<CleanupEpoch> epoch;
+	PrepareCleanup(broker, clock, profile, &generation, &epoch);
+
+	std::unique_ptr<OperationInvocation> first;
+	assert(broker.BeginCleanupInvocation(*epoch, 1500, &first) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> scheduler;
+	assert(broker.BeginCleanupOperation(*epoch, *first,
+		OperationKind::scheduler, &scheduler) == MISTER_RESULT_OK);
+	assert(scheduler->absolute_deadline_ms() == 1500);
+	assert(broker.FinishInvocation(std::move(first)) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(first != nullptr);
+	assert(broker.RecordOperationOutcome(*first, *scheduler, MISTER_RESULT_OK) ==
+		MISTER_RESULT_OK);
+	scheduler.reset();
+	std::unique_ptr<OperationLease> content_in_same_callback;
+	assert(broker.BeginCleanupOperation(*epoch, *first,
+		OperationKind::content, &content_in_same_callback) == MISTER_RESULT_OK);
+	assert(content_in_same_callback->absolute_deadline_ms() == 1500);
+	assert(broker.RecordOperationOutcome(*first, *content_in_same_callback,
+		MISTER_RESULT_OK) == MISTER_RESULT_OK);
+	content_in_same_callback.reset();
+	std::unique_ptr<OperationLease> terminal;
+	assert(broker.BeginCleanupOperation(*epoch, *first,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+	assert(terminal->absolute_deadline_ms() == 1500);
+	assert(broker.RecordOperationOutcome(*first, *terminal,
+		MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_OK);
+	terminal.reset();
+	assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+	assert(first == nullptr);
+
+	std::unique_ptr<OperationInvocation> second;
+	assert(broker.BeginCleanupInvocation(*epoch, 4000, &second) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> content;
+	assert(broker.BeginCleanupOperation(*epoch, *second,
+		OperationKind::content, &content) == MISTER_RESULT_OK);
+	assert(content->absolute_deadline_ms() == 3000);
+	assert(broker.RecordOperationOutcome(*second, *content, MISTER_RESULT_OK) ==
+		MISTER_RESULT_OK);
+	content.reset();
+	assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+}
+
+void TestInvocationRejectsAnUnrecordedOrdinaryOutcome()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	std::unique_ptr<CleanupEpoch> epoch;
+	PrepareCleanup(broker, clock, profile, &generation, &epoch);
+	std::unique_ptr<OperationInvocation> invocation;
+	assert(broker.BeginCleanupInvocation(*epoch, 1500, &invocation) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> lease;
+	assert(broker.BeginCleanupOperation(*epoch, *invocation,
+		OperationKind::scheduler, &lease) == MISTER_RESULT_OK);
+	lease.reset();
+	assert(broker.FinishInvocation(std::move(invocation)) ==
+		MISTER_RESULT_INVALID_STATE);
+	invocation.reset();
+}
+
+void TestRetainedRegistrationSuspendsRebindsAndFailsClosed()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	std::unique_ptr<CleanupEpoch> epoch;
+	PrepareCleanup(broker, clock, profile, &generation, &epoch);
+	std::unique_ptr<OperationInvocation> first;
+	assert(broker.BeginCleanupInvocation(*epoch, 1500, &first) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> save;
+	assert(broker.BeginCleanupOperation(*epoch, *first, OperationKind::save,
+		&save) == MISTER_RESULT_OK);
+	assert(broker.RecordOperationOutcome(*first, *save,
+		MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_OK);
+	assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+	assert(save->absolute_deadline_ms() == 0);
+
+	std::unique_ptr<OperationInvocation> second;
+	assert(broker.BeginCleanupInvocation(*epoch, 1800, &second) ==
+		MISTER_RESULT_OK);
+	assert(broker.RecordOperationOutcome(*second, *save,
+		MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_INVALID_STATE);
+	assert(broker.ContinueCleanupOperation(*epoch, *second, *save) ==
+		MISTER_RESULT_OK);
+	assert(save->absolute_deadline_ms() == 1800);
+	assert(broker.RecordOperationOutcome(*second, *save,
+		MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_OK);
+	second.reset();
+	assert(save->absolute_deadline_ms() == 0);
+	assert(broker.BeginCleanupInvocation(*epoch, 1900, &second) ==
+		MISTER_RESULT_OK);
+	assert(broker.ContinueCleanupOperation(*epoch, *second, *save) ==
+		MISTER_RESULT_OK);
+	assert(broker.RecordOperationOutcome(*second, *save,
+		MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_OK);
+	assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+	save.reset();
+}
+
+void TestLiveViewBlocksNextAdmissionAndInvocationFinish()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	std::unique_ptr<CleanupEpoch> epoch;
+	PrepareCleanup(broker, clock, profile, &generation, &epoch);
+	std::unique_ptr<OperationInvocation> invocation;
+	assert(broker.BeginCleanupInvocation(*epoch, 1500, &invocation) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> input;
+	assert(broker.BeginCleanupOperation(*epoch, *invocation,
+		OperationKind::input, &input) == MISTER_RESULT_OK);
+	std::unique_ptr<HardwareLeaseView> view;
+	assert(broker.AcquireHardwareLeaseView(*input, &view) == MISTER_RESULT_OK);
+	assert(broker.RecordOperationOutcome(*invocation, *input, MISTER_RESULT_OK) ==
+		MISTER_RESULT_OK);
+	input.reset();
+	std::unique_ptr<OperationLease> rejected;
+	assert(broker.BeginCleanupOperation(*epoch, *invocation,
+		OperationKind::content, &rejected) == MISTER_RESULT_INVALID_STATE);
+	assert(broker.BeginCleanupOperation(*epoch, *invocation,
+		OperationKind::terminal_fpga_cleanup, &rejected) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(broker.FinishInvocation(std::move(invocation)) ==
+		MISTER_RESULT_INVALID_STATE);
+	assert(invocation != nullptr);
+	view.reset();
+	assert(broker.BeginCleanupOperation(*epoch, *invocation,
+		OperationKind::content, &rejected) == MISTER_RESULT_OK);
+	assert(broker.RecordOperationOutcome(*invocation, *rejected,
+		MISTER_RESULT_OK) == MISTER_RESULT_OK);
+	rejected.reset();
+	assert(broker.BeginCleanupOperation(*epoch, *invocation,
+		OperationKind::terminal_fpga_cleanup, &rejected) == MISTER_RESULT_OK);
+	assert(broker.RecordOperationOutcome(*invocation, *rejected,
+		MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_OK);
+	rejected.reset();
+	assert(broker.FinishInvocation(std::move(invocation)) == MISTER_RESULT_OK);
 }
 
 void TestProtocolSessionsRequireExactAuthority()
@@ -1032,6 +1191,10 @@ void TestForeignNullDuplicateAndDestructionRejection()
 int main()
 {
 	mister::native::TestOwningTypesAreNotForgeable();
+	mister::native::TestCleanupInvocationBoundsSequentialOperations();
+	mister::native::TestInvocationRejectsAnUnrecordedOrdinaryOutcome();
+	mister::native::TestRetainedRegistrationSuspendsRebindsAndFailsClosed();
+	mister::native::TestLiveViewBlocksNextAdmissionAndInvocationFinish();
 	mister::native::TestProtocolSessionsRequireExactAuthority();
 	mister::native::TestEnterRequiresExactTrustedFixtureAuthority();
 	mister::native::TestLeaseDurationQuiesceAndFreshGeneration();

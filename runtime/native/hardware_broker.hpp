@@ -51,8 +51,14 @@ enum class CoreProtocolBrokerDisposition : uint8_t {
 	failure_completed
 };
 
+enum class RecoveryFailurePersistence : uint8_t {
+	retryable,
+	terminal
+};
+
 class HardwareBroker;
 class OperationLease;
+class OperationInvocation;
 class NativeInput;
 class NativeSpiBus;
 class NativeContainment;
@@ -289,6 +295,29 @@ private:
 	std::shared_ptr<OperationRegistration> registration_;
 };
 
+class OperationInvocation final {
+public:
+	~OperationInvocation();
+	OperationInvocation(const OperationInvocation &) = delete;
+	OperationInvocation &operator=(const OperationInvocation &) = delete;
+	OperationInvocation(OperationInvocation &&) = delete;
+	OperationInvocation &operator=(OperationInvocation &&) = delete;
+
+private:
+	friend class HardwareBroker;
+	OperationInvocation(HardwareBroker &broker, LeaseAuthority authority,
+		uint64_t authority_identity, uint64_t callback_deadline_ms,
+		uint64_t invocation_identity);
+
+	HardwareBroker *broker_;
+	std::shared_ptr<BrokerLifetime> lifetime_;
+	LeaseAuthority authority_;
+	uint64_t authority_identity_;
+	uint64_t callback_deadline_ms_;
+	uint64_t identity_;
+	bool registered_;
+};
+
 class CleanupEpoch final {
 public:
 	~CleanupEpoch();
@@ -399,9 +428,22 @@ public:
 	Result BeginCleanup(PlatformGenerationId generation,
 		uint64_t non_fpga_deadline_ms, uint64_t fpga_deadline_ms,
 		std::unique_ptr<CleanupEpoch> *epoch);
+	Result BeginCleanupInvocation(const CleanupEpoch &epoch,
+		uint64_t callback_deadline_ms,
+		std::unique_ptr<OperationInvocation> *invocation);
+	Result BeginRecoveryInvocation(const RecoveryEpoch &epoch,
+		uint64_t callback_deadline_ms,
+		std::unique_ptr<OperationInvocation> *invocation);
+	Result BeginCleanupOperation(const CleanupEpoch &epoch,
+		const OperationInvocation &invocation, OperationKind operation_kind,
+		std::unique_ptr<OperationLease> *lease);
+	Result ContinueCleanupOperation(const CleanupEpoch &epoch,
+		const OperationInvocation &invocation, const OperationLease &lease);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result BeginCleanupOperation(const CleanupEpoch &epoch,
 		OperationKind operation_kind,
 		std::unique_ptr<OperationLease> *lease);
+#endif
 	Result AcquireHardwareLeaseView(const OperationLease &lease,
 		std::unique_ptr<HardwareLeaseView> *view);
 	Result ObserveContainment(const CleanupEpoch &epoch,
@@ -412,13 +454,24 @@ public:
 		uint64_t non_fpga_deadline_ms, uint64_t fpga_deadline_ms,
 		std::unique_ptr<RecoveryEpoch> *epoch);
 	Result BeginRecoveryOperation(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation, OperationKind operation_kind,
+		std::unique_ptr<OperationLease> *lease);
+	Result ContinueRecoveryOperation(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation, const OperationLease &lease);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	Result BeginRecoveryOperation(const RecoveryEpoch &epoch,
 		OperationKind operation_kind,
 		std::unique_ptr<OperationLease> *lease);
+#endif
+	Result FinishInvocation(std::unique_ptr<OperationInvocation> &&invocation);
+	Result RecordOperationOutcome(const OperationInvocation &invocation,
+		const OperationLease &lease, Result result);
 	Result FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
 		MisterRecoveryObservationV2 *observation);
 
 private:
 	friend class OperationLease;
+	friend class OperationInvocation;
 	friend class CleanupEpoch;
 	friend class RecoveryEpoch;
 	friend class HardwareLeaseView;
@@ -443,12 +496,26 @@ private:
 	};
 
 	void ReleaseOperation(OperationRegistration &registration);
+	void UnregisterInvocation(OperationInvocation &invocation);
 	void ReleaseHardwareLeaseView(HardwareLeaseView &view);
 	void ReleaseProcessOperationGuard(ProcessOperationGuard &guard);
 	void UnregisterCleanup(CleanupEpoch &epoch);
 	void UnregisterRecovery(RecoveryEpoch &epoch);
 	bool IsCurrentCleanup(const CleanupEpoch &epoch) const;
 	bool IsCurrentRecovery(const RecoveryEpoch &epoch) const;
+	bool IsCurrentInvocation(const OperationInvocation &invocation,
+		LeaseAuthority authority, uint64_t authority_identity) const;
+	Result BeginInvocation(LeaseAuthority authority, uint64_t authority_identity,
+		uint64_t callback_deadline_ms,
+		std::unique_ptr<OperationInvocation> *invocation);
+	Result BeginInvokedOperation(LeaseAuthority authority,
+		uint64_t authority_identity, const OperationInvocation &invocation,
+		OperationKind operation_kind, uint64_t authority_deadline_ms,
+		const NativeCoreProfile *profile,
+		std::unique_ptr<OperationLease> *lease);
+	Result ContinueInvokedOperation(LeaseAuthority authority,
+		uint64_t authority_identity, const OperationInvocation &invocation,
+		const OperationLease &lease, uint64_t authority_deadline_ms);
 	static bool IsHardwareOperation(OperationKind operation_kind);
 	static bool IsRecoveryOperation(OperationKind operation_kind,
 		uint32_t requested_resource_flags);
@@ -615,27 +682,35 @@ private:
 		const OperationLease &terminal_lease);
 	Result CommitRecoveryContainment(const RecoveryEpoch &epoch,
 		const OperationLease &terminal_lease);
-	Result BeginRecoveryObservation(const RecoveryEpoch &epoch);
-	Result CheckRecoveryObservationDeadline(const RecoveryEpoch &epoch);
+	Result BeginRecoveryObservation(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation);
+	Result CheckRecoveryObservationDeadline(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation);
 	Result EndRecoveryObservation(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation,
 		uint32_t observed_resource_flags, uint32_t neutral_resource_flags,
 		Result result);
+	Result RecoveryObservationDeadline(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation, uint64_t *deadline_ms) const;
 	Result RecordRecoveryContainmentObservation(const RecoveryEpoch &epoch,
 		uint32_t observed_resource_flags, uint32_t neutral_resource_flags,
 		Result result);
 	Result RecordRecoveryOperation(const RecoveryEpoch &epoch,
 		const OperationLease &lease, RecoveryResourceState resource_state,
 		Result result);
-	Result RecordRecoveryFailure(const RecoveryEpoch &epoch, Result result);
+	Result RecordRecoveryFailure(const RecoveryEpoch &epoch,
+		const OperationLease &lease, Result result,
+		RecoveryFailurePersistence persistence);
 	Result SnapshotRecovery(const RecoveryEpoch &epoch,
-		MisterRecoveryObservationV2 *observation) const;
+		MisterRecoveryObservationV2 *observation);
 	Result ValidateRecoveryRequestedFlags(const RecoveryEpoch &epoch,
 		uint32_t callback_requested_flags) const;
 	bool CanFinishRecovery(const RecoveryEpoch &epoch) const;
 	static uint32_t RecoveryResourceForOperation(OperationKind operation_kind);
 	void RecordRecoveryPartition(uint32_t observed_resource_flags,
 		uint32_t neutral_resource_flags);
-	void LatchRecoveryResult(Result result);
+	void LatchRecoveryResult(Result result,
+		RecoveryFailurePersistence persistence);
 	void ClearContainmentReceipt();
 	void ClearCoreProtocolFailureReceipt();
 	void ConsumeCoreProtocolSessionState(OperationRegistration &registration,
@@ -678,6 +753,14 @@ private:
 	uint32_t recovery_requested_resource_flags_;
 	uint64_t recovery_non_fpga_deadline_ms_;
 	uint64_t recovery_fpga_deadline_ms_;
+	LeaseAuthority invocation_authority_;
+	uint64_t invocation_authority_identity_;
+	uint64_t invocation_identity_;
+	uint64_t invocation_callback_deadline_ms_;
+	bool invocation_registered_;
+	bool invocation_outcome_missing_;
+	std::weak_ptr<OperationRegistration> invocation_registration_;
+	std::weak_ptr<OperationRegistration> suspended_registration_;
 	uint64_t mutation_sequence_;
 	size_t active_lease_count_;
 	size_t terminal_lease_count_;

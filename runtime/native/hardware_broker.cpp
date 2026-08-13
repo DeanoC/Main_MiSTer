@@ -43,8 +43,9 @@ struct OperationRegistration {
 		const NativeCoreProfile *bound_profile)
 		: broker(&owner), lifetime(broker_lifetime), authority(lease_authority),
 		  authority_identity(identity), operation_kind(kind),
-		  absolute_deadline_ms(deadline_ms), profile(bound_profile),
-		  registered(false), process_guard_active(false),
+		  authority_deadline_ms(deadline_ms), effective_deadline_ms(deadline_ms),
+		  invocation_identity(0), profile(bound_profile),
+		  registered(false), process_guard_active(false), outcome_recorded(false),
 		  core_protocol_completion(CoreProtocolBrokerDisposition::no_session),
 		  core_protocol_session_state(),
 		  peripheral_completion(PeripheralBrokerDisposition::no_session),
@@ -65,10 +66,13 @@ struct OperationRegistration {
 	LeaseAuthority authority;
 	uint64_t authority_identity;
 	OperationKind operation_kind;
-	uint64_t absolute_deadline_ms;
+	uint64_t authority_deadline_ms;
+	uint64_t effective_deadline_ms;
+	uint64_t invocation_identity;
 	const NativeCoreProfile *profile;
 	bool registered;
 	bool process_guard_active;
+	bool outcome_recorded;
 	CoreProtocolBrokerDisposition core_protocol_completion;
 	std::shared_ptr<ProtocolSessionState> core_protocol_session_state;
 	PeripheralBrokerDisposition peripheral_completion;
@@ -80,6 +84,7 @@ namespace {
 std::atomic<uint64_t> generation_nonce_source(0);
 std::atomic<uint64_t> cleanup_nonce_source(0);
 std::atomic<uint64_t> peripheral_backend_nonce_source(0);
+std::atomic<uint64_t> invocation_nonce_source(0);
 
 uint64_t FreshNonzeroNonce(std::atomic<uint64_t> &source)
 {
@@ -100,6 +105,11 @@ bool OutputAvailable(const std::unique_ptr<CleanupEpoch> *output)
 }
 
 bool OutputAvailable(const std::unique_ptr<RecoveryEpoch> *output)
+{
+	return output != nullptr && output->get() == nullptr;
+}
+
+bool OutputAvailable(const std::unique_ptr<OperationInvocation> *output)
 {
 	return output != nullptr && output->get() == nullptr;
 }
@@ -134,7 +144,7 @@ ProcessOperationGuard::~ProcessOperationGuard()
 
 uint64_t ProcessOperationGuard::absolute_deadline_ms() const
 {
-	return registration_ ? registration_->absolute_deadline_ms : 0;
+	return registration_ ? registration_->effective_deadline_ms : 0;
 }
 
 LeaseAuthority ProcessOperationGuard::authority() const
@@ -188,7 +198,7 @@ Result HardwareLeaseView::AuthorizeFpgaProgrammingProfile(
 
 uint64_t HardwareLeaseView::absolute_deadline_ms() const
 {
-	return registration_->absolute_deadline_ms;
+	return registration_->effective_deadline_ms;
 }
 
 OperationLease::OperationLease(
@@ -524,7 +534,25 @@ OperationKind OperationLease::operation_kind() const
 
 uint64_t OperationLease::absolute_deadline_ms() const
 {
-	return registration_->absolute_deadline_ms;
+	return registration_->effective_deadline_ms;
+}
+
+OperationInvocation::OperationInvocation(HardwareBroker &broker,
+	LeaseAuthority authority, uint64_t authority_identity,
+	uint64_t callback_deadline_ms, uint64_t invocation_identity)
+	: broker_(&broker), lifetime_(broker.lifetime_), authority_(authority),
+	  authority_identity_(authority_identity),
+	  callback_deadline_ms_(callback_deadline_ms),
+	  identity_(invocation_identity), registered_(true)
+{
+}
+
+OperationInvocation::~OperationInvocation()
+{
+	if (!lifetime_ || !registered_) return;
+	std::lock_guard<std::mutex> lifetime_lock(lifetime_->mutex);
+	if (broker_ != nullptr && registered_ && lifetime_->broker == broker_)
+		broker_->UnregisterInvocation(*this);
 }
 
 CleanupEpoch::CleanupEpoch(HardwareBroker &broker,
@@ -585,6 +613,10 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 	  cleanup_fpga_deadline_ms_(0), terminal_lease_deadline_ms_(0),
 	  recovery_identity_(0), recovery_requested_resource_flags_(0),
 	  recovery_non_fpga_deadline_ms_(0), recovery_fpga_deadline_ms_(0),
+	  invocation_authority_(LeaseAuthority::active_generation),
+	  invocation_authority_identity_(0), invocation_identity_(0),
+	  invocation_callback_deadline_ms_(0), invocation_registered_(false),
+	  invocation_outcome_missing_(false), invocation_registration_(),
 	  mutation_sequence_(0), active_lease_count_(0), terminal_lease_count_(0),
 	  cleanup_registered_(false), cleanup_ever_started_(false),
 	  quiesce_complete_(false), quiesce_call_active_(false),
@@ -862,7 +894,8 @@ Result HardwareBroker::BeginCleanup(PlatformGenerationId generation,
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (generation == 0 || generation != generation_ ||
 		state_ != State::quiescing || active_lease_count_ != 0 ||
-		!quiesce_complete_ || cleanup_registered_ || cleanup_ever_started_) {
+		!quiesce_complete_ || cleanup_registered_ || cleanup_ever_started_ ||
+		invocation_registered_) {
 		return MISTER_RESULT_INVALID_STATE;
 	}
 
@@ -884,6 +917,139 @@ Result HardwareBroker::BeginCleanup(PlatformGenerationId generation,
 	return MISTER_RESULT_OK;
 }
 
+bool HardwareBroker::IsCurrentInvocation(const OperationInvocation &invocation,
+	LeaseAuthority authority, uint64_t authority_identity) const
+{
+	return invocation.registered_ && invocation.broker_ == this &&
+		invocation.authority_ == authority &&
+		invocation.authority_identity_ == authority_identity &&
+		invocation.identity_ == invocation_identity_ &&
+		invocation.callback_deadline_ms_ == invocation_callback_deadline_ms_ &&
+		invocation_registered_ && invocation_authority_ == authority &&
+		invocation_authority_identity_ == authority_identity;
+}
+
+Result HardwareBroker::BeginInvocation(LeaseAuthority authority,
+	uint64_t authority_identity, uint64_t callback_deadline_ms,
+	std::unique_ptr<OperationInvocation> *invocation)
+{
+	if (!OutputAvailable(invocation) || callback_deadline_ms == 0)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (invocation_registered_ || clock_.NowMs() >= callback_deadline_ms)
+		return invocation_registered_ ? MISTER_RESULT_INVALID_STATE :
+			MISTER_RESULT_DEADLINE;
+	const bool cleanup = authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && cleanup_registered_ &&
+		authority_identity == cleanup_identity_;
+	const bool recovery = authority == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery && recovery_registered_ &&
+		authority_identity == recovery_identity_ && !recovery_terminal_neutral_;
+	if (!cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+	const uint64_t identity = FreshNonzeroNonce(invocation_nonce_source);
+	std::unique_ptr<OperationInvocation> admitted(
+		new (std::nothrow) OperationInvocation(*this, authority,
+			authority_identity, callback_deadline_ms, identity));
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	invocation_authority_ = authority;
+	invocation_authority_identity_ = authority_identity;
+	invocation_identity_ = identity;
+	invocation_callback_deadline_ms_ = callback_deadline_ms;
+	invocation_registered_ = true;
+	invocation_outcome_missing_ = false;
+	invocation_registration_.reset();
+	*invocation = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::BeginCleanupInvocation(const CleanupEpoch &epoch,
+	uint64_t callback_deadline_ms,
+	std::unique_ptr<OperationInvocation> *invocation)
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!IsCurrentCleanup(epoch)) return MISTER_RESULT_INVALID_STATE;
+	}
+	return BeginInvocation(LeaseAuthority::cleanup_epoch, epoch.identity_,
+		callback_deadline_ms, invocation);
+}
+
+Result HardwareBroker::BeginRecoveryInvocation(const RecoveryEpoch &epoch,
+	uint64_t callback_deadline_ms,
+	std::unique_ptr<OperationInvocation> *invocation)
+{
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!IsCurrentRecovery(epoch)) return MISTER_RESULT_INVALID_STATE;
+	}
+	return BeginInvocation(LeaseAuthority::recovery_epoch, epoch.identity_,
+		callback_deadline_ms, invocation);
+}
+
+Result HardwareBroker::BeginInvokedOperation(LeaseAuthority authority,
+	uint64_t authority_identity, const OperationInvocation &invocation,
+	OperationKind operation_kind, uint64_t authority_deadline_ms,
+	const NativeCoreProfile *profile,
+	std::unique_ptr<OperationLease> *lease)
+{
+	if (!OutputAvailable(lease)) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const bool cleanup = authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && cleanup_registered_ &&
+		authority_identity == cleanup_identity_;
+	const bool recovery = authority == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery && recovery_registered_ &&
+		authority_identity == recovery_identity_ &&
+		!recovery_observation_active_ && !recovery_terminal_neutral_ &&
+		IsRecoveryOperation(operation_kind, recovery_requested_resource_flags_);
+	if (!IsCurrentInvocation(invocation, authority, authority_identity) ||
+		(!cleanup && !recovery) ||
+		invocation_outcome_missing_ || !invocation_registration_.expired() ||
+		active_lease_count_ != 0)
+		return MISTER_RESULT_INVALID_STATE;
+	const uint64_t effective_deadline_ms = authority_deadline_ms <
+		invocation.callback_deadline_ms_ ? authority_deadline_ms :
+		invocation.callback_deadline_ms_;
+	if (clock_.NowMs() >= effective_deadline_ms) return MISTER_RESULT_DEADLINE;
+	std::shared_ptr<OperationRegistration> registration(
+		new (std::nothrow) OperationRegistration(*this, authority,
+			authority_identity, operation_kind, authority_deadline_ms,
+			lifetime_, profile));
+	if (!registration) return MISTER_RESULT_PLATFORM;
+	registration->effective_deadline_ms = effective_deadline_ms;
+	registration->invocation_identity = invocation.identity_;
+	registration->outcome_recorded = false;
+	std::unique_ptr<OperationLease> admitted(
+		new (std::nothrow) OperationLease(registration));
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	registration->registered = true;
+	++active_lease_count_;
+	if (operation_kind == OperationKind::terminal_fpga_cleanup) {
+		++terminal_lease_count_;
+		terminal_lease_deadline_ms_ = effective_deadline_ms;
+	}
+	invocation_registration_ = registration;
+	*lease = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::BeginCleanupOperation(const CleanupEpoch &epoch,
+	const OperationInvocation &invocation, OperationKind operation_kind,
+	std::unique_ptr<OperationLease> *lease)
+{
+	uint64_t authority_deadline_ms = 0;
+	if (!CleanupDeadline(operation_kind, epoch, &authority_deadline_ms))
+		return MISTER_RESULT_INVALID_STATE;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (state_ != State::cleanup || !IsCurrentCleanup(epoch))
+			return MISTER_RESULT_INVALID_STATE;
+	}
+	return BeginInvokedOperation(LeaseAuthority::cleanup_epoch, epoch.identity_,
+		invocation, operation_kind, authority_deadline_ms, profile_, lease);
+}
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 Result HardwareBroker::BeginCleanupOperation(const CleanupEpoch &epoch,
 	OperationKind operation_kind, std::unique_ptr<OperationLease> *lease)
 {
@@ -920,6 +1086,7 @@ Result HardwareBroker::BeginCleanupOperation(const CleanupEpoch &epoch,
 	*lease = std::move(admitted);
 	return MISTER_RESULT_OK;
 }
+#endif
 
 Result HardwareBroker::AcquireHardwareLeaseView(const OperationLease &lease,
 	std::unique_ptr<HardwareLeaseView> *view)
@@ -968,7 +1135,7 @@ Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
 			recovery_requested_resource_flags_);
 	if (!active_authority && !cleanup_authority && !recovery_authority)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 
 	std::unique_ptr<HardwareLeaseView> admitted(
@@ -1001,7 +1168,7 @@ Result HardwareBroker::AcquireActiveCoreProtocolSessionFor(
 		registration->profile != &profile || state_ != State::active ||
 		failure_latched_)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	std::unique_ptr<ActiveCoreProtocolSession> admitted(
 		new (std::nothrow) ActiveCoreProtocolSession());
@@ -1045,7 +1212,7 @@ Result HardwareBroker::AcquireCleanupCoreProtocolSessionFor(
 		// A failed teardown retains the original registration, view, and
 		// immutable epoch deadline. Only that registration can atomically
 		// re-check out its abandoned typed handle.
-		if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		if (clock_.NowMs() >= registration->effective_deadline_ms)
 			return MISTER_RESULT_DEADLINE;
 		const std::shared_ptr<ProtocolSessionState> current =
 			core_protocol_session_state_.lock();
@@ -1075,7 +1242,7 @@ Result HardwareBroker::AcquireCleanupCoreProtocolSessionFor(
 		registration->core_protocol_completion !=
 			CoreProtocolBrokerDisposition::no_session)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	std::unique_ptr<CleanupCoreProtocolSession> admitted(
 		new (std::nothrow) CleanupCoreProtocolSession());
@@ -1120,7 +1287,7 @@ Result HardwareBroker::AcquireRecoveryCoreProtocolSessionFor(
 	if (registration->core_protocol_session_state) {
 		// Recovery has no profile, but it retains the exact requested
 		// CORE_PROTOCOL registration and its original deadline on failure.
-		if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		if (clock_.NowMs() >= registration->effective_deadline_ms)
 			return MISTER_RESULT_DEADLINE;
 		const std::shared_ptr<ProtocolSessionState> current =
 			core_protocol_session_state_.lock();
@@ -1150,7 +1317,7 @@ Result HardwareBroker::AcquireRecoveryCoreProtocolSessionFor(
 		registration->core_protocol_completion !=
 			CoreProtocolBrokerDisposition::no_session)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	std::unique_ptr<RecoveryCoreProtocolSession> admitted(
 		new (std::nothrow) RecoveryCoreProtocolSession());
@@ -1449,10 +1616,31 @@ Result HardwareBroker::GetCoreProtocolBrokerDispositionFor(
 		lease.registration_;
 	if (!registration || !registration->registered ||
 		registration->broker != this ||
-		registration->operation_kind != OperationKind::core_protocol ||
-		registration->authority != LeaseAuthority::active_generation ||
-		registration->authority_identity != generation_ ||
-		registration->profile == nullptr || registration->profile != profile_)
+		registration->operation_kind != OperationKind::core_protocol)
+		return MISTER_RESULT_INVALID_STATE;
+	const bool active = registration->authority ==
+		LeaseAuthority::active_generation &&
+		registration->authority_identity == generation_ &&
+		registration->profile != nullptr && registration->profile == profile_;
+	const bool cleanup = registration->authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && cleanup_registered_ &&
+		registration->authority_identity == cleanup_identity_ &&
+		registration->profile != nullptr && registration->profile == profile_;
+	const bool recovery = registration->authority ==
+		LeaseAuthority::recovery_epoch && state_ == State::recovery &&
+		recovery_registered_ &&
+		registration->authority_identity == recovery_identity_ &&
+		registration->profile == nullptr;
+	if (!active && !cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+	bool legacy_test_authority = false;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	legacy_test_authority = registration->invocation_identity == 0 &&
+		registration->effective_deadline_ms != 0 && !invocation_registered_;
+#endif
+	if (!active && !legacy_test_authority &&
+		(registration->effective_deadline_ms == 0 ||
+		registration->invocation_identity == 0 || !invocation_registered_ ||
+		registration->invocation_identity != invocation_identity_))
 		return MISTER_RESULT_INVALID_STATE;
 	if (registration->core_protocol_completion ==
 			CoreProtocolBrokerDisposition::success_completed ||
@@ -1566,7 +1754,7 @@ Result HardwareBroker::AcquirePeripheralState(const OperationLease &lease,
 		!recovery_terminal_neutral_ &&
 		IsRecoveryOperation(required_kind, recovery_requested_resource_flags_);
 	if (!active && !cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	if (active) {
 		if (profile == nullptr || registration->profile != profile_ ||
@@ -1628,7 +1816,7 @@ Result HardwareBroker::AcquirePeripheralState(const OperationLease &lease,
 	// Retained recheckout deliberately bypasses this initialization so suffix
 	// progress and its later mutation sequence are never reset.
 	admitted->last_mutation_sequence = mutation_sequence_;
-	admitted->absolute_deadline_ms = registration->absolute_deadline_ms;
+	admitted->absolute_deadline_ms = registration->effective_deadline_ms;
 	registration->peripheral_session_state = admitted;
 	peripheral_session_state_ = admitted;
 	hardware_transaction_active_ = true;
@@ -1647,6 +1835,17 @@ Result HardwareBroker::GetPeripheralDisposition(const OperationLease &lease,
 		(registration->operation_kind != (kind == PeripheralSessionKind::audio ?
 			OperationKind::audio : kind == PeripheralSessionKind::video ?
 			OperationKind::video : OperationKind::audio_video)))
+		return MISTER_RESULT_INVALID_STATE;
+	bool legacy_test_authority = false;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	legacy_test_authority = registration->invocation_identity == 0 &&
+		registration->effective_deadline_ms != 0 && !invocation_registered_;
+#endif
+	if (registration->authority != LeaseAuthority::active_generation &&
+		!legacy_test_authority &&
+		(registration->effective_deadline_ms == 0 ||
+		 registration->invocation_identity == 0 || !invocation_registered_ ||
+		 registration->invocation_identity != invocation_identity_))
 		return MISTER_RESULT_INVALID_STATE;
 	if (registration->peripheral_completion != PeripheralBrokerDisposition::no_session) {
 		*disposition = registration->peripheral_completion;
@@ -1750,7 +1949,7 @@ Result HardwareBroker::CompletePeripheralSession(
 		state_ == State::recovery && registration->authority_identity == recovery_identity_;
 	if (!active && !cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
 	if (receipt.mutation_sequence != mutation_sequence_ ||
-		(clock_.NowMs() >= registration->absolute_deadline_ms &&
+		(clock_.NowMs() >= registration->effective_deadline_ms &&
 		 receipt.result == MISTER_RESULT_OK))
 		return MISTER_RESULT_DEADLINE;
 	if (active_failure) {
@@ -1857,7 +2056,7 @@ Result HardwareBroker::CompleteCoupledSession(
 		(state->action != PeripheralSessionAction::none &&
 			(state->action_progress_unknown || !state->action_transaction_closed ||
 			 state->action_next_word_index != state->action_word_count)) ||
-		(clock_.NowMs() >= registration->absolute_deadline_ms &&
+		(clock_.NowMs() >= registration->effective_deadline_ms &&
 		 receipt.result == MISTER_RESULT_OK) ||
 		(active && receipt.mutation_sequence <= state->initial_mutation_sequence))
 		return MISTER_RESULT_INVALID_STATE;
@@ -2166,7 +2365,7 @@ Result HardwareBroker::RecordPeripheralMutation(
 		!state->view || state->view->registration_.get() != registration.get() ||
 		state->phase.load() != PeripheralSessionPhase::live ||
 		!hardware_transaction_active_ || containment_evidence_pending_ ||
-		clock_.NowMs() >= registration->absolute_deadline_ms ||
+		clock_.NowMs() >= registration->effective_deadline_ms ||
 		mutation_sequence_ == UINT64_MAX)
 		return MISTER_RESULT_INVALID_STATE;
 	*mutation_sequence = ++mutation_sequence_;
@@ -2196,7 +2395,7 @@ Result HardwareBroker::PreparePeripheralAction(
 		!hardware_transaction_active_ || containment_evidence_pending_ ||
 		!PeripheralActionMatchesSession(action, state->kind))
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	if (state->action == PeripheralSessionAction::none) {
 		state->action = action;
@@ -2236,7 +2435,7 @@ Result HardwareBroker::AdmitPeripheralAction(
 		state->phase.load() != PeripheralSessionPhase::live ||
 		!hardware_transaction_active_ || containment_evidence_pending_)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	if (state->action != action || state->action_progress_unknown ||
 		!state->action_transaction_closed ||
@@ -2263,7 +2462,7 @@ Result HardwareBroker::RecordPeripheralActionWord(
 		state->phase.load() != PeripheralSessionPhase::live ||
 		!hardware_transaction_active_ || containment_evidence_pending_)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms) {
+	if (clock_.NowMs() >= registration->effective_deadline_ms) {
 		state->action_progress_unknown = true;
 		return MISTER_RESULT_DEADLINE;
 	}
@@ -2294,11 +2493,11 @@ Result HardwareBroker::ClosePeripheralAction(
 		state->phase.load() != PeripheralSessionPhase::live ||
 		!hardware_transaction_active_ || containment_evidence_pending_)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms ||
+	if (clock_.NowMs() >= registration->effective_deadline_ms ||
 		state->action != action || state->action_transaction_closed ||
 		state->action_progress_unknown) {
 		state->action_progress_unknown = true;
-		return clock_.NowMs() >= registration->absolute_deadline_ms ?
+		return clock_.NowMs() >= registration->effective_deadline_ms ?
 			MISTER_RESULT_DEADLINE : MISTER_RESULT_INVALID_STATE;
 	}
 	state->action_transaction_closed = true;
@@ -2326,14 +2525,15 @@ Result HardwareBroker::RecordCoupledRecoveryOperation(
 		((receipt.observed_flags | receipt.neutral_flags) & ~affected) != 0)
 		return MISTER_RESULT_INVALID_STATE;
 	if (operation_result == MISTER_RESULT_OK &&
-		clock_.NowMs() >= registration->absolute_deadline_ms)
+		clock_.NowMs() >= registration->effective_deadline_ms)
 		operation_result = MISTER_RESULT_DEADLINE;
 	const uint32_t classified = receipt.observed_flags |
 		receipt.neutral_flags;
 	recovery_observed_resource_flags_ &= ~classified;
 	recovery_neutral_resource_flags_ &= ~classified;
 	RecordRecoveryPartition(receipt.observed_flags, receipt.neutral_flags);
-	LatchRecoveryResult(operation_result);
+	LatchRecoveryResult(operation_result, RecoveryFailurePersistence::retryable);
+	registration->outcome_recorded = true;
 	return operation_result;
 }
 
@@ -2410,7 +2610,7 @@ Result HardwareBroker::AcquireProcessOperationGuardFor(
 			recovery_requested_resource_flags_);
 	if (!active_authority && !cleanup_authority && !recovery_authority)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 
 	std::unique_ptr<ProcessOperationGuard> admitted(
@@ -2438,7 +2638,7 @@ Result HardwareBroker::BeginRecovery(uint32_t requested_resource_flags,
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (state_ != State::idle || generation_ != 0 ||
 		cleanup_registered_ || recovery_registered_ ||
-		active_lease_count_ != 0)
+		active_lease_count_ != 0 || invocation_registered_)
 		return MISTER_RESULT_INVALID_STATE;
 	if (clock_.NowMs() >= non_fpga_deadline_ms ||
 		clock_.NowMs() >= fpga_deadline_ms)
@@ -2466,6 +2666,7 @@ Result HardwareBroker::BeginRecovery(uint32_t requested_resource_flags,
 	return MISTER_RESULT_OK;
 }
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
 	OperationKind operation_kind, std::unique_ptr<OperationLease> *lease)
 {
@@ -2484,7 +2685,8 @@ Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
 	if (active_lease_count_ != 0 || (terminal && terminal_lease_count_ != 0))
 		return MISTER_RESULT_INVALID_STATE;
 	if (clock_.NowMs() >= absolute_deadline_ms) {
-		LatchRecoveryResult(MISTER_RESULT_DEADLINE);
+		LatchRecoveryResult(MISTER_RESULT_DEADLINE,
+			RecoveryFailurePersistence::retryable);
 		return MISTER_RESULT_DEADLINE;
 	}
 
@@ -2493,13 +2695,15 @@ Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
 			LeaseAuthority::recovery_epoch, epoch.identity_, operation_kind,
 			absolute_deadline_ms, lifetime_, nullptr));
 	if (!registration) {
-		LatchRecoveryResult(MISTER_RESULT_PLATFORM);
+		LatchRecoveryResult(MISTER_RESULT_PLATFORM,
+			RecoveryFailurePersistence::retryable);
 		return MISTER_RESULT_PLATFORM;
 	}
 	std::unique_ptr<OperationLease> admitted(
 		new (std::nothrow) OperationLease(registration));
 	if (!admitted) {
-		LatchRecoveryResult(MISTER_RESULT_PLATFORM);
+		LatchRecoveryResult(MISTER_RESULT_PLATFORM,
+			RecoveryFailurePersistence::retryable);
 		return MISTER_RESULT_PLATFORM;
 	}
 	registration->registered = true;
@@ -2511,6 +2715,194 @@ Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
 	*lease = std::move(admitted);
 	return MISTER_RESULT_OK;
 }
+#endif
+
+Result HardwareBroker::BeginRecoveryOperation(const RecoveryEpoch &epoch,
+	const OperationInvocation &invocation, OperationKind operation_kind,
+	std::unique_ptr<OperationLease> *lease)
+{
+	uint64_t authority_deadline_ms = 0;
+	if (!RecoveryDeadline(operation_kind, epoch, &authority_deadline_ms))
+		return MISTER_RESULT_INVALID_STATE;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (state_ != State::recovery || !IsCurrentRecovery(epoch) ||
+			recovery_observation_active_ || recovery_terminal_neutral_ ||
+			!IsRecoveryOperation(operation_kind,
+				epoch.requested_resource_flags_))
+			return MISTER_RESULT_INVALID_STATE;
+	}
+	const Result result = BeginInvokedOperation(LeaseAuthority::recovery_epoch,
+		epoch.identity_, invocation, operation_kind, authority_deadline_ms,
+		nullptr, lease);
+	if (result != MISTER_RESULT_OK) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (IsCurrentRecovery(epoch)) LatchRecoveryResult(result,
+			RecoveryFailurePersistence::retryable);
+	}
+	return result;
+}
+
+Result HardwareBroker::ContinueInvokedOperation(LeaseAuthority authority,
+	uint64_t authority_identity, const OperationInvocation &invocation,
+	const OperationLease &lease, uint64_t authority_deadline_ms)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const std::shared_ptr<OperationRegistration> suspended =
+		suspended_registration_.lock();
+	const bool cleanup = authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && cleanup_registered_ &&
+		authority_identity == cleanup_identity_;
+	const bool recovery = authority == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery && recovery_registered_ &&
+		authority_identity == recovery_identity_ &&
+		!recovery_observation_active_ && !recovery_terminal_neutral_ &&
+		IsRecoveryOperation(registration ? registration->operation_kind :
+			OperationKind::program_fpga, recovery_requested_resource_flags_);
+	if (!IsCurrentInvocation(invocation, authority, authority_identity) ||
+		(!cleanup && !recovery) || invocation_outcome_missing_ ||
+		!invocation_registration_.expired() || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->authority != authority ||
+		registration->authority_identity != authority_identity ||
+		registration->authority_deadline_ms != authority_deadline_ms ||
+		registration->effective_deadline_ms != 0 ||
+		registration->invocation_identity != 0 ||
+		registration->process_guard_active || active_lease_count_ != 1 ||
+		terminal_lease_count_ != 0 || suspended.get() != registration.get())
+		return MISTER_RESULT_INVALID_STATE;
+	const bool core_abandoned = registration->core_protocol_session_state &&
+		registration->core_protocol_session_state->handle_state.load() ==
+			ProtocolSessionHandleState::abandoned;
+	const bool peripheral_abandoned = registration->peripheral_session_state &&
+		registration->peripheral_session_state->phase.load() ==
+			PeripheralSessionPhase::abandoned;
+	const bool save_retry = registration->operation_kind == OperationKind::save;
+	if ((!core_abandoned && !peripheral_abandoned && hardware_transaction_active_) ||
+		(!core_abandoned && !peripheral_abandoned && !save_retry))
+		return MISTER_RESULT_INVALID_STATE;
+	const uint64_t effective_deadline_ms = authority_deadline_ms <
+		invocation.callback_deadline_ms_ ? authority_deadline_ms :
+		invocation.callback_deadline_ms_;
+	if (clock_.NowMs() >= effective_deadline_ms) return MISTER_RESULT_DEADLINE;
+	registration->effective_deadline_ms = effective_deadline_ms;
+	registration->invocation_identity = invocation.identity_;
+	registration->outcome_recorded = false;
+	if (registration->peripheral_session_state)
+		registration->peripheral_session_state->absolute_deadline_ms =
+			effective_deadline_ms;
+	suspended_registration_.reset();
+	invocation_registration_ = registration;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::ContinueCleanupOperation(const CleanupEpoch &epoch,
+	const OperationInvocation &invocation, const OperationLease &lease)
+{
+	uint64_t authority_deadline_ms = 0;
+	if (!CleanupDeadline(lease.operation_kind(), epoch, &authority_deadline_ms))
+		return MISTER_RESULT_INVALID_STATE;
+	return ContinueInvokedOperation(LeaseAuthority::cleanup_epoch,
+		epoch.identity_, invocation, lease, authority_deadline_ms);
+}
+
+Result HardwareBroker::ContinueRecoveryOperation(const RecoveryEpoch &epoch,
+	const OperationInvocation &invocation, const OperationLease &lease)
+{
+	uint64_t authority_deadline_ms = 0;
+	if (!RecoveryDeadline(lease.operation_kind(), epoch, &authority_deadline_ms))
+		return MISTER_RESULT_INVALID_STATE;
+	return ContinueInvokedOperation(LeaseAuthority::recovery_epoch,
+		epoch.identity_, invocation, lease, authority_deadline_ms);
+}
+
+Result HardwareBroker::FinishInvocation(
+	std::unique_ptr<OperationInvocation> &&invocation)
+{
+	if (!invocation) return MISTER_RESULT_INVALID_ARGUMENT;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!IsCurrentInvocation(*invocation, invocation->authority_,
+			invocation->authority_identity_))
+			return MISTER_RESULT_INVALID_STATE;
+		if (invocation_outcome_missing_)
+			return MISTER_RESULT_INVALID_STATE;
+		const std::shared_ptr<OperationRegistration> registration =
+			invocation_registration_.lock();
+		if (registration) {
+			const bool core_abandoned = registration->core_protocol_session_state &&
+				registration->core_protocol_session_state->handle_state.load() ==
+					ProtocolSessionHandleState::abandoned;
+			const bool peripheral_abandoned =
+				registration->peripheral_session_state &&
+				registration->peripheral_session_state->phase.load() ==
+					PeripheralSessionPhase::abandoned;
+			const bool save_retry =
+				registration->operation_kind == OperationKind::save;
+			const bool retained_typed = core_abandoned || peripheral_abandoned;
+			if (!registration->registered || registration->process_guard_active ||
+				active_lease_count_ != 1 || terminal_lease_count_ != 0 ||
+				(hardware_transaction_active_ && !retained_typed) ||
+				(!core_abandoned && !peripheral_abandoned && !save_retry) ||
+				!registration->outcome_recorded)
+				return MISTER_RESULT_INVALID_STATE;
+			registration->effective_deadline_ms = 0;
+			registration->invocation_identity = 0;
+			if (registration->peripheral_session_state)
+				registration->peripheral_session_state->absolute_deadline_ms = 0;
+			suspended_registration_ = registration;
+		} else if (active_lease_count_ != 0 || terminal_lease_count_ != 0) {
+			const std::shared_ptr<OperationRegistration> suspended =
+				suspended_registration_.lock();
+			const bool core_abandoned = suspended &&
+				suspended->core_protocol_session_state &&
+				suspended->core_protocol_session_state->handle_state.load() ==
+					ProtocolSessionHandleState::abandoned;
+			const bool peripheral_abandoned = suspended &&
+				suspended->peripheral_session_state &&
+				suspended->peripheral_session_state->phase.load() ==
+					PeripheralSessionPhase::abandoned;
+			const bool save_retry = suspended &&
+				suspended->operation_kind == OperationKind::save;
+			if (active_lease_count_ != 1 || terminal_lease_count_ != 0 ||
+				!suspended || !suspended->registered ||
+				suspended->effective_deadline_ms != 0 ||
+				suspended->invocation_identity != 0 ||
+				!suspended->outcome_recorded ||
+				(!core_abandoned && !peripheral_abandoned && !save_retry))
+				return MISTER_RESULT_INVALID_STATE;
+		}
+		invocation_registration_.reset();
+		invocation_registered_ = false;
+		invocation_outcome_missing_ = false;
+		invocation_authority_identity_ = 0;
+		invocation_identity_ = 0;
+		invocation_callback_deadline_ms_ = 0;
+		invocation->registered_ = false;
+	}
+	invocation.reset();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::RecordOperationOutcome(
+	const OperationInvocation &invocation, const OperationLease &lease,
+	Result)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered ||
+		registration->broker != this || registration->outcome_recorded ||
+		registration->invocation_identity != invocation.identity_ ||
+		!IsCurrentInvocation(invocation, registration->authority,
+			registration->authority_identity) ||
+		registration->process_guard_active)
+		return MISTER_RESULT_INVALID_STATE;
+	registration->outcome_recorded = true;
+	return MISTER_RESULT_OK;
+}
 
 Result HardwareBroker::FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
 	MisterRecoveryObservationV2 *observation)
@@ -2520,7 +2912,8 @@ Result HardwareBroker::FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (state_ != State::recovery || !IsCurrentRecovery(*epoch) ||
-			active_lease_count_ != 0 || recovery_observation_active_)
+			active_lease_count_ != 0 || recovery_observation_active_ ||
+			invocation_registered_)
 			return MISTER_RESULT_INVALID_STATE;
 		if (recovery_terminal_neutral_ && !ReceiptMatchesRecovery(*epoch))
 			return MISTER_RESULT_INVALID_STATE;
@@ -2532,9 +2925,18 @@ Result HardwareBroker::FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
 			observation->observed_resource_flags == 0 &&
 			observation->neutral_resource_flags ==
 				epoch->requested_resource_flags_;
+		const uint32_t outstanding = epoch->requested_resource_flags_ &
+			~observation->neutral_resource_flags;
+		const uint32_t fpga_group = MISTER_RESOURCE_FPGA |
+			MISTER_RESOURCE_BRIDGES | MISTER_RESOURCE_CORE_PROTOCOL;
+		const bool expired = ((outstanding & fpga_group) != 0 &&
+			clock_.NowMs() >= recovery_fpga_deadline_ms_) ||
+			((outstanding & ~fpga_group) != 0 &&
+			 clock_.NowMs() >= recovery_non_fpga_deadline_ms_);
 		const Result result = recovery_result_ != MISTER_RESULT_OK ?
-			recovery_result_ : (all_neutral ? MISTER_RESULT_OK :
-				MISTER_RESULT_CLEANUP_INCOMPLETE);
+			recovery_result_ : (expired ? MISTER_RESULT_DEADLINE :
+				(all_neutral ? MISTER_RESULT_OK :
+				 MISTER_RESULT_CLEANUP_INCOMPLETE));
 
 		epoch->registered_ = false;
 		recovery_registered_ = false;
@@ -2565,6 +2967,7 @@ Result HardwareBroker::Leave(PlatformGenerationId generation,
 		if (generation == 0 || generation != generation_ ||
 			state_ != State::terminal_neutral ||
 			!containment_receipt_current_ || active_lease_count_ != 0 ||
+			invocation_registered_ ||
 			!IsCurrentCleanup(*epoch) || !ReceiptMatchesCleanup(*epoch)) {
 			return MISTER_RESULT_INVALID_STATE;
 		}
@@ -2611,6 +3014,16 @@ void HardwareBroker::ReleaseOperation(OperationRegistration &registration)
 	}
 
 	registration.registered = false;
+	if (registration.invocation_identity != 0 &&
+		!registration.outcome_recorded && invocation_registered_ &&
+		registration.invocation_identity == invocation_identity_)
+		invocation_outcome_missing_ = true;
+	const std::shared_ptr<OperationRegistration> invoked =
+		invocation_registration_.lock();
+	if (invoked.get() == &registration) invocation_registration_.reset();
+	const std::shared_ptr<OperationRegistration> suspended =
+		suspended_registration_.lock();
+	if (suspended.get() == &registration) suspended_registration_.reset();
 	if (active_lease_count_ != 0) --active_lease_count_;
 	if (registration.operation_kind == OperationKind::terminal_fpga_cleanup &&
 		terminal_lease_count_ != 0) {
@@ -2624,6 +3037,32 @@ void HardwareBroker::ReleaseOperation(OperationRegistration &registration)
 		active_lease_count_ == 0)
 		quiesce_complete_ = true;
 	lease_released_.notify_all();
+}
+
+void HardwareBroker::UnregisterInvocation(OperationInvocation &invocation)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!invocation.registered_ || invocation.broker_ != this) return;
+	const bool current = IsCurrentInvocation(invocation,
+		invocation.authority_, invocation.authority_identity_);
+	invocation.registered_ = false;
+	if (!current)
+		return;
+	const std::shared_ptr<OperationRegistration> registration =
+		invocation_registration_.lock();
+	if (registration && registration->registered) {
+		registration->effective_deadline_ms = 0;
+		registration->invocation_identity = 0;
+		if (registration->peripheral_session_state)
+			registration->peripheral_session_state->absolute_deadline_ms = 0;
+		suspended_registration_ = registration;
+	}
+	invocation_registration_.reset();
+	invocation_registered_ = false;
+	invocation_outcome_missing_ = false;
+	invocation_authority_identity_ = 0;
+	invocation_identity_ = 0;
+	invocation_callback_deadline_ms_ = 0;
 }
 
 void HardwareBroker::ReleaseHardwareLeaseView(HardwareLeaseView &view)
@@ -2771,7 +3210,7 @@ Result HardwareBroker::AuthorizeFpgaProgrammingProfile(
 		registration->profile != &profile ||
 		(state_ != State::active && state_ != State::quiescing))
 		return MISTER_RESULT_INVALID_STATE;
-	return clock_.NowMs() >= registration->absolute_deadline_ms ?
+	return clock_.NowMs() >= registration->effective_deadline_ms ?
 		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
 }
 
@@ -2829,7 +3268,7 @@ Result HardwareBroker::ValidateContainmentBoundary(
 		state_ == State::recovery && recovery_registered_ &&
 		!recovery_terminal_neutral_;
 	if (!cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
-	return clock_.NowMs() >= registration->absolute_deadline_ms ?
+	return clock_.NowMs() >= registration->effective_deadline_ms ?
 		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
 }
 
@@ -2919,7 +3358,7 @@ Result HardwareBroker::StageContainmentEvidence(
 		state_ == State::recovery && recovery_registered_ &&
 		!recovery_terminal_neutral_;
 	if (!cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	if ((core_gpo & 0xc0000000u) != 0x40000000u ||
 		interface_module != 0 || sdr_port_control != 0 || bridge_reset != 7 ||
@@ -2963,7 +3402,7 @@ Result HardwareBroker::CommitCleanupContainment(const CleanupEpoch &epoch,
 		receipt_registration_ != registration.get() ||
 		receipt_mutation_sequence_ != mutation_sequence_)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	containment_evidence_pending_ = false;
 	containment_receipt_current_ = true;
@@ -2989,7 +3428,7 @@ Result HardwareBroker::PromoteCleanupAudioWithContainment(
 	// Audio local shutdown expires at the non-FPGA deadline even if terminal
 	// containment itself remains admissible until the longer FPGA deadline.
 	if (clock_.NowMs() >= cleanup_non_fpga_deadline_ms_ ||
-		clock_.NowMs() >= registration->absolute_deadline_ms)
+		clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	return MISTER_RESULT_OK;
 }
@@ -3015,7 +3454,7 @@ Result HardwareBroker::CommitRecoveryContainment(const RecoveryEpoch &epoch,
 		receipt_registration_ != registration.get() ||
 		receipt_mutation_sequence_ != mutation_sequence_)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
 		return MISTER_RESULT_DEADLINE;
 	containment_evidence_pending_ = false;
 	containment_receipt_current_ = true;
@@ -3027,21 +3466,28 @@ Result HardwareBroker::CommitRecoveryContainment(const RecoveryEpoch &epoch,
 	if ((recovery_requested_resource_flags_ & MISTER_RESOURCE_NATIVE_AUDIO) != 0 &&
 		recovery_audio_shutdown_complete_ &&
 		clock_.NowMs() < recovery_non_fpga_deadline_ms_ &&
-		clock_.NowMs() < registration->absolute_deadline_ms)
+		clock_.NowMs() < registration->effective_deadline_ms)
 		neutral |= MISTER_RESOURCE_NATIVE_AUDIO;
 	RecordRecoveryPartition(0, neutral);
 	return MISTER_RESULT_OK;
 }
 
-Result HardwareBroker::BeginRecoveryObservation(const RecoveryEpoch &epoch)
+Result HardwareBroker::BeginRecoveryObservation(const RecoveryEpoch &epoch,
+	const OperationInvocation &invocation)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (state_ != State::recovery || !IsCurrentRecovery(epoch) ||
+		!IsCurrentInvocation(invocation, LeaseAuthority::recovery_epoch,
+			epoch.identity_) || !invocation_registration_.expired() ||
 		recovery_observation_active_ || recovery_terminal_neutral_ ||
 		active_lease_count_ != 0)
 		return MISTER_RESULT_INVALID_STATE;
-	if (clock_.NowMs() >= epoch.fpga_deadline_ms_) {
-		LatchRecoveryResult(MISTER_RESULT_DEADLINE);
+	const uint64_t deadline = epoch.fpga_deadline_ms_ <
+		invocation.callback_deadline_ms_ ? epoch.fpga_deadline_ms_ :
+		invocation.callback_deadline_ms_;
+	if (clock_.NowMs() >= deadline) {
+		LatchRecoveryResult(MISTER_RESULT_DEADLINE,
+			RecoveryFailurePersistence::retryable);
 		return MISTER_RESULT_DEADLINE;
 	}
 	recovery_observation_active_ = true;
@@ -3049,30 +3495,41 @@ Result HardwareBroker::BeginRecoveryObservation(const RecoveryEpoch &epoch)
 }
 
 Result HardwareBroker::CheckRecoveryObservationDeadline(
-	const RecoveryEpoch &epoch)
+	const RecoveryEpoch &epoch, const OperationInvocation &invocation)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (!recovery_observation_active_ || state_ != State::recovery ||
-		!IsCurrentRecovery(epoch))
+		!IsCurrentRecovery(epoch) ||
+		!IsCurrentInvocation(invocation, LeaseAuthority::recovery_epoch,
+			epoch.identity_))
 		return MISTER_RESULT_INVALID_STATE;
-	return clock_.NowMs() >= epoch.fpga_deadline_ms_ ?
+	const uint64_t deadline = epoch.fpga_deadline_ms_ <
+		invocation.callback_deadline_ms_ ? epoch.fpga_deadline_ms_ :
+		invocation.callback_deadline_ms_;
+	return clock_.NowMs() >= deadline ?
 		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
 }
 
 Result HardwareBroker::EndRecoveryObservation(const RecoveryEpoch &epoch,
+	const OperationInvocation &invocation,
 	uint32_t observed_resource_flags, uint32_t neutral_resource_flags,
 	Result result)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (!recovery_observation_active_ || state_ != State::recovery ||
-		!IsCurrentRecovery(epoch))
+		!IsCurrentRecovery(epoch) ||
+		!IsCurrentInvocation(invocation, LeaseAuthority::recovery_epoch,
+			epoch.identity_))
 		return MISTER_RESULT_INVALID_STATE;
 	recovery_observation_active_ = false;
 	observed_resource_flags &= epoch.requested_resource_flags_;
 	neutral_resource_flags &= epoch.requested_resource_flags_;
 	if ((observed_resource_flags & neutral_resource_flags) != 0)
 		return MISTER_RESULT_INVALID_ARGUMENT;
-	if (result == MISTER_RESULT_OK && clock_.NowMs() >= epoch.fpga_deadline_ms_)
+	const uint64_t deadline = epoch.fpga_deadline_ms_ <
+		invocation.callback_deadline_ms_ ? epoch.fpga_deadline_ms_ :
+		invocation.callback_deadline_ms_;
+	if (result == MISTER_RESULT_OK && clock_.NowMs() >= deadline)
 		result = MISTER_RESULT_DEADLINE;
 	const uint32_t observed_bundle = epoch.requested_resource_flags_ &
 		(MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
@@ -3080,8 +3537,22 @@ Result HardwareBroker::EndRecoveryObservation(const RecoveryEpoch &epoch,
 	recovery_observed_resource_flags_ &= ~observed_bundle;
 	recovery_neutral_resource_flags_ &= ~observed_bundle;
 	RecordRecoveryPartition(observed_resource_flags, neutral_resource_flags);
-	LatchRecoveryResult(result);
+	LatchRecoveryResult(result, RecoveryFailurePersistence::retryable);
 	return result;
+}
+
+Result HardwareBroker::RecoveryObservationDeadline(const RecoveryEpoch &epoch,
+	const OperationInvocation &invocation, uint64_t *deadline_ms) const
+{
+	if (deadline_ms == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!IsCurrentRecovery(epoch) ||
+		!IsCurrentInvocation(invocation, LeaseAuthority::recovery_epoch,
+			epoch.identity_))
+		return MISTER_RESULT_INVALID_STATE;
+	*deadline_ms = epoch.fpga_deadline_ms_ < invocation.callback_deadline_ms_ ?
+		epoch.fpga_deadline_ms_ : invocation.callback_deadline_ms_;
+	return MISTER_RESULT_OK;
 }
 
 Result HardwareBroker::RecordRecoveryContainmentObservation(
@@ -3102,7 +3573,7 @@ Result HardwareBroker::RecordRecoveryContainmentObservation(
 	recovery_observed_resource_flags_ &= ~bundle;
 	recovery_neutral_resource_flags_ &= ~bundle;
 	RecordRecoveryPartition(observed_resource_flags, neutral_resource_flags);
-	LatchRecoveryResult(result);
+	LatchRecoveryResult(result, RecoveryFailurePersistence::retryable);
 	return result;
 }
 
@@ -3124,7 +3595,7 @@ Result HardwareBroker::RecordRecoveryOperation(const RecoveryEpoch &epoch,
 	if (bit == 0 || (bit & epoch.requested_resource_flags_) == 0)
 		return MISTER_RESULT_INVALID_STATE;
 	if (result == MISTER_RESULT_OK &&
-		clock_.NowMs() >= registration->absolute_deadline_ms)
+		clock_.NowMs() >= registration->effective_deadline_ms)
 		result = MISTER_RESULT_DEADLINE;
 	uint32_t observed = 0;
 	uint32_t neutral = 0;
@@ -3135,23 +3606,34 @@ Result HardwareBroker::RecordRecoveryOperation(const RecoveryEpoch &epoch,
 	recovery_observed_resource_flags_ &= ~bit;
 	recovery_neutral_resource_flags_ &= ~bit;
 	RecordRecoveryPartition(observed, neutral);
-	LatchRecoveryResult(result);
+	LatchRecoveryResult(result, RecoveryFailurePersistence::retryable);
+	registration->outcome_recorded = true;
 	return result;
 }
 
 Result HardwareBroker::RecordRecoveryFailure(const RecoveryEpoch &epoch,
-	Result result)
+	const OperationLease &lease, Result result,
+	RecoveryFailurePersistence persistence)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
 	if (state_ != State::recovery || !IsCurrentRecovery(epoch) ||
-		recovery_terminal_neutral_)
+		recovery_terminal_neutral_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->authority != LeaseAuthority::recovery_epoch ||
+		registration->authority_identity != epoch.identity_)
 		return MISTER_RESULT_INVALID_STATE;
-	LatchRecoveryResult(result);
+	if (result == MISTER_RESULT_DEADLINE &&
+		clock_.NowMs() >= registration->authority_deadline_ms)
+		recovery_result_ = MISTER_RESULT_DEADLINE;
+	else
+		LatchRecoveryResult(result, persistence);
 	return result;
 }
 
 Result HardwareBroker::SnapshotRecovery(const RecoveryEpoch &epoch,
-	MisterRecoveryObservationV2 *observation) const
+	MisterRecoveryObservationV2 *observation)
 {
 	if (observation == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -3162,6 +3644,20 @@ Result HardwareBroker::SnapshotRecovery(const RecoveryEpoch &epoch,
 	observation->neutral_resource_flags =
 		recovery_neutral_resource_flags_ & epoch.requested_resource_flags_;
 	if (recovery_result_ != MISTER_RESULT_OK) return recovery_result_;
+	const uint32_t outstanding = epoch.requested_resource_flags_ &
+		~observation->neutral_resource_flags;
+	const uint32_t fpga_group = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	if (((outstanding & fpga_group) != 0 &&
+		 clock_.NowMs() >= recovery_fpga_deadline_ms_) ||
+		((outstanding & ~fpga_group) != 0 &&
+		 clock_.NowMs() >= recovery_non_fpga_deadline_ms_)) {
+		// Unlike a shorter invocation deadline, expiry of an immutable epoch
+		// group deadline is terminal for this recovery attempt. Retain it so a
+		// later callback cannot revive the same attempt.
+		recovery_result_ = MISTER_RESULT_DEADLINE;
+		return MISTER_RESULT_DEADLINE;
+	}
 	return observation->observed_resource_flags == 0 &&
 		observation->neutral_resource_flags == epoch.requested_resource_flags_ ?
 		MISTER_RESULT_OK : MISTER_RESULT_CLEANUP_INCOMPLETE;
@@ -3173,9 +3669,8 @@ Result HardwareBroker::ValidateRecoveryRequestedFlags(
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (state_ != State::recovery || !IsCurrentRecovery(epoch))
 		return MISTER_RESULT_INVALID_STATE;
-	const uint32_t still_unproved = recovery_requested_resource_flags_ &
-		~recovery_neutral_resource_flags_;
-	return callback_requested_flags == still_unproved ? MISTER_RESULT_OK :
+	return callback_requested_flags == recovery_requested_resource_flags_ ?
+		MISTER_RESULT_OK :
 		MISTER_RESULT_INVALID_STATE;
 }
 
@@ -3224,14 +3719,18 @@ void HardwareBroker::RecordRecoveryPartition(uint32_t observed_resource_flags,
 	recovery_observed_resource_flags_ &= ~recovery_neutral_resource_flags_;
 }
 
-void HardwareBroker::LatchRecoveryResult(Result result)
+void HardwareBroker::LatchRecoveryResult(Result result,
+	RecoveryFailurePersistence persistence)
 {
 	if (result == MISTER_RESULT_OK || recovery_result_ != MISTER_RESULT_OK)
 		return;
-	if (result == MISTER_RESULT_DEADLINE || result == MISTER_RESULT_PLATFORM ||
-		result == MISTER_RESULT_CLEANUP_INCOMPLETE)
-		recovery_result_ = result;
-	else
+	// Per-operation DEADLINE, CLEANUP_INCOMPLETE, and PLATFORM are current-call
+	// results. Their truthful partition and retained residue remain retryable.
+	// Only an explicitly reviewed non-retryable PLATFORM classification may
+	// poison the attempt; permanent deadline expiry is latched at its immutable
+	// authority comparison sites instead.
+	if (persistence == RecoveryFailurePersistence::terminal &&
+		result == MISTER_RESULT_PLATFORM)
 		recovery_result_ = MISTER_RESULT_PLATFORM;
 }
 

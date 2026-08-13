@@ -155,7 +155,8 @@ Result NativeContainment::ResetAndContain(const RecoveryEpoch &epoch,
 				broker_.RecordRecoveryContainmentObservation(epoch, observed,
 					neutral, result);
 			else
-				broker_.RecordRecoveryFailure(epoch, result);
+				broker_.RecordRecoveryFailure(epoch, terminal_lease, result,
+					RecoveryFailurePersistence::retryable);
 		}
 		return result;
 	}
@@ -196,18 +197,23 @@ void NativeContainment::Partition(const Values &values,
 		*neutral |= MISTER_RESOURCE_CORE_PROTOCOL;
 }
 
-Result NativeContainment::ObserveRecovery(const RecoveryEpoch &epoch)
+Result NativeContainment::ObserveRecovery(const RecoveryEpoch &epoch,
+	const OperationInvocation &invocation)
 {
-	Result result = broker_.BeginRecoveryObservation(epoch);
+	Result result = broker_.BeginRecoveryObservation(epoch, invocation);
 	if (result != MISTER_RESULT_OK) return result;
+	uint64_t deadline_ms = 0;
+	result = broker_.RecoveryObservationDeadline(epoch, invocation, &deadline_ms);
+	if (result != MISTER_RESULT_OK)
+		return broker_.EndRecoveryObservation(epoch, invocation, 0, 0, result);
 	Values values = {};
 	bool known[5] = {false, false, false, false, false};
 	Result first_failure = MISTER_RESULT_OK;
-	NativeContainmentIo::Access access(UINT64_MAX);
+	NativeContainmentIo::Access access(deadline_ms);
 
 #define RECOVERY_READ(index, expression) \
 	do { \
-		Result boundary = broker_.CheckRecoveryObservationDeadline(epoch); \
+		Result boundary = broker_.CheckRecoveryObservationDeadline(epoch, invocation); \
 		if (boundary != MISTER_RESULT_OK) { \
 			if (first_failure == MISTER_RESULT_OK) first_failure = boundary; \
 			break; \
@@ -231,9 +237,26 @@ Result NativeContainment::ObserveRecovery(const RecoveryEpoch &epoch)
 	uint32_t observed = 0;
 	uint32_t neutral = 0;
 	Partition(values, false, &observed, &neutral);
-	return broker_.EndRecoveryObservation(epoch, observed, neutral,
+	return broker_.EndRecoveryObservation(epoch, invocation, observed, neutral,
 		first_failure);
 }
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+Result NativeContainment::ObserveRecovery(const RecoveryEpoch &epoch)
+{
+	std::unique_ptr<OperationInvocation> invocation;
+	const Result begin = broker_.BeginRecoveryInvocation(epoch, UINT64_MAX,
+		&invocation);
+	if (begin != MISTER_RESULT_OK) return begin;
+	const Result result = ObserveRecovery(epoch, *invocation);
+	const Result finish = broker_.FinishInvocation(std::move(invocation));
+	if (finish != MISTER_RESULT_OK) {
+		invocation.reset();
+		return MISTER_RESULT_PLATFORM;
+	}
+	return result;
+}
+#endif
 
 } // namespace native
 } // namespace mister

@@ -62,7 +62,11 @@ public:
 		const OperationLease &terminal_lease);
 	Result ResetAndContain(const RecoveryEpoch &epoch,
 		const OperationLease &terminal_lease);
+	Result ObserveRecovery(const RecoveryEpoch &epoch,
+		const OperationInvocation &invocation);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result ObserveRecovery(const RecoveryEpoch &epoch);
+#endif
 
 private:
 	struct Values {

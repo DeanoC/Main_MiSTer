@@ -111,6 +111,8 @@ public:
 class NativeHardwareResources {
 public:
 	virtual ~NativeHardwareResources() {}
+	virtual NativeAcquisitionOutcome AcquireContainmentMappings(
+		const OperationLease &program_lease) = 0;
 	virtual NativeAcquisitionOutcome AcquireFpga(
 		const OperationLease &lease) = 0;
 	virtual NativeAcquisitionOutcome EnableBridges(

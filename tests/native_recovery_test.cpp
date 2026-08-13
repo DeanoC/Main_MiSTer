@@ -95,6 +95,13 @@ public:
 			lease, broker_, &session);
 		if (acquire != MISTER_RESULT_OK) return acquire;
 		++core_protocol_session_calls;
+		if (deadline_core_once && deadline_clock != nullptr) {
+			deadline_core_once = false;
+			last_deadline = lease.absolute_deadline_ms();
+			*state = RecoveryResourceState::unknown;
+			deadline_clock->SetNow(last_deadline);
+			return MISTER_RESULT_DEADLINE;
+		}
 		const Result primary = ApplyDeadline(lease.absolute_deadline_ms(),
 			OperationKind::core_protocol, state);
 		if (abandon_core_protocol_release_once) {
@@ -132,6 +139,8 @@ public:
 	int core_protocol_session_calls;
 	uint64_t last_deadline;
 	bool abandon_core_protocol_release_once = false;
+	FakeClock *deadline_clock = nullptr;
+	bool deadline_core_once = false;
 	const SafeSaveRecoveryRecord *save_record;
 };
 
@@ -140,8 +149,10 @@ class FakeTypedRecoveryResources final : public NativeAudioResource,
 public:
 	explicit FakeTypedRecoveryResources(HardwareBroker &broker)
 		: broker_(broker), backend_(PeripheralAuthorityTestPeer::Backend(broker,
-			this)), audio_calls(0), coupled_calls(0), last_deadline(0), abandon_once(false),
-		  closure_unknown_once(false) {}
+			this)), audio_calls(0), video_calls(0), coupled_calls(0), last_deadline(0),
+		  abandon_once(false), closure_unknown_once(false), deadline_clock(nullptr),
+		  deadline_once_kind(OperationKind::program_fpga), deadline_to_expire(1500),
+		  coupled_all_neutral(false) {}
 
 	PeripheralBackendIdentity BackendIdentity() const override { return backend_; }
 	NativePeripheralAcquisitionOutcome StartAudio(
@@ -157,6 +168,12 @@ public:
 		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, false, false,
 			false, false};
 		last_deadline = PeripheralAuthorityTestPeer::Deadline(*session);
+		if (deadline_once_kind == OperationKind::audio && deadline_clock != nullptr) {
+			deadline_once_kind = OperationKind::program_fpga;
+			deadline_clock->SetNow(last_deadline);
+			session.reset();
+			return {MISTER_RESULT_DEADLINE, false, false, false, false};
+		}
 		uint64_t sequence = 0;
 		const Result recorded = PeripheralAuthorityTestPeer::Record(broker_,
 			*session, &sequence);
@@ -177,8 +194,26 @@ public:
 		std::unique_ptr<CleanupVideoSessionBundle> &&) override
 	{ return {MISTER_RESULT_UNSUPPORTED, false, false, false, false}; }
 	NativePeripheralReleaseOutcome RecoverVideo(
-		std::unique_ptr<RecoveryVideoSessionBundle> &&) override
-	{ return {MISTER_RESULT_UNSUPPORTED, false, false, false, false}; }
+		std::unique_ptr<RecoveryVideoSessionBundle> &&session) override
+	{
+		++video_calls;
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, false, false,
+			false, false};
+		if (deadline_once_kind == OperationKind::video && deadline_clock != nullptr) {
+			last_deadline = deadline_to_expire;
+			deadline_once_kind = OperationKind::program_fpga;
+			deadline_clock->SetNow(deadline_to_expire);
+			session.reset();
+			return {MISTER_RESULT_DEADLINE, false, false, false, false};
+		}
+		const PeripheralCompletionReceipt receipt = {MISTER_RESULT_OK, true,
+			true, true, true, false, broker_.mutation_sequence_for_test(), 0xa55a};
+		const Result completed = PeripheralAuthorityTestPeer::CompleteVideo(
+			broker_, std::move(session), receipt);
+		return {completed, completed == MISTER_RESULT_OK,
+			completed == MISTER_RESULT_OK,
+			completed == MISTER_RESULT_OK, false};
+	}
 	void CloseVideoForProcessExit() override {}
 	NativeCoupledAcquisitionOutcome StartAudioVideo(
 		std::unique_ptr<ActiveAudioVideoSessionBundle> &&) override
@@ -193,13 +228,26 @@ public:
 		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, 0, 0, 0, false,
 			false, 0};
 		last_deadline = PeripheralAuthorityTestPeer::Deadline(*session);
+		const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO;
+		if (deadline_once_kind == OperationKind::audio_video &&
+			deadline_clock != nullptr) {
+			deadline_once_kind = OperationKind::program_fpga;
+			deadline_clock->SetNow(last_deadline);
+			const CoupledFailureReceipt failure = {MISTER_RESULT_DEADLINE,
+				{MISTER_RESULT_DEADLINE, affected, false, false, false,
+					broker_.mutation_sequence_for_test(), 0xa55a}};
+			const Result abandoned = PeripheralAuthorityTestPeer::AbandonAudioVideo(
+				broker_, std::move(session), failure);
+			return {abandoned == MISTER_RESULT_OK ? MISTER_RESULT_DEADLINE :
+				abandoned, affected, 0, 0, false, false,
+				broker_.mutation_sequence_for_test()};
+		}
 		uint64_t sequence = 0;
 		const Result recorded = PeripheralAuthorityTestPeer::Record(broker_,
 			*session, &sequence);
 		if (recorded != MISTER_RESULT_OK)
 			return {recorded, 0, 0, 0, false, false, 0};
-		const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
-			MISTER_RESOURCE_NATIVE_VIDEO;
 		if (abandon_once) {
 			abandon_once = false;
 			const bool closure_unknown = closure_unknown_once;
@@ -212,11 +260,13 @@ public:
 			return {abandoned == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM :
 				abandoned, affected, 0, 0, false, closure_unknown, sequence};
 		}
+		const uint32_t neutral = coupled_all_neutral ? affected :
+			MISTER_RESOURCE_NATIVE_VIDEO;
 		const CoupledRecoveryReceipt receipt = {MISTER_RESULT_OK, affected, 0,
-			MISTER_RESOURCE_NATIVE_VIDEO, true, false, sequence, true, 0xa55a};
+			neutral, true, false, sequence, true, 0xa55a};
 		const Result completed = PeripheralAuthorityTestPeer::CompleteAudioVideo(
 			broker_, std::move(session), receipt);
-		return {completed, affected, 0, MISTER_RESOURCE_NATIVE_VIDEO, true,
+		return {completed, affected, 0, neutral, true,
 			false, sequence};
 	}
 	void CloseAudioVideoForProcessExit() override {}
@@ -224,10 +274,15 @@ public:
 	HardwareBroker &broker_;
 	PeripheralBackendIdentity backend_;
 	int audio_calls;
+	int video_calls;
 	int coupled_calls;
 	uint64_t last_deadline;
 	bool abandon_once;
 	bool closure_unknown_once;
+	FakeClock *deadline_clock;
+	OperationKind deadline_once_kind;
+	uint64_t deadline_to_expire;
+	bool coupled_all_neutral;
 };
 
 class FakeTypedSaveRecoveryResource final : public NativeSaveResource {
@@ -246,6 +301,11 @@ public:
 	{
 		++calls;
 		last_deadline = lease.absolute_deadline_ms();
+		if (deadline_once && deadline_clock != nullptr) {
+			deadline_once = false;
+			deadline_clock->SetNow(last_deadline);
+			return {MISTER_RESULT_DEADLINE, false, false, false, false};
+		}
 		if (fail_once) {
 			fail_once = false;
 			return {MISTER_RESULT_PLATFORM, false, false, false, false};
@@ -257,6 +317,8 @@ public:
 	int calls = 0;
 	uint64_t last_deadline = 0;
 	bool fail_once = false;
+	FakeClock *deadline_clock = nullptr;
+	bool deadline_once = false;
 };
 
 class RecoverySaveFileSystem final : public linux_native::NativeSaveFileSystem {
@@ -354,14 +416,16 @@ private:
 class FakeContainmentIo final : public NativeContainmentIo {
 public:
 	FakeContainmentIo()
-		: fail_at(0), advance_at(0), advance_clock(nullptr), calls(0), writes(0), reads(0), releases(0), core(0x40000000u), interface(0),
+		: fail_at(0), advance_at(0), advance_clock(nullptr), calls(0), writes(0),
+		  reads(0), releases(0), last_deadline(0), advance_to(6000),
+		  step_failure_result(MISTER_RESULT_PLATFORM), core(0x40000000u), interface(0),
 		  sdr(0), bridge(7), remap(1), release_result(MISTER_RESULT_OK) {}
 	Result Step()
 	{
 		++calls;
 		if (calls == advance_at && advance_clock != nullptr)
-			advance_clock->SetNow(6000);
-		return calls == fail_at ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
+			advance_clock->SetNow(advance_to);
+		return calls == fail_at ? step_failure_result : MISTER_RESULT_OK;
 	}
 	Result WriteCoreReset(const Access &, uint32_t mask,
 		uint32_t value) override
@@ -387,8 +451,9 @@ public:
 	{
 		assert(value == 1); ++writes; return Step();
 	}
-	Result ReadCoreGpo(const Access &, uint32_t *value) override
+	Result ReadCoreGpo(const Access &access, uint32_t *value) override
 	{
+		last_deadline = access.absolute_deadline_ms();
 		++reads; const Result result = Step(); if (result == MISTER_RESULT_OK) *value = core; return result;
 	}
 	Result ReadInterfaceModule(const Access &, uint32_t *value) override
@@ -420,6 +485,9 @@ public:
 	int writes;
 	int reads;
 	int releases;
+	uint64_t last_deadline;
+	uint64_t advance_to;
+	Result step_failure_result;
 	uint32_t core;
 	uint32_t interface;
 	uint32_t sdr;
@@ -459,6 +527,347 @@ void TestRecoveryEpochAuthorityAndFreshness()
 	assert(broker.BeginRecovery(MISTER_RESOURCE_CORE_INPUT, 4000, 7000,
 		&epoch) == MISTER_RESULT_OK);
 	assert(epoch->identity_for_test() != first_identity);
+}
+
+void TestRecoveryInvocationBoundsGenericMutation()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	NativeRecovery recovery(broker, io);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_CONTENT, 3000, 6000, &epoch) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationInvocation> invocation;
+	assert(broker.BeginRecoveryInvocation(*epoch, 1500, &invocation) ==
+		MISTER_RESULT_OK);
+	io.states[KindIndex(OperationKind::content)] = RecoveryResourceState::neutral;
+	assert(recovery.Perform(*epoch, *invocation, OperationKind::content) ==
+		MISTER_RESULT_OK);
+	assert(io.last_deadline == 1500);
+	assert(broker.FinishInvocation(std::move(invocation)) == MISTER_RESULT_OK);
+}
+
+void TestRecoveryInvocationRebindsRetainedSaveDeadline()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	FakeTypedRecoveryResources typed(broker);
+	FakeTypedSaveRecoveryResource save;
+	save.fail_once = true;
+	NativeRecovery recovery(broker, io, typed, typed, typed, save);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_SAVES, 3000, 6000, &epoch) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationInvocation> first;
+	assert(broker.BeginRecoveryInvocation(*epoch, 1500, &first) ==
+		MISTER_RESULT_OK);
+	assert(recovery.Perform(*epoch, *first, OperationKind::save) ==
+		MISTER_RESULT_PLATFORM);
+	assert(save.calls == 1 && save.last_deadline == 1500);
+	assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+
+	std::unique_ptr<OperationInvocation> second;
+	assert(broker.BeginRecoveryInvocation(*epoch, 1800, &second) ==
+		MISTER_RESULT_OK);
+	assert(recovery.Perform(*epoch, *second, OperationKind::save) ==
+		MISTER_RESULT_OK);
+	assert(save.calls == 2 && save.last_deadline == 1800);
+	assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+	MisterRecoveryObservationV2 observation = Observation();
+	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+	assert(observation.neutral_resource_flags == MISTER_RESOURCE_SAVES);
+}
+
+void TestRecoveryInvocationBoundsContainmentObservation()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeContainmentIo io;
+	NativeContainment containment(broker, io);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_FPGA, 3000, 6000, &epoch) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationInvocation> invocation;
+	assert(broker.BeginRecoveryInvocation(*epoch, 1500, &invocation) ==
+		MISTER_RESULT_OK);
+	assert(containment.ObserveRecovery(*epoch, *invocation) == MISTER_RESULT_OK);
+	assert(io.reads == 5 && io.last_deadline == 1500);
+	assert(broker.FinishInvocation(std::move(invocation)) == MISTER_RESULT_OK);
+}
+
+void TestCallbackDeadlineDoesNotPoisonRecoveryEpochOrOriginalMask()
+{
+	class DeadlineOnceIo final : public NativeRecoveryIo {
+	public:
+		explicit DeadlineOnceIo(FakeClock &clock) : clock_(clock), calls_(0) {}
+		Result CloseContent(const OperationLease &, RecoveryResourceState *state) override
+		{
+			++calls_;
+			*state = calls_ == 1 ? RecoveryResourceState::unknown :
+				RecoveryResourceState::neutral;
+			if (calls_ == 1) clock_.SetNow(1500);
+			return MISTER_RESULT_OK;
+		}
+		Result CloseInputDescriptors(const OperationLease &,
+			RecoveryResourceState *) override { return MISTER_RESULT_UNSUPPORTED; }
+		Result MuteAudio(const OperationLease &,
+			RecoveryResourceState *) override { return MISTER_RESULT_UNSUPPORTED; }
+		Result PowerDownVideo(const OperationLease &,
+			RecoveryResourceState *) override { return MISTER_RESULT_UNSUPPORTED; }
+		Result DisableCoreProtocol(const OperationLease &,
+			RecoveryResourceState *) override { return MISTER_RESULT_UNSUPPORTED; }
+		FakeClock &clock_;
+		int calls_;
+	};
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	DeadlineOnceIo io(clock);
+	NativeRecovery recovery(broker, io);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_CONTENT, 3000, 6000, &epoch) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationInvocation> first;
+	assert(broker.BeginRecoveryInvocation(*epoch, 1500, &first) ==
+		MISTER_RESULT_OK);
+	assert(recovery.Perform(*epoch, *first, OperationKind::content) ==
+		MISTER_RESULT_DEADLINE);
+	assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+	MisterRecoveryObservationV2 snapshot = Observation();
+	assert(recovery.Snapshot(*epoch, &snapshot) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
+		MISTER_RESOURCE_CONTENT) == MISTER_RESULT_OK);
+	assert(recovery.ValidateCallbackRequestedFlags(*epoch, 0) ==
+		MISTER_RESULT_INVALID_STATE);
+
+	std::unique_ptr<OperationInvocation> second;
+	assert(broker.BeginRecoveryInvocation(*epoch, 2500, &second) ==
+		MISTER_RESULT_OK);
+	assert(recovery.Perform(*epoch, *second, OperationKind::content) ==
+		MISTER_RESULT_OK);
+	assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+	assert(recovery.Finish(std::move(epoch), &snapshot) == MISTER_RESULT_OK);
+	assert(io.calls_ == 2);
+}
+
+void TestCallbackDeadlineRetriesEveryRetainedTypedRecoveryClass()
+{
+	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	const OperationKind kinds[] = {OperationKind::audio, OperationKind::video,
+		OperationKind::audio_video, OperationKind::core_protocol,
+		OperationKind::save};
+	const uint32_t requested[] = {MISTER_RESOURCE_NATIVE_AUDIO | closure,
+		MISTER_RESOURCE_NATIVE_VIDEO,
+		MISTER_RESOURCE_NATIVE_AUDIO | MISTER_RESOURCE_NATIVE_VIDEO,
+		MISTER_RESOURCE_CORE_PROTOCOL, MISTER_RESOURCE_SAVES};
+	for (size_t index = 0; index != sizeof(kinds) / sizeof(kinds[0]); ++index) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeRecoveryIo io(broker);
+		FakeTypedRecoveryResources typed(broker);
+		FakeTypedSaveRecoveryResource save;
+		FakeContainmentIo containment_io;
+		NativeContainment containment(broker, containment_io);
+		io.deadline_clock = &clock;
+		io.deadline_core_once = kinds[index] == OperationKind::core_protocol;
+		io.states[KindIndex(OperationKind::core_protocol)] =
+			RecoveryResourceState::neutral;
+		typed.deadline_clock = &clock;
+		typed.deadline_once_kind = kinds[index];
+		typed.coupled_all_neutral = true;
+		save.deadline_clock = &clock;
+		save.deadline_once = kinds[index] == OperationKind::save;
+		NativeRecovery recovery(broker, io, typed, typed, typed, save, containment);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(requested[index], 3000, 6000, &epoch) ==
+			MISTER_RESULT_OK);
+		const uint64_t identity = epoch->identity_for_test();
+		std::unique_ptr<OperationInvocation> first;
+		assert(broker.BeginRecoveryInvocation(*epoch, 1500, &first) ==
+			MISTER_RESULT_OK);
+		assert(recovery.Perform(*epoch, *first, kinds[index]) ==
+			MISTER_RESULT_DEADLINE);
+		assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+		clock.SetNow(1600);
+		std::unique_ptr<OperationInvocation> second;
+		assert(broker.BeginRecoveryInvocation(*epoch, 2500, &second) ==
+			MISTER_RESULT_OK);
+		assert(recovery.Perform(*epoch, *second, kinds[index]) == MISTER_RESULT_OK);
+		assert(epoch->identity_for_test() == identity);
+		assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+		if (kinds[index] == OperationKind::audio) {
+			std::unique_ptr<OperationInvocation> terminal;
+			assert(broker.BeginRecoveryInvocation(*epoch, 2500, &terminal) ==
+				MISTER_RESULT_OK);
+			assert(recovery.Perform(*epoch, *terminal,
+				OperationKind::terminal_fpga_cleanup) == MISTER_RESULT_OK);
+			assert(broker.FinishInvocation(std::move(terminal)) == MISTER_RESULT_OK);
+		}
+		MisterRecoveryObservationV2 observation = Observation();
+		assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+		assert(observation.neutral_resource_flags == requested[index]);
+	}
+}
+
+void TestCallbackDeadlineRetriesObservationAndTerminalResidue()
+{
+	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeContainmentIo io;
+		NativeContainment containment(broker, io);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(closure, 3000, 6000, &epoch) ==
+			MISTER_RESULT_OK);
+		io.advance_clock = &clock;
+		io.advance_at = 2;
+		io.advance_to = 1500;
+		std::unique_ptr<OperationInvocation> first;
+		assert(broker.BeginRecoveryInvocation(*epoch, 1500, &first) ==
+			MISTER_RESULT_OK);
+		assert(containment.ObserveRecovery(*epoch, *first) ==
+			MISTER_RESULT_DEADLINE);
+		assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+		io.advance_at = 0;
+		std::unique_ptr<OperationInvocation> second;
+		assert(broker.BeginRecoveryInvocation(*epoch, 2500, &second) ==
+			MISTER_RESULT_OK);
+		assert(containment.ObserveRecovery(*epoch, *second) == MISTER_RESULT_OK);
+		assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+		MisterRecoveryObservationV2 observation = Observation();
+		assert(broker.FinishRecovery(std::move(epoch), &observation) ==
+			MISTER_RESULT_OK);
+		assert(observation.neutral_resource_flags == closure);
+	}
+	{
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeRecoveryIo recovery_io(broker);
+		FakeTypedRecoveryResources typed(broker);
+		FakeTypedSaveRecoveryResource save;
+		FakeContainmentIo io;
+		NativeContainment containment(broker, io);
+		NativeRecovery recovery(broker, recovery_io, typed, typed, typed, save,
+			containment);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(closure, 3000, 6000, &epoch) ==
+			MISTER_RESULT_OK);
+		io.advance_clock = &clock;
+		io.advance_at = 11;
+		io.advance_to = 1500;
+		io.release_result = MISTER_RESULT_DEADLINE;
+		std::unique_ptr<OperationInvocation> first;
+		assert(broker.BeginRecoveryInvocation(*epoch, 1500, &first) ==
+			MISTER_RESULT_OK);
+		assert(recovery.Perform(*epoch, *first,
+			OperationKind::terminal_fpga_cleanup) == MISTER_RESULT_DEADLINE);
+		assert(broker.FinishInvocation(std::move(first)) == MISTER_RESULT_OK);
+		io.advance_at = 0;
+		io.release_result = MISTER_RESULT_OK;
+		std::unique_ptr<OperationInvocation> second;
+		assert(broker.BeginRecoveryInvocation(*epoch, 2500, &second) ==
+			MISTER_RESULT_OK);
+		assert(recovery.Perform(*epoch, *second,
+			OperationKind::terminal_fpga_cleanup) == MISTER_RESULT_OK);
+		assert(broker.FinishInvocation(std::move(second)) == MISTER_RESULT_OK);
+		assert(io.writes == 5 && io.reads == 5 && io.releases == 2);
+		MisterRecoveryObservationV2 observation = Observation();
+		assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+		assert(observation.neutral_resource_flags == closure);
+	}
+}
+
+void TestRetryableRecoveryResultsReachSameEpochSuccess()
+{
+	const Result retryable[] = {MISTER_RESULT_CLEANUP_INCOMPLETE,
+		MISTER_RESULT_PLATFORM};
+	for (Result first_result : retryable) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeRecoveryIo io(broker);
+		NativeRecovery recovery(broker, io);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(MISTER_RESOURCE_CONTENT, 3000, 6000,
+			&epoch) == MISTER_RESULT_OK);
+		const uint64_t identity = epoch->identity_for_test();
+		io.states[KindIndex(OperationKind::content)] = RecoveryResourceState::unknown;
+		io.results[KindIndex(OperationKind::content)] = first_result;
+		assert(recovery.Perform(*epoch, OperationKind::content) == first_result);
+		assert(io.last_deadline == 3000);
+		MisterRecoveryObservationV2 snapshot = Observation();
+		assert(recovery.Snapshot(*epoch, &snapshot) ==
+			MISTER_RESULT_CLEANUP_INCOMPLETE);
+		io.states[KindIndex(OperationKind::content)] = RecoveryResourceState::neutral;
+		io.results[KindIndex(OperationKind::content)] = MISTER_RESULT_OK;
+		clock.SetNow(1500);
+		assert(recovery.Perform(*epoch, OperationKind::content) == MISTER_RESULT_OK);
+		assert(epoch->identity_for_test() == identity);
+		assert(io.last_deadline == 3000);
+		assert(recovery.Finish(std::move(epoch), &snapshot) == MISTER_RESULT_OK);
+		assert(snapshot.neutral_resource_flags == MISTER_RESOURCE_CONTENT);
+	}
+}
+
+void TestRetryableObservationAndTerminalFailuresReachSuccess()
+{
+	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	const Result retryable[] = {MISTER_RESULT_CLEANUP_INCOMPLETE,
+		MISTER_RESULT_PLATFORM};
+	for (Result first_result : retryable) {
+		{
+			FakeClock clock(1000);
+			HardwareBroker broker(clock);
+			FakeContainmentIo io;
+			io.fail_at = 2;
+			io.step_failure_result = first_result;
+			NativeContainment containment(broker, io);
+			std::unique_ptr<RecoveryEpoch> epoch;
+			assert(broker.BeginRecovery(closure, 3000, 6000, &epoch) ==
+				MISTER_RESULT_OK);
+			const uint64_t identity = epoch->identity_for_test();
+			assert(containment.ObserveRecovery(*epoch) == first_result);
+			io.fail_at = 0;
+			assert(containment.ObserveRecovery(*epoch) == MISTER_RESULT_OK);
+			assert(epoch->identity_for_test() == identity);
+			MisterRecoveryObservationV2 observation = Observation();
+			assert(broker.FinishRecovery(std::move(epoch), &observation) ==
+				MISTER_RESULT_OK);
+			assert(observation.neutral_resource_flags == closure);
+		}
+		{
+			FakeClock clock(1000);
+			HardwareBroker broker(clock);
+			FakeRecoveryIo recovery_io(broker);
+			FakeTypedRecoveryResources typed(broker);
+			FakeTypedSaveRecoveryResource save;
+			FakeContainmentIo io;
+			io.release_result = first_result;
+			NativeContainment containment(broker, io);
+			NativeRecovery recovery(broker, recovery_io, typed, typed, typed, save,
+				containment);
+			std::unique_ptr<RecoveryEpoch> epoch;
+			assert(broker.BeginRecovery(closure, 3000, 6000, &epoch) ==
+				MISTER_RESULT_OK);
+			const uint64_t identity = epoch->identity_for_test();
+			assert(recovery.Perform(*epoch, OperationKind::terminal_fpga_cleanup) ==
+				first_result);
+			assert(io.writes == 5 && io.reads == 5 && io.releases == 1);
+			io.release_result = MISTER_RESULT_OK;
+			assert(recovery.Perform(*epoch, OperationKind::terminal_fpga_cleanup) ==
+				MISTER_RESULT_OK);
+			assert(epoch->identity_for_test() == identity);
+			assert(io.writes == 5 && io.reads == 5 && io.releases == 2);
+			MisterRecoveryObservationV2 observation = Observation();
+			assert(recovery.Finish(std::move(epoch), &observation) ==
+				MISTER_RESULT_OK);
+			assert(observation.neutral_resource_flags == closure);
+		}
+	}
 }
 
 void TestRecoveryRejectedWithLiveGenerationOrCleanup()
@@ -614,7 +1023,8 @@ void TestNonOkResultsRetainPartialFields()
 		io.results[KindIndex(OperationKind::audio)] = failure;
 		assert(recovery.Perform(*epoch, OperationKind::audio) == failure);
 		MisterRecoveryObservationV2 observation = Observation();
-		assert(recovery.Snapshot(*epoch, &observation) == failure);
+		const Result snapshot_result = MISTER_RESULT_CLEANUP_INCOMPLETE;
+		assert(recovery.Snapshot(*epoch, &observation) == snapshot_result);
 		assert(observation.neutral_resource_flags == MISTER_RESOURCE_CORE_INPUT);
 		assert(observation.observed_resource_flags == MISTER_RESOURCE_NATIVE_AUDIO);
 		assert(recovery.Finish(std::move(epoch), &observation) ==
@@ -705,7 +1115,7 @@ void TestBusyRecoveryAdmissionDoesNotLatchDeadline()
 	held.reset();
 	MisterRecoveryObservationV2 observation = Observation();
 	assert(broker.FinishRecovery(std::move(epoch), &observation) ==
-		MISTER_RESULT_CLEANUP_INCOMPLETE);
+		MISTER_RESULT_DEADLINE);
 	assert(observation.observed_resource_flags == 0);
 	assert(observation.neutral_resource_flags == 0);
 }
@@ -743,13 +1153,11 @@ void TestOperationOverrunRetainsTruthfulResult()
 	assert(recovery.Perform(*epoch, OperationKind::input_descriptors) ==
 		MISTER_RESULT_DEADLINE);
 	MisterRecoveryObservationV2 observation = Observation();
-	assert(recovery.Snapshot(*epoch, &observation) ==
-		MISTER_RESULT_DEADLINE);
+	assert(recovery.Snapshot(*epoch, &observation) == MISTER_RESULT_OK);
 	assert(observation.neutral_resource_flags == MISTER_RESOURCE_CORE_INPUT);
 	assert(observation.observed_resource_flags == 0);
-	assert(recovery.Finish(std::move(epoch), &observation) ==
-		MISTER_RESULT_CLEANUP_INCOMPLETE);
-	assert(epoch != nullptr);
+	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+	assert(epoch == nullptr);
 }
 
 void TestCoreProtocolRecoveryUsesProfilelessSessionAuthority()
@@ -825,9 +1233,9 @@ void TestTypedCoupledRecoverySnapshotsVideoNeutralWhileAudioRemainsUnknown()
 	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
 		MISTER_RESOURCE_NATIVE_VIDEO) == MISTER_RESULT_INVALID_STATE);
 	assert(recovery.ValidateCallbackRequestedFlags(*epoch, requested) ==
-		MISTER_RESULT_INVALID_STATE);
+		MISTER_RESULT_OK);
 	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
-		MISTER_RESOURCE_NATIVE_AUDIO) == MISTER_RESULT_OK);
+		MISTER_RESOURCE_NATIVE_AUDIO) == MISTER_RESULT_INVALID_STATE);
 	MisterRecoveryObservationV2 finish = Observation();
 	assert(recovery.Finish(std::move(epoch), &finish) ==
 		MISTER_RESULT_CLEANUP_INCOMPLETE);
@@ -858,8 +1266,10 @@ void TestTypedSaveRecoveryRetainsOneTaggedLeaseAndOriginalDeadline()
 	assert(recovery.Perform(*epoch, OperationKind::save) == MISTER_RESULT_OK);
 	assert(save.calls == 2);
 	assert(save.last_deadline == 3000);
+	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
+		MISTER_RESOURCE_SAVES) == MISTER_RESULT_OK);
 	assert(recovery.ValidateCallbackRequestedFlags(*epoch, 0) ==
-		MISTER_RESULT_OK);
+		MISTER_RESULT_INVALID_STATE);
 	MisterRecoveryObservationV2 observation = Observation();
 	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
 	assert(observation.neutral_resource_flags == MISTER_RESOURCE_SAVES);
@@ -886,8 +1296,8 @@ void TestTaggedSaveRecoveryUsesTheFreshNativeSaveAdapterAndExactRecord()
 		MISTER_RESULT_INVALID_STATE);
 	assert(recovery.Perform(*epoch, OperationKind::save) == MISTER_RESULT_OK);
 	assert(filesystem.calls() != 0);
-	assert(recovery.ValidateCallbackRequestedFlags(*epoch, 0) ==
-		MISTER_RESULT_OK);
+	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
+		MISTER_RESOURCE_SAVES) == MISTER_RESULT_OK);
 	MisterRecoveryObservationV2 observation = Observation();
 	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
 	assert(observation.neutral_resource_flags == MISTER_RESOURCE_SAVES);
@@ -946,7 +1356,9 @@ void TestRealSaveRecoveryReducesItsOutstandingMaskAndStillExcludesFinish()
 		MISTER_RESULT_OK);
 	assert(recovery.Perform(*epoch, OperationKind::save) == MISTER_RESULT_OK);
 	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
-		MISTER_RESOURCE_CONTENT) == MISTER_RESULT_OK);
+		requested) == MISTER_RESULT_OK);
+	assert(recovery.ValidateCallbackRequestedFlags(*epoch,
+		MISTER_RESOURCE_CONTENT) == MISTER_RESULT_INVALID_STATE);
 	assert(recovery.ValidateCallbackRequestedFlags(*epoch, 0) ==
 		MISTER_RESULT_INVALID_STATE);
 	MisterRecoveryObservationV2 observation = Observation();
@@ -968,6 +1380,7 @@ void TestTypedCoupledRecoveryRetainsItsExactRegistrationForRetry()
 	assert(broker.BeginRecovery(requested, 3000, 6000, &epoch) ==
 		MISTER_RESULT_OK);
 	resources.abandon_once = true;
+	resources.coupled_all_neutral = true;
 	assert(recovery.Perform(*epoch, OperationKind::audio_video) ==
 		MISTER_RESULT_PLATFORM);
 	assert(resources.coupled_calls == 1);
@@ -984,9 +1397,8 @@ void TestTypedCoupledRecoveryRetainsItsExactRegistrationForRetry()
 		MISTER_RESULT_OK);
 	assert(resources.coupled_calls == 2);
 	assert(resources.last_deadline == original_deadline);
-	assert(recovery.Finish(std::move(epoch), &observation) ==
-		MISTER_RESULT_CLEANUP_INCOMPLETE);
-	assert(epoch != nullptr);
+	assert(recovery.Finish(std::move(epoch), &observation) == MISTER_RESULT_OK);
+	assert(observation.neutral_resource_flags == requested);
 }
 
 void TestCoupledRecoveryClosureUnknownBlocksRawRetry()
@@ -1008,8 +1420,10 @@ void TestCoupledRecoveryClosureUnknownBlocksRawRetry()
 	assert(resources.coupled_calls == 1);
 	clock.SetNow(2000);
 	assert(recovery.Perform(*epoch, OperationKind::audio_video) ==
-		MISTER_RESULT_CLEANUP_INCOMPLETE);
+		MISTER_RESULT_PLATFORM);
 	assert(resources.coupled_calls == 1);
+	MisterRecoveryObservationV2 observation = Observation();
+	assert(recovery.Snapshot(*epoch, &observation) == MISTER_RESULT_PLATFORM);
 }
 
 void TestCoupledRecoveryCannotBorrowTheLaterFpgaDeadline()
@@ -1131,7 +1545,7 @@ void TestTypedAudioTerminalPromotionHonorsBothImmutableDeadlines()
 			MISTER_RESULT_OK);
 		MisterRecoveryObservationV2 observation = Observation();
 		assert(recovery.Snapshot(*epoch, &observation) ==
-			MISTER_RESULT_CLEANUP_INCOMPLETE);
+			MISTER_RESULT_DEADLINE);
 		assert(observation.neutral_resource_flags == closure);
 		assert(recovery.Finish(std::move(epoch), &observation) ==
 			MISTER_RESULT_CLEANUP_INCOMPLETE);
@@ -1378,20 +1792,24 @@ void TestTerminalFailuresPreservePositivePartitions()
 		bool mismatch;
 		bool deadline;
 		Result result;
+		Result finish_result;
 		uint32_t observed;
 		uint32_t neutral;
 	};
 	const Case cases[] = {
 		{0, true, false, MISTER_RESULT_CLEANUP_INCOMPLETE,
+			MISTER_RESULT_CLEANUP_INCOMPLETE,
 			MISTER_RESOURCE_FPGA | MISTER_RESOURCE_CORE_PROTOCOL,
 			MISTER_RESOURCE_BRIDGES},
-		{8, false, false, MISTER_RESULT_PLATFORM, 0,
+		{8, false, false, MISTER_RESULT_PLATFORM,
+			MISTER_RESULT_CLEANUP_INCOMPLETE, 0,
 			MISTER_RESOURCE_CORE_PROTOCOL},
-		{0, false, true, MISTER_RESULT_DEADLINE, 0,
+		{0, false, true, MISTER_RESULT_DEADLINE, MISTER_RESULT_DEADLINE, 0,
 			MISTER_RESOURCE_CORE_PROTOCOL},
-		{11, false, false, MISTER_RESULT_PLATFORM, 0,
+		{11, false, false, MISTER_RESULT_PLATFORM,
+			MISTER_RESULT_CLEANUP_INCOMPLETE, 0,
 			MISTER_RESOURCE_BRIDGES | MISTER_RESOURCE_CORE_PROTOCOL},
-		{-1, false, true, MISTER_RESULT_DEADLINE, 0,
+		{-1, false, true, MISTER_RESULT_DEADLINE, MISTER_RESULT_DEADLINE, 0,
 			MISTER_RESOURCE_BRIDGES | MISTER_RESOURCE_CORE_PROTOCOL}
 	};
 	for (const Case &test : cases) {
@@ -1415,7 +1833,7 @@ void TestTerminalFailuresPreservePositivePartitions()
 		terminal.reset();
 		MisterRecoveryObservationV2 observation = Observation();
 		assert(broker.FinishRecovery(std::move(epoch), &observation) ==
-			test.result);
+			test.finish_result);
 		assert(observation.observed_resource_flags == test.observed);
 		assert(observation.neutral_resource_flags == test.neutral);
 	}
@@ -1429,6 +1847,14 @@ int main()
 {
 	using namespace mister::native;
 	TestRecoveryEpochAuthorityAndFreshness();
+	TestRecoveryInvocationBoundsGenericMutation();
+	TestRecoveryInvocationRebindsRetainedSaveDeadline();
+	TestRecoveryInvocationBoundsContainmentObservation();
+	TestCallbackDeadlineDoesNotPoisonRecoveryEpochOrOriginalMask();
+	TestCallbackDeadlineRetriesEveryRetainedTypedRecoveryClass();
+	TestCallbackDeadlineRetriesObservationAndTerminalResidue();
+	TestRetryableRecoveryResultsReachSameEpochSuccess();
+	TestRetryableObservationAndTerminalFailuresReachSuccess();
 	TestRecoveryRejectedWithLiveGenerationOrCleanup();
 	TestNormativeDependenciesAndExactDeadlines();
 	TestSaveRecoveryRequiresTypedSafeRecordAuthority();

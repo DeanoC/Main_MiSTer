@@ -27,6 +27,7 @@ enum class NativeLifecycleState : uint8_t {
 struct NativeResourceLedger {
 	uint32_t resource_flags;
 	bool generation;
+	bool containment_mappings;
 	bool scheduler;
 	bool offload;
 	bool input_descriptors;
@@ -69,7 +70,7 @@ public:
 	uint64_t cleanup_epoch_identity_for_test() const;
 	NativeFailureDrainTiming failure_drain_timing_for_test() const;
 #endif
-	Result Stop();
+	Result Stop(uint64_t callback_deadline_ms);
 
 	NativeLifecycleState state() const;
 	PlatformGenerationId generation() const;
@@ -108,12 +109,13 @@ private:
 	Result FinishPreownershipContentLocked(Result activation_result);
 	void EstablishCleanupTimingLocked();
 	void EstablishFailureDrainTimingLocked();
-	Result EstablishCleanupLocked();
-	Result RunCleanupLocked();
+	Result EstablishCleanupLocked(uint64_t callback_deadline_ms);
+	Result RunCleanupLocked(uint64_t callback_deadline_ms);
 	Result BeginCleanupOperationLocked(OperationKind kind,
 		std::unique_ptr<OperationLease> *lease);
+	Result FinishCleanupCallbackLocked(Result result);
 	Result FinishCleanupOperationLocked(Result result,
-		const OperationLease &lease) const;
+		const OperationLease &lease);
 	Result CaptureDigitalNeutralLocked(const OperationLease &lease);
 	static uint64_t SaturatingAdd(uint64_t value, uint64_t delta);
 	static Result CleanupFailure(Result result);
@@ -129,8 +131,10 @@ private:
 	NativeCleanupTiming cleanup_timing_;
 	NativeFailureDrainTiming failure_drain_timing_;
 	Result latched_activation_result_;
+	uint64_t callback_deadline_ms_;
 	const NativeCoreProfile *profile_;
 	std::unique_ptr<CleanupEpoch> cleanup_epoch_;
+	std::unique_ptr<OperationInvocation> cleanup_invocation_;
 	std::unique_ptr<OperationLease> core_protocol_cleanup_lease_;
 	std::unique_ptr<OperationLease> save_cleanup_lease_;
 	std::unique_ptr<OperationLease> audio_cleanup_lease_;
