@@ -3,7 +3,6 @@
 
 #include "runtime/native/linux/native_core_artifact_adapter.hpp"
 
-#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <time.h>
@@ -220,11 +219,6 @@ ssize_t NativePosixFileSystem::Read(int descriptor, void *bytes, size_t count)
 ssize_t NativePosixFileSystem::ReadAt(int descriptor, void *bytes,
 	size_t count, off_t offset) { return pread(descriptor, bytes, count, offset); }
 int NativePosixFileSystem::Close(int descriptor) { return close(descriptor); }
-int NativePosixFileSystem::DescriptorOpen(int descriptor)
-{
-	if (fcntl(descriptor, F_GETFD) >= 0) return 1;
-	return errno == EBADF ? 0 : -1;
-}
 
 NativeArtifactResult NativeSha256DescriptorForTest(NativeFileSystem &filesystem,
 	int descriptor, uint64_t expected_size, char output[65])
@@ -255,7 +249,7 @@ NativeHeldFile::NativeHeldFile()
 	  root_components_(), root_descriptor_count_(0), directory_descriptor_(-1),
 	  file_descriptor_(-1), size_(0), verified_(false), bound_profile_(nullptr),
 	  directory_name_(), file_name_(),
-	  directory_identity_(), file_identity_()
+	  directory_identity_(), file_identity_(), closure_unknown_(false)
 {
 	for (size_t index = 0; index < kMaximumRootComponents; ++index)
 		root_descriptors_[index] = -1;
@@ -263,76 +257,93 @@ NativeHeldFile::NativeHeldFile()
 
 NativeHeldFile::~NativeHeldFile()
 {
-	for (unsigned attempt = 0; attempt < 3 && owns_descriptors(); ++attempt)
-		Close();
+	Close();
 }
 
 bool NativeHeldFile::valid() const { return verified_ && file_descriptor_ >= 0; }
-bool NativeHeldFile::owns_descriptors() const
+bool NativeHeldFile::HasLiveDescriptors() const
 {
 	return root_descriptor_count_ != 0 || directory_descriptor_ >= 0 ||
 		file_descriptor_ >= 0;
 }
+bool NativeHeldFile::owns_descriptors() const
+{
+	return HasLiveDescriptors() || closure_unknown_;
+}
+bool NativeHeldFile::closure_unknown() const { return closure_unknown_; }
 uint64_t NativeHeldFile::size() const { return size_; }
 
 NativeArtifactResult NativeHeldFile::Close()
 {
-	if (filesystem_ == nullptr) return owns_descriptors() ?
+	if (filesystem_ == nullptr) return closure_unknown_ || HasLiveDescriptors() ?
 		NativeArtifactResult::cleanup_incomplete : NativeArtifactResult::ok;
+	NativeFileSystem *const filesystem = filesystem_;
 	int *const descriptors[] = {&file_descriptor_, &directory_descriptor_};
-	bool incomplete = false;
 	for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]);
 		++index) {
 		int &descriptor = *descriptors[index];
 		if (descriptor < 0) continue;
-		filesystem_->Close(descriptor);
-		const int open = filesystem_->DescriptorOpen(descriptor);
-		if (open == 0) descriptor = -1;
-		else incomplete = true;
+		const int retired = descriptor;
+		descriptor = -1;
+		if (index == 0) {
+			size_ = 0;
+			verified_ = false;
+			bound_profile_ = nullptr;
+		}
+		if (filesystem->Close(retired) != 0) closure_unknown_ = true;
 	}
 	for (size_t remaining = root_descriptor_count_; remaining != 0;
 		--remaining) {
 		int &descriptor = root_descriptors_[remaining - 1];
 		if (descriptor < 0) continue;
-		filesystem_->Close(descriptor);
-		const int open = filesystem_->DescriptorOpen(descriptor);
-		if (open == 0) descriptor = -1;
-		else incomplete = true;
+		const int retired = descriptor;
+		descriptor = -1;
+		if (filesystem->Close(retired) != 0) closure_unknown_ = true;
 	}
 	while (root_descriptor_count_ != 0 &&
 		root_descriptors_[root_descriptor_count_ - 1] < 0)
 		--root_descriptor_count_;
-	if (!owns_descriptors()) {
+	if (!HasLiveDescriptors()) {
 		filesystem_ = nullptr;
 		size_ = 0;
 		verified_ = false;
 		bound_profile_ = nullptr;
+		memset(root_identities_, 0, sizeof(root_identities_));
+		memset(root_components_, 0, sizeof(root_components_));
+		memset(directory_name_, 0, sizeof(directory_name_));
+		memset(file_name_, 0, sizeof(file_name_));
+		memset(&directory_identity_, 0, sizeof(directory_identity_));
+		memset(&file_identity_, 0, sizeof(file_identity_));
 	}
-	return incomplete ? NativeArtifactResult::cleanup_incomplete :
+	return closure_unknown_ ? NativeArtifactResult::cleanup_incomplete :
 		NativeArtifactResult::ok;
 }
 
 NativeArtifactResult NativeHeldFile::CloseBefore(
 	uint64_t absolute_deadline_ms)
 {
-	if (filesystem_ == nullptr) return owns_descriptors() ?
+	if (filesystem_ == nullptr) return closure_unknown_ || HasLiveDescriptors() ?
 		NativeArtifactResult::cleanup_incomplete : NativeArtifactResult::ok;
-	bool incomplete = false;
+	NativeFileSystem *const filesystem = filesystem_;
 	bool expired = false;
 	int *const descriptors[] = {&file_descriptor_, &directory_descriptor_};
 	for (size_t index = 0; index < sizeof(descriptors) / sizeof(descriptors[0]);
 		++index) {
 		int &descriptor = *descriptors[index];
 		if (descriptor < 0) continue;
-		if (filesystem_->NowMs() >= absolute_deadline_ms) {
+		if (filesystem->NowMs() >= absolute_deadline_ms) {
 			expired = true;
 			break;
 		}
-		filesystem_->Close(descriptor);
-		const int open = filesystem_->DescriptorOpen(descriptor);
-		if (open == 0) descriptor = -1;
-		else incomplete = true;
-		if (filesystem_->NowMs() >= absolute_deadline_ms) {
+		const int retired = descriptor;
+		descriptor = -1;
+		if (index == 0) {
+			size_ = 0;
+			verified_ = false;
+			bound_profile_ = nullptr;
+		}
+		if (filesystem->Close(retired) != 0) closure_unknown_ = true;
+		if (filesystem->NowMs() >= absolute_deadline_ms) {
 			expired = true;
 			break;
 		}
@@ -342,15 +353,14 @@ NativeArtifactResult NativeHeldFile::CloseBefore(
 			--remaining) {
 			int &descriptor = root_descriptors_[remaining - 1];
 			if (descriptor < 0) continue;
-			if (filesystem_->NowMs() >= absolute_deadline_ms) {
+			if (filesystem->NowMs() >= absolute_deadline_ms) {
 				expired = true;
 				break;
 			}
-			filesystem_->Close(descriptor);
-			const int open = filesystem_->DescriptorOpen(descriptor);
-			if (open == 0) descriptor = -1;
-			else incomplete = true;
-			if (filesystem_->NowMs() >= absolute_deadline_ms) {
+			const int retired = descriptor;
+			descriptor = -1;
+			if (filesystem->Close(retired) != 0) closure_unknown_ = true;
+			if (filesystem->NowMs() >= absolute_deadline_ms) {
 				expired = true;
 				break;
 			}
@@ -359,15 +369,27 @@ NativeArtifactResult NativeHeldFile::CloseBefore(
 	while (root_descriptor_count_ != 0 &&
 		root_descriptors_[root_descriptor_count_ - 1] < 0)
 		--root_descriptor_count_;
-	if (!owns_descriptors()) {
+	if (!HasLiveDescriptors()) {
 		filesystem_ = nullptr;
 		size_ = 0;
 		verified_ = false;
 		bound_profile_ = nullptr;
+		memset(root_identities_, 0, sizeof(root_identities_));
+		memset(root_components_, 0, sizeof(root_components_));
+		memset(directory_name_, 0, sizeof(directory_name_));
+		memset(file_name_, 0, sizeof(file_name_));
+		memset(&directory_identity_, 0, sizeof(directory_identity_));
+		memset(&file_identity_, 0, sizeof(file_identity_));
 	}
+	if (closure_unknown_) return NativeArtifactResult::cleanup_incomplete;
 	if (expired) return NativeArtifactResult::deadline;
-	return incomplete ? NativeArtifactResult::cleanup_incomplete :
-		NativeArtifactResult::ok;
+	return NativeArtifactResult::ok;
+}
+
+NativeArtifactResult NativeCoreArtifactHandle::CloseRetainedBefore(
+	uint64_t absolute_deadline_ms)
+{
+	return CloseBefore(absolute_deadline_ms);
 }
 
 NativeArtifactResult NativeHeldFile::Revalidate(

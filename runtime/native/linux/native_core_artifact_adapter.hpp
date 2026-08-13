@@ -44,9 +44,6 @@ public:
 	virtual ssize_t ReadAt(int descriptor, void *bytes, size_t count,
 		off_t offset) = 0;
 	virtual int Close(int descriptor) = 0;
-	// Returns one while open, zero when positively closed, and minus one when
-	// descriptor state cannot be observed.
-	virtual int DescriptorOpen(int descriptor) = 0;
 };
 
 class NativePosixFileSystem final : public NativeFileSystem {
@@ -61,7 +58,6 @@ public:
 	ssize_t ReadAt(int descriptor, void *bytes, size_t count,
 		off_t offset) override;
 	int Close(int descriptor) override;
-	int DescriptorOpen(int descriptor) override;
 };
 
 // Exposed only so the same in-tree implementation can be checked against
@@ -89,6 +85,7 @@ public:
 
 	bool valid() const;
 	bool owns_descriptors() const;
+	bool closure_unknown() const;
 	uint64_t size() const;
 	NativeArtifactResult Close();
 
@@ -119,11 +116,16 @@ protected:
 	char file_name_[96];
 	struct stat directory_identity_;
 	struct stat file_identity_;
+
+private:
+	bool HasLiveDescriptors() const;
+	bool closure_unknown_;
 };
 
 class NativeCoreArtifactHandle final : public NativeHeldFile {
 public:
 	NativeCoreArtifactHandle() {}
+	NativeArtifactResult CloseRetainedBefore(uint64_t absolute_deadline_ms);
 };
 
 class NativeCoreArtifactAdapter final {

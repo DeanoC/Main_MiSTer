@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -278,20 +279,33 @@ private:
 
 class FaultFileSystem final : public NativeFileSystem {
 public:
+	enum ForeignKind { foreign_pipe, foreign_file, foreign_socket };
 	explicit FaultFileSystem(NativeFileSystem &delegate)
 		: delegate_(delegate), call_(0), fail_at_(0), close_failures_(0),
 		  opens_(0), read_calls_(0), read_fail_at_(0), read_short_at_(0),
 		  read_overlong_at_(0), read_at_calls_(0), read_at_fail_at_(0),
 		  read_at_short_at_(0), read_at_overlong_at_(0), now_override_(0),
 		  advance_after_read_to_(0), advance_after_read_at_to_(0),
-		  advance_after_close_to_(0), after_hash_() {}
+		  advance_after_close_to_(0), fail_close_at_(0), reuse_close_at_(0),
+		  foreign_descriptor_(-1), foreign_peer_(-1),
+		  foreign_kind_(foreign_pipe), now_calls_(0), expire_now_at_(0),
+		  expire_now_to_(0), after_hash_(), opened_descriptors_(),
+		  close_attempts_(), during_close_() {}
 	uint64_t NowMs() const override
-	{ return now_override_ == 0 ? delegate_.NowMs() : now_override_; }
+	{
+		++now_calls_;
+		if (expire_now_at_ != 0 && now_calls_ >= expire_now_at_)
+			return expire_now_to_;
+		return now_override_ == 0 ? delegate_.NowMs() : now_override_;
+	}
 	int OpenAt(int parent, const char *name, int flags, mode_t mode) override
 	{
 		if (Fail()) return -1;
 		const int result = delegate_.OpenAt(parent, name, flags, mode);
-		if (result >= 0) ++opens_;
+		if (result >= 0) {
+			++opens_;
+			opened_descriptors_.push_back(result);
+		}
 		return result;
 	}
 	int StatAt(int parent, const char *name, struct stat *info,
@@ -337,14 +351,64 @@ public:
 	int Close(int descriptor) override
 	{
 		++call_;
+		close_attempts_.push_back(descriptor);
+		if (during_close_) {
+			std::function<void()> callback = during_close_;
+			during_close_ = std::function<void()>();
+			callback();
+		}
+		if (reuse_close_at_ == close_attempts_.size()) {
+			assert(delegate_.Close(descriptor) == 0);
+			InstallForeignDescriptor(descriptor);
+			if (advance_after_close_to_ != 0)
+				now_override_ = advance_after_close_to_;
+			return -1;
+		}
+		if (fail_close_at_ == close_attempts_.size()) return -1;
 		if (close_failures_ != 0) { --close_failures_; return -1; }
 		if (fail_at_ != 0 && call_ == fail_at_) return -1;
 		const int result = delegate_.Close(descriptor);
 		if (advance_after_close_to_ != 0) now_override_ = advance_after_close_to_;
 		return result;
 	}
-	int DescriptorOpen(int descriptor) override
-	{ if (Fail()) return -1; return delegate_.DescriptorOpen(descriptor); }
+	void InstallForeignDescriptor(int descriptor)
+	{
+		int pair[2] = {-1, -1};
+		if (foreign_kind_ == foreign_socket)
+			assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+		else if (foreign_kind_ == foreign_pipe)
+			assert(pipe(pair) == 0);
+		else {
+			char path[] = "/tmp/fogcast-foreign-fd.XXXXXX";
+			pair[0] = mkstemp(path);
+			assert(pair[0] >= 0);
+			assert(unlink(path) == 0);
+		}
+		assert(pair[0] == descriptor);
+		foreign_descriptor_ = pair[0];
+		foreign_peer_ = pair[1];
+	}
+	void AssertForeignUsable()
+	{
+		const char value = 'z';
+		char observed = 0;
+		if (foreign_kind_ == foreign_file) {
+			assert(write(foreign_descriptor_, &value, 1) == 1);
+			assert(lseek(foreign_descriptor_, 0, SEEK_SET) == 0);
+			assert(read(foreign_descriptor_, &observed, 1) == 1);
+		} else {
+			assert(write(foreign_peer_, &value, 1) == 1);
+			assert(read(foreign_descriptor_, &observed, 1) == 1);
+		}
+		assert(observed == value);
+	}
+	void CloseForeign()
+	{
+		assert(close(foreign_descriptor_) == 0);
+		if (foreign_peer_ >= 0) assert(close(foreign_peer_) == 0);
+		foreign_descriptor_ = -1;
+		foreign_peer_ = -1;
+	}
 	bool Fail()
 	{
 		++call_;
@@ -367,39 +431,269 @@ public:
 	uint64_t advance_after_read_to_;
 	uint64_t advance_after_read_at_to_;
 	uint64_t advance_after_close_to_;
+	size_t fail_close_at_;
+	size_t reuse_close_at_;
+	int foreign_descriptor_;
+	int foreign_peer_;
+	ForeignKind foreign_kind_;
+	mutable unsigned now_calls_;
+	unsigned expire_now_at_;
+	uint64_t expire_now_to_;
 	std::function<void()> after_hash_;
+	std::vector<int> opened_descriptors_;
+	std::vector<int> close_attempts_;
+	std::function<void()> during_close_;
 };
 
-void TestContentCloseIsObservedAndRetryable()
+void TestRetainedCoreCloseIsOrderedAndIdempotent()
 {
 	const std::string root = TemporaryRoot();
 	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
 	const std::string name =
-		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.sfc";
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
 	WriteFile(Join(Join(root, "snes"), name), "hello");
 	NativePosixFileSystem posix;
 	FaultFileSystem filesystem(posix);
-	NativeContentAdapter content(root.c_str(), filesystem);
-	NativeArtifactAuthority authority = HelloAuthority();
-	authority.extension = "sfc";
-	authority.extension_length = 3;
-	assert(content.Configure(authority) == MISTER_RESULT_OK);
-	assert(content.RetainContent(posix.NowMs() + 1000).result ==
-		MISTER_RESULT_OK);
-	char byte = 0;
-	assert(content.ReadAt(0, &byte, 1, posix.NowMs()) ==
-		MISTER_RESULT_DEADLINE);
-	assert(content.owns_descriptors());
-	filesystem.close_failures_ = 1;
-	assert(content.CloseContent(posix.NowMs() + 1000) ==
-		MISTER_RESULT_CLEANUP_INCOMPLETE);
-	assert(content.owns_descriptors());
-	assert(content.CloseContent(posix.NowMs() + 1000) == MISTER_RESULT_OK);
-	assert(!content.owns_descriptors());
+	NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+	NativeCoreArtifactHandle artifact;
+	assert(ResolveSnesFixtureForTest(adapter, posix.NowMs() + 1000, &artifact) ==
+		NativeArtifactResult::ok);
+	const std::vector<int> opened = filesystem.opened_descriptors_;
+	const unsigned opens = filesystem.opens_;
+	assert(opened.size() >= 4);
+	filesystem.during_close_ = [&]() {
+		assert(!artifact.valid());
+		assert(artifact.size() == 0);
+		assert(artifact.owns_descriptors());
+		assert(!artifact.closure_unknown());
+	};
+	assert(artifact.CloseRetainedBefore(posix.NowMs() + 1000) ==
+		NativeArtifactResult::ok);
+	assert(filesystem.close_attempts_.size() == opened.size());
+	for (size_t index = 0; index < opened.size(); ++index)
+		assert(filesystem.close_attempts_[index] ==
+			opened[opened.size() - index - 1]);
+	assert(!artifact.owns_descriptors());
+	assert(!artifact.closure_unknown());
+	assert(!artifact.valid());
+	assert(artifact.size() == 0);
+	assert(artifact.CloseRetainedBefore(posix.NowMs() + 1000) ==
+		NativeArtifactResult::ok);
+	assert(filesystem.close_attempts_.size() == opened.size());
+	assert(filesystem.opens_ == opens);
 	RemoveArtifactTree(root, "snes", name);
 }
 
-void TestContentCloseHonorsEveryObservationDeadline()
+void TestRetainedCloseNeverTargetsAReusedForeignDescriptor(bool content_path)
+{
+	size_t descriptor_total = 0;
+	for (size_t failed_index = 0;
+		descriptor_total == 0 || failed_index < descriptor_total; ++failed_index) {
+		const std::string root = TemporaryRoot();
+		assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+		const char *const suffix = content_path ? ".sfc" : ".rbf";
+		const std::string name = std::string(
+			"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824") +
+			suffix;
+		WriteFile(Join(Join(root, "snes"), name), "hello");
+		NativePosixFileSystem posix;
+		FaultFileSystem filesystem(posix);
+		filesystem.foreign_kind_ = static_cast<FaultFileSystem::ForeignKind>(
+			failed_index % 3);
+		if (content_path) {
+			NativeContentAdapter content(root.c_str(), filesystem);
+			NativeArtifactAuthority authority = HelloAuthority();
+			authority.extension = "sfc";
+			authority.extension_length = 3;
+			assert(content.Configure(authority) == MISTER_RESULT_OK);
+			assert(content.RetainContent(posix.NowMs() + 1000).result ==
+				MISTER_RESULT_OK);
+			descriptor_total = filesystem.opened_descriptors_.size();
+			filesystem.reuse_close_at_ = failed_index + 1;
+			assert(content.CloseContent(posix.NowMs() + 1000) ==
+				MISTER_RESULT_CLEANUP_INCOMPLETE);
+			assert(content.owns_descriptors());
+			assert(!content.active());
+			const size_t attempts = filesystem.close_attempts_.size();
+			filesystem.AssertForeignUsable();
+			assert(content.CloseContent(posix.NowMs() + 1000) ==
+				MISTER_RESULT_CLEANUP_INCOMPLETE);
+			content.CloseContentForProcessExit();
+			assert(filesystem.close_attempts_.size() == attempts);
+			filesystem.AssertForeignUsable();
+			assert(content.Configure(authority) == MISTER_RESULT_INVALID_ARGUMENT);
+			assert(content.RetainContent(posix.NowMs() + 1000).result ==
+				MISTER_RESULT_INVALID_STATE);
+		} else {
+			NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+			NativeCoreArtifactHandle *artifact = new NativeCoreArtifactHandle;
+			assert(ResolveSnesFixtureForTest(adapter, posix.NowMs() + 1000,
+				artifact) == NativeArtifactResult::ok);
+			descriptor_total = filesystem.opened_descriptors_.size();
+			filesystem.reuse_close_at_ = failed_index + 1;
+			assert(artifact->CloseRetainedBefore(posix.NowMs() + 1000) ==
+				NativeArtifactResult::cleanup_incomplete);
+			assert(artifact->closure_unknown());
+			assert(artifact->owns_descriptors());
+			assert(!artifact->valid());
+			assert(artifact->size() == 0);
+			const size_t attempts = filesystem.close_attempts_.size();
+			filesystem.AssertForeignUsable();
+			assert(artifact->CloseRetainedBefore(posix.NowMs() + 1000) ==
+				NativeArtifactResult::cleanup_incomplete);
+			assert(artifact->Close() == NativeArtifactResult::cleanup_incomplete);
+			assert(adapter.Resolve(HelloAuthority(), posix.NowMs() + 1000,
+				artifact) == NativeArtifactResult::invalid_argument);
+			delete artifact;
+			assert(filesystem.close_attempts_.size() == attempts);
+			filesystem.AssertForeignUsable();
+		}
+		assert(filesystem.close_attempts_.size() == descriptor_total);
+		filesystem.CloseForeign();
+		RemoveArtifactTree(root, "snes", name);
+	}
+}
+
+void TestRetainedCoreCloseHonorsEqualityAndLateDeadline()
+{
+	const std::string root = TemporaryRoot();
+	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+	const std::string name =
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
+	WriteFile(Join(Join(root, "snes"), name), "hello");
+	NativePosixFileSystem posix;
+	FaultFileSystem filesystem(posix);
+	filesystem.now_override_ = 10;
+	NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+	NativeCoreArtifactHandle artifact;
+	assert(ResolveSnesFixtureForTest(adapter, 20, &artifact) ==
+		NativeArtifactResult::ok);
+	const unsigned opens = filesystem.opens_;
+	assert(artifact.CloseRetainedBefore(10) == NativeArtifactResult::deadline);
+	assert(artifact.owns_descriptors());
+	assert(filesystem.close_attempts_.empty());
+	filesystem.now_override_ = 11;
+	assert(artifact.CloseRetainedBefore(10) == NativeArtifactResult::deadline);
+	assert(artifact.owns_descriptors());
+	assert(filesystem.close_attempts_.empty());
+	filesystem.now_override_ = 10;
+	filesystem.advance_after_close_to_ = 20;
+	assert(artifact.CloseRetainedBefore(20) == NativeArtifactResult::deadline);
+	assert(artifact.owns_descriptors());
+	assert(filesystem.close_attempts_.size() == 1);
+	filesystem.advance_after_close_to_ = 0;
+	filesystem.now_override_ = 21;
+	assert(artifact.CloseRetainedBefore(30) == NativeArtifactResult::ok);
+	assert(!artifact.owns_descriptors());
+	assert(filesystem.opens_ == opens);
+	RemoveArtifactTree(root, "snes", name);
+}
+
+void TestRetainedCoreCloseHonorsEveryDeadlineBoundary()
+{
+	unsigned final_boundary = 0;
+	for (unsigned boundary = 1;
+		final_boundary == 0 || boundary <= final_boundary; ++boundary) {
+		const std::string root = TemporaryRoot();
+		assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+		const std::string name =
+			"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
+		WriteFile(Join(Join(root, "snes"), name), "hello");
+		NativePosixFileSystem posix;
+		FaultFileSystem filesystem(posix);
+		filesystem.now_override_ = 10;
+		NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+		NativeCoreArtifactHandle artifact;
+		assert(ResolveSnesFixtureForTest(adapter, 20, &artifact) ==
+			NativeArtifactResult::ok);
+		const size_t descriptor_count = filesystem.opened_descriptors_.size();
+		assert(descriptor_count >= 4);
+		if (final_boundary == 0)
+			final_boundary = static_cast<unsigned>(descriptor_count * 2);
+		else assert(final_boundary == descriptor_count * 2);
+		const unsigned opens = filesystem.opens_;
+		filesystem.now_calls_ = 0;
+		filesystem.expire_now_at_ = boundary;
+		filesystem.expire_now_to_ = 20;
+		assert(artifact.CloseRetainedBefore(20) ==
+			NativeArtifactResult::deadline);
+		assert(filesystem.close_attempts_.size() == boundary / 2);
+		assert(artifact.owns_descriptors() == (boundary < descriptor_count * 2));
+		filesystem.expire_now_at_ = 0;
+		filesystem.now_calls_ = 0;
+		assert(artifact.CloseRetainedBefore(20) == NativeArtifactResult::ok);
+		assert(filesystem.close_attempts_.size() == descriptor_count);
+		assert(filesystem.opens_ == opens);
+		assert(!artifact.owns_descriptors());
+		RemoveArtifactTree(root, "snes", name);
+	}
+}
+
+void TestRetainedCoreCloseFailureIsStickyAndNeverRetried()
+{
+	const std::string root = TemporaryRoot();
+	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+	const std::string name =
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
+	WriteFile(Join(Join(root, "snes"), name), "hello");
+	NativePosixFileSystem posix;
+	FaultFileSystem filesystem(posix);
+	NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+	NativeCoreArtifactHandle artifact;
+	assert(ResolveSnesFixtureForTest(adapter, posix.NowMs() + 1000, &artifact) ==
+		NativeArtifactResult::ok);
+	const int leaked = filesystem.opened_descriptors_.back();
+	filesystem.fail_close_at_ = 1;
+	assert(artifact.CloseRetainedBefore(posix.NowMs() + 1000) ==
+		NativeArtifactResult::cleanup_incomplete);
+	assert(artifact.closure_unknown());
+	const size_t attempts = filesystem.close_attempts_.size();
+	assert(artifact.CloseRetainedBefore(posix.NowMs() + 1000) ==
+		NativeArtifactResult::cleanup_incomplete);
+	assert(artifact.Close() == NativeArtifactResult::cleanup_incomplete);
+	assert(filesystem.close_attempts_.size() == attempts);
+	assert(close(leaked) == 0);
+	RemoveArtifactTree(root, "snes", name);
+}
+
+void TestRetainedCoreCloseFailurePrecedesDeadlineAndIsReentrant()
+{
+	const std::string root = TemporaryRoot();
+	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+	const std::string name =
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
+	WriteFile(Join(Join(root, "snes"), name), "hello");
+	NativePosixFileSystem posix;
+	FaultFileSystem filesystem(posix);
+	filesystem.now_override_ = 10;
+	NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+	NativeCoreArtifactHandle artifact;
+	assert(ResolveSnesFixtureForTest(adapter, 20, &artifact) ==
+		NativeArtifactResult::ok);
+	filesystem.reuse_close_at_ = 1;
+	filesystem.advance_after_close_to_ = 20;
+	assert(artifact.CloseRetainedBefore(20) ==
+		NativeArtifactResult::cleanup_incomplete);
+	assert(artifact.owns_descriptors());
+	assert(artifact.closure_unknown());
+	assert(filesystem.close_attempts_.size() == 1);
+	filesystem.AssertForeignUsable();
+	filesystem.advance_after_close_to_ = 0;
+	filesystem.now_override_ = 10;
+	filesystem.during_close_ = [&]() {
+		assert(artifact.CloseRetainedBefore(30) ==
+			NativeArtifactResult::cleanup_incomplete);
+	};
+	assert(artifact.CloseRetainedBefore(30) ==
+		NativeArtifactResult::cleanup_incomplete);
+	assert(filesystem.close_attempts_.size() ==
+		filesystem.opened_descriptors_.size());
+	filesystem.AssertForeignUsable();
+	filesystem.CloseForeign();
+	RemoveArtifactTree(root, "snes", name);
+}
+
+void TestContentCloseRetainsOnlyDeadlineSkippedDescriptors()
 {
 	const std::string root = TemporaryRoot();
 	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
@@ -415,10 +709,15 @@ void TestContentCloseHonorsEveryObservationDeadline()
 	authority.extension_length = 3;
 	assert(content.Configure(authority) == MISTER_RESULT_OK);
 	assert(content.RetainContent(20).result == MISTER_RESULT_OK);
+	assert(content.CloseContent(10) == MISTER_RESULT_DEADLINE);
+	assert(filesystem.close_attempts_.empty());
+	assert(content.owns_descriptors());
 	filesystem.advance_after_close_to_ = 20;
 	assert(content.CloseContent(20) == MISTER_RESULT_DEADLINE);
+	assert(filesystem.close_attempts_.size() == 1);
 	assert(content.owns_descriptors());
 	filesystem.advance_after_close_to_ = 0;
+	filesystem.now_override_ = 21;
 	assert(content.CloseContent(30) == MISTER_RESULT_OK);
 	assert(!content.owns_descriptors());
 	RemoveArtifactTree(root, "snes", name);
@@ -808,11 +1107,13 @@ void TestResolutionFailureInjectionAndEntrySubstitution()
 	NativeCoreArtifactHandle retained;
 	assert(close_adapter.Resolve(HelloAuthority(), posix.NowMs() + 1000,
 		&retained) == NativeArtifactResult::ok);
+	const int unresolved_descriptor = close_failure.opened_descriptors_.back();
 	close_failure.close_failures_ = 1;
 	assert(retained.Close() == NativeArtifactResult::cleanup_incomplete);
 	assert(retained.owns_descriptors());
-	assert(retained.Close() == NativeArtifactResult::ok);
-	assert(!retained.owns_descriptors());
+	assert(close(unresolved_descriptor) == 0);
+	assert(retained.Close() == NativeArtifactResult::cleanup_incomplete);
+	assert(retained.owns_descriptors());
 	RemoveArtifactTree(root, "snes", name);
 }
 
@@ -1225,8 +1526,14 @@ void RunAllTests()
 	TestSecureArtifactResolutionAndComponents();
 	TestContentRetainsExactDescriptorAndRechecksEntry();
 	TestRetainedContentSystemMustMatchTheAdmittedSaveProfile();
-	TestContentCloseIsObservedAndRetryable();
-	TestContentCloseHonorsEveryObservationDeadline();
+	TestRetainedCoreCloseIsOrderedAndIdempotent();
+	TestRetainedCloseNeverTargetsAReusedForeignDescriptor(false);
+	TestRetainedCloseNeverTargetsAReusedForeignDescriptor(true);
+	TestRetainedCoreCloseHonorsEqualityAndLateDeadline();
+	TestRetainedCoreCloseHonorsEveryDeadlineBoundary();
+	TestRetainedCoreCloseFailureIsStickyAndNeverRetried();
+	TestRetainedCoreCloseFailurePrecedesDeadlineAndIsReentrant();
+	TestContentCloseRetainsOnlyDeadlineSkippedDescriptors();
 	TestContentReadAtFailureAndDeadlineBoundaries();
 	TestRejectedContentConfigurationIsAtomic();
 	TestProgrammingRequiresExactActiveProgramLeaseAndDeadline();
