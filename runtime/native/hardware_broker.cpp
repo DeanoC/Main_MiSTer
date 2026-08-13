@@ -46,7 +46,9 @@ struct OperationRegistration {
 		  absolute_deadline_ms(deadline_ms), profile(bound_profile),
 		  registered(false), process_guard_active(false),
 		  core_protocol_completion(CoreProtocolBrokerDisposition::no_session),
-		  core_protocol_session_state()
+		  core_protocol_session_state(),
+		  peripheral_completion(PeripheralBrokerDisposition::no_session),
+		  peripheral_session_state()
 	{
 	}
 
@@ -69,12 +71,15 @@ struct OperationRegistration {
 	bool process_guard_active;
 	CoreProtocolBrokerDisposition core_protocol_completion;
 	std::shared_ptr<ProtocolSessionState> core_protocol_session_state;
+	PeripheralBrokerDisposition peripheral_completion;
+	std::shared_ptr<PeripheralSessionState> peripheral_session_state;
 };
 
 namespace {
 
 std::atomic<uint64_t> generation_nonce_source(0);
 std::atomic<uint64_t> cleanup_nonce_source(0);
+std::atomic<uint64_t> peripheral_backend_nonce_source(0);
 
 uint64_t FreshNonzeroNonce(std::atomic<uint64_t> &source)
 {
@@ -354,6 +359,111 @@ Result OperationLease::GetCoreProtocolBrokerDisposition(HardwareBroker &owner,
 	return owner.GetCoreProtocolBrokerDispositionFor(*this, disposition);
 }
 
+#define MISTER_PERIPHERAL_LEASE_CALL(call) \
+	if (!registration_ || !registration_->lifetime) \
+		return MISTER_RESULT_INVALID_STATE; \
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex); \
+	if (registration_->lifetime->broker != registration_->broker || \
+		registration_->broker != &owner) \
+		return MISTER_RESULT_INVALID_STATE; \
+	return owner.call
+
+Result OperationLease::AcquireActiveAudioSession(HardwareBroker &owner,
+	const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+	std::unique_ptr<ActiveAudioSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireActiveAudioSessionFor(*this, profile,
+		backend, bundle));
+}
+
+Result OperationLease::AcquireCleanupAudioSession(HardwareBroker &owner,
+	const PeripheralBackendIdentity &backend,
+	std::unique_ptr<CleanupAudioSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireCleanupAudioSessionFor(*this, backend,
+		bundle));
+}
+
+Result OperationLease::AcquireRecoveryAudioSession(HardwareBroker &owner,
+	const SafeAudioRecoveryRecord &record, const PeripheralBackendIdentity &backend,
+	std::unique_ptr<RecoveryAudioSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireRecoveryAudioSessionFor(*this, record,
+		backend, bundle));
+}
+
+Result OperationLease::GetAudioSessionDisposition(HardwareBroker &owner,
+	PeripheralBrokerDisposition *disposition) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(GetAudioSessionDispositionFor(*this,
+		disposition));
+}
+
+Result OperationLease::AcquireActiveVideoSession(HardwareBroker &owner,
+	const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+	std::unique_ptr<ActiveVideoSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireActiveVideoSessionFor(*this, profile,
+		backend, bundle));
+}
+
+Result OperationLease::AcquireCleanupVideoSession(HardwareBroker &owner,
+	const PeripheralBackendIdentity &backend,
+	std::unique_ptr<CleanupVideoSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireCleanupVideoSessionFor(*this, backend,
+		bundle));
+}
+
+Result OperationLease::AcquireRecoveryVideoSession(HardwareBroker &owner,
+	const SafeVideoRecoveryRecord &record, const PeripheralBackendIdentity &backend,
+	std::unique_ptr<RecoveryVideoSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireRecoveryVideoSessionFor(*this, record,
+		backend, bundle));
+}
+
+Result OperationLease::GetVideoSessionDisposition(HardwareBroker &owner,
+	PeripheralBrokerDisposition *disposition) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(GetVideoSessionDispositionFor(*this,
+		disposition));
+}
+
+Result OperationLease::AcquireActiveAudioVideoSession(HardwareBroker &owner,
+	const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+	std::unique_ptr<ActiveAudioVideoSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireActiveAudioVideoSessionFor(*this,
+		profile, backend, bundle));
+}
+
+Result OperationLease::AcquireCleanupAudioVideoSession(HardwareBroker &owner,
+	const PeripheralBackendIdentity &backend,
+	std::unique_ptr<CleanupAudioVideoSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireCleanupAudioVideoSessionFor(*this,
+		backend, bundle));
+}
+
+Result OperationLease::AcquireRecoveryAudioVideoSession(HardwareBroker &owner,
+	const SafeAudioVideoRecoveryRecord &record,
+	const PeripheralBackendIdentity &backend,
+	std::unique_ptr<RecoveryAudioVideoSessionBundle> *bundle) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(AcquireRecoveryAudioVideoSessionFor(*this,
+		record, backend, bundle));
+}
+
+Result OperationLease::GetAudioVideoSessionDisposition(HardwareBroker &owner,
+	PeripheralBrokerDisposition *disposition) const
+{
+	MISTER_PERIPHERAL_LEASE_CALL(GetAudioVideoSessionDispositionFor(*this,
+		disposition));
+}
+
+#undef MISTER_PERIPHERAL_LEASE_CALL
+
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 Result OperationLease::BeginConcurrentActiveOperationForTest(
 	HardwareBroker &owner, OperationKind operation_kind,
@@ -479,6 +589,8 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 	  cleanup_registered_(false), cleanup_ever_started_(false),
 	  quiesce_complete_(false), quiesce_call_active_(false),
 	  containment_receipt_current_(false), containment_evidence_pending_(false),
+	  cleanup_audio_shutdown_complete_(false),
+	  recovery_audio_shutdown_complete_(false),
 	  recovery_registered_(false),
 	  recovery_observation_active_(false), recovery_terminal_neutral_(false),
 	  hardware_transaction_active_(false), failure_latched_(false),
@@ -559,6 +671,8 @@ Result HardwareBroker::Enter(const NativeCoreProfile *profile,
 	recovery_fpga_deadline_ms_ = 0;
 	mutation_sequence_ = 0;
 	cleanup_ever_started_ = false;
+	cleanup_audio_shutdown_complete_ = false;
+	recovery_audio_shutdown_complete_ = false;
 	quiesce_complete_ = false;
 	ClearContainmentReceipt();
 	ClearCoreProtocolFailureReceipt();
@@ -599,6 +713,8 @@ Result HardwareBroker::EnterFixtureForTest(const NativeCoreProfile &profile,
 	recovery_fpga_deadline_ms_ = 0;
 	mutation_sequence_ = 0;
 	cleanup_ever_started_ = false;
+	cleanup_audio_shutdown_complete_ = false;
+	recovery_audio_shutdown_complete_ = false;
 	quiesce_complete_ = false;
 	ClearContainmentReceipt();
 	ClearCoreProtocolFailureReceipt();
@@ -761,6 +877,7 @@ Result HardwareBroker::BeginCleanup(PlatformGenerationId generation,
 	cleanup_fpga_deadline_ms_ = fpga_deadline_ms;
 	cleanup_registered_ = true;
 	cleanup_ever_started_ = true;
+	cleanup_audio_shutdown_complete_ = false;
 	ClearContainmentReceipt();
 	state_ = State::cleanup;
 	*epoch = std::move(registered);
@@ -1360,6 +1477,866 @@ Result HardwareBroker::GetCoreProtocolBrokerDispositionFor(
 	return MISTER_RESULT_OK;
 }
 
+PeripheralBackendIdentity HardwareBroker::CreatePeripheralBackendIdentity(
+	const void *adapter_instance)
+{
+	return PeripheralBackendIdentity(adapter_instance,
+		FreshNonzeroNonce(peripheral_backend_nonce_source));
+}
+
+namespace {
+
+bool PeripheralBackendMatches(const PeripheralBackendIdentity &left,
+	const PeripheralBackendIdentity &right)
+{
+	return left.Matches(right);
+}
+
+bool PeripheralSessionWrapperAllocationAllowed()
+{
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	return PeripheralSessionAllocationAllowedForTest();
+#else
+	return true;
+#endif
+}
+
+bool PeripheralReceiptComplete(const PeripheralCompletionReceipt &receipt)
+{
+	return receipt.result == MISTER_RESULT_OK && receipt.transaction_closed &&
+		receipt.mapping_absent && receipt.descriptor_absent &&
+		receipt.local_resources_absent && !receipt.closure_unknown;
+}
+
+bool CoupledReceiptComplete(const CoupledCompletionReceipt &receipt)
+{
+	const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+		MISTER_RESOURCE_NATIVE_VIDEO;
+	return receipt.result == MISTER_RESULT_OK &&
+		receipt.affected_flags == affected &&
+		(receipt.observed_flags & receipt.neutral_flags) == 0 &&
+		((receipt.observed_flags | receipt.neutral_flags) & ~affected) == 0 &&
+		receipt.transaction_closed && receipt.local_resources_absent &&
+		!receipt.closure_unknown;
+}
+
+bool PeripheralActionMatchesSession(PeripheralSessionAction action,
+	PeripheralSessionKind kind)
+{
+	switch (action) {
+	case PeripheralSessionAction::audio_attenuation:
+		return kind == PeripheralSessionKind::audio;
+	case PeripheralSessionAction::video_activation:
+	case PeripheralSessionAction::video_teardown:
+		return kind == PeripheralSessionKind::video;
+	case PeripheralSessionAction::coupled_transmitter:
+		return kind == PeripheralSessionKind::audio_video;
+	case PeripheralSessionAction::none:
+		return false;
+	}
+	return false;
+}
+
+} // namespace
+
+Result HardwareBroker::AcquirePeripheralState(const OperationLease &lease,
+	PeripheralSessionKind kind, const NativeCoreProfile *profile,
+	const SafePeripheralRecoveryRecord *recovery_record,
+	const PeripheralBackendIdentity &backend,
+	std::shared_ptr<PeripheralSessionState> *state)
+{
+	if (state == nullptr || *state) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered || registration->broker != this ||
+		containment_evidence_pending_)
+		return MISTER_RESULT_INVALID_STATE;
+	const OperationKind required_kind = kind == PeripheralSessionKind::audio ?
+		OperationKind::audio : kind == PeripheralSessionKind::video ?
+		OperationKind::video : OperationKind::audio_video;
+	if (registration->operation_kind != required_kind) return MISTER_RESULT_INVALID_STATE;
+	const bool active = registration->authority == LeaseAuthority::active_generation &&
+		registration->authority_identity == generation_ && state_ == State::active &&
+		!failure_latched_;
+	const bool cleanup = registration->authority == LeaseAuthority::cleanup_epoch &&
+		registration->authority_identity == cleanup_identity_ && state_ == State::cleanup;
+	const bool recovery = registration->authority == LeaseAuthority::recovery_epoch &&
+		registration->authority_identity == recovery_identity_ && state_ == State::recovery &&
+		!recovery_terminal_neutral_ &&
+		IsRecoveryOperation(required_kind, recovery_requested_resource_flags_);
+	if (!active && !cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	if (active) {
+		if (profile == nullptr || registration->profile != profile_ ||
+			registration->profile != profile || recovery_record != nullptr)
+			return MISTER_RESULT_INVALID_STATE;
+	} else if (recovery) {
+		if (profile != nullptr || recovery_record == nullptr)
+			return MISTER_RESULT_UNSUPPORTED;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+		if (recovery_record->authority != NativeProfileAuthority::fixture ||
+			!IsExactFixtureSafePeripheralRecoveryRecordForTest(recovery_record))
+			return MISTER_RESULT_UNSUPPORTED;
+#else
+		return MISTER_RESULT_UNSUPPORTED;
+#endif
+	} else if (profile != nullptr || recovery_record != nullptr ||
+		registration->profile != profile_) {
+		return MISTER_RESULT_INVALID_STATE;
+	}
+	if (registration->peripheral_session_state) {
+		const std::shared_ptr<PeripheralSessionState> retained =
+			registration->peripheral_session_state;
+		const std::shared_ptr<PeripheralSessionState> current =
+			peripheral_session_state_.lock();
+		PeripheralSessionPhase expected = PeripheralSessionPhase::abandoned;
+		if (registration->peripheral_completion !=
+				PeripheralBrokerDisposition::no_session ||
+			!retained || current.get() != retained.get() || !retained->view ||
+			retained->owner_registration.lock().get() != registration.get() ||
+			retained->view->registration_.get() != registration.get() ||
+			retained->kind != kind || !retained->recheckout_allowed ||
+			!hardware_transaction_active_ ||
+			!PeripheralBackendMatches(retained->backend, backend) ||
+			!retained->phase.compare_exchange_strong(expected,
+				PeripheralSessionPhase::live))
+			return MISTER_RESULT_INVALID_STATE;
+		*state = retained;
+		return MISTER_RESULT_OK;
+	}
+	if (registration->peripheral_completion != PeripheralBrokerDisposition::no_session)
+		return MISTER_RESULT_INVALID_STATE;
+	if (hardware_transaction_active_) return MISTER_RESULT_INVALID_STATE;
+	std::shared_ptr<PeripheralSessionState> admitted(new (std::nothrow)
+		PeripheralSessionState(kind, backend));
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	std::unique_ptr<HardwareLeaseView> view(new (std::nothrow)
+		HardwareLeaseView(registration));
+	if (!view) return MISTER_RESULT_PLATFORM;
+	admitted->view = std::move(view);
+	admitted->owner_registration = registration;
+	// Cleanup reuses the immutable profile bound to the registration. The
+	// resource receives only the typed session, never an independently supplied
+	// profile selector.
+	admitted->profile = active ? profile : registration->profile;
+	admitted->recovery_record = recovery_record;
+	admitted->initial_mutation_sequence = mutation_sequence_;
+	// A known no-admission receipt must match the broker sequence that was
+	// current when this exact registration-owned state was first admitted.
+	// Retained recheckout deliberately bypasses this initialization so suffix
+	// progress and its later mutation sequence are never reset.
+	admitted->last_mutation_sequence = mutation_sequence_;
+	admitted->absolute_deadline_ms = registration->absolute_deadline_ms;
+	registration->peripheral_session_state = admitted;
+	peripheral_session_state_ = admitted;
+	hardware_transaction_active_ = true;
+	*state = admitted;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::GetPeripheralDisposition(const OperationLease &lease,
+	PeripheralSessionKind kind, PeripheralBrokerDisposition *disposition)
+{
+	if (disposition == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered || registration->broker != this ||
+		(registration->operation_kind != (kind == PeripheralSessionKind::audio ?
+			OperationKind::audio : kind == PeripheralSessionKind::video ?
+			OperationKind::video : OperationKind::audio_video)))
+		return MISTER_RESULT_INVALID_STATE;
+	if (registration->peripheral_completion != PeripheralBrokerDisposition::no_session) {
+		*disposition = registration->peripheral_completion;
+		return MISTER_RESULT_OK;
+	}
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (current && registration->peripheral_session_state.get() == current.get() &&
+		current->kind == kind && current->view &&
+		current->owner_registration.lock().get() == registration.get() &&
+		current->view->registration_.get() == registration.get()) {
+		*disposition = current->phase.load() == PeripheralSessionPhase::abandoned ?
+			PeripheralBrokerDisposition::abandoned : PeripheralBrokerDisposition::live;
+		return MISTER_RESULT_OK;
+	}
+	*disposition = PeripheralBrokerDisposition::no_session;
+	return MISTER_RESULT_OK;
+}
+
+void HardwareBroker::ConsumePeripheralSessionState(OperationRegistration &registration,
+	const std::shared_ptr<PeripheralSessionState> &state,
+	PeripheralBrokerDisposition disposition)
+{
+	if (state && state->view) {
+		state->view->registration_.reset();
+		state->view.reset();
+	}
+	if (state) state->phase.store(PeripheralSessionPhase::finalized);
+	registration.peripheral_session_state.reset();
+	registration.peripheral_completion = disposition;
+	peripheral_session_state_.reset();
+	hardware_transaction_active_ = false;
+}
+
+Result HardwareBroker::ResolvePeripheralWrapperAllocationFailure(
+	const std::shared_ptr<PeripheralSessionState> &state)
+{
+	if (!state) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() ||
+		registration->peripheral_session_state.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		registration->peripheral_completion !=
+			PeripheralBrokerDisposition::no_session || !hardware_transaction_active_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (registration->authority == LeaseAuthority::active_generation) {
+		if (state_ != State::active || registration->authority_identity != generation_ ||
+			failure_latched_) return MISTER_RESULT_INVALID_STATE;
+		// Active admission has not reached a consumer.  Roll it all the way
+		// back so the exact registration is unfenced and can mint a fresh
+		// wrapper; no hardware mutation or successful receipt is implied.
+		ConsumePeripheralSessionState(*registration, state,
+			PeripheralBrokerDisposition::no_session);
+		lease_released_.notify_all();
+		return MISTER_RESULT_OK;
+	}
+	if ((registration->authority == LeaseAuthority::cleanup_epoch &&
+		 state_ == State::cleanup &&
+		 registration->authority_identity == cleanup_identity_) ||
+		(registration->authority == LeaseAuthority::recovery_epoch &&
+		 state_ == State::recovery &&
+		 registration->authority_identity == recovery_identity_)) {
+		state->phase.store(PeripheralSessionPhase::abandoned);
+		return MISTER_RESULT_OK;
+	}
+	return MISTER_RESULT_INVALID_STATE;
+}
+
+Result HardwareBroker::CompletePeripheralSession(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	PeripheralSessionKind kind, LeaseAuthority authority, bool active_failure,
+	bool abandon, const PeripheralCompletionReceipt &receipt)
+{
+	if (!state) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() ||
+		registration->peripheral_session_state.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->kind != kind || state->phase.load() != PeripheralSessionPhase::live ||
+		registration->authority != authority ||
+		registration->peripheral_completion != PeripheralBrokerDisposition::no_session ||
+		!hardware_transaction_active_ || containment_evidence_pending_)
+		return MISTER_RESULT_INVALID_STATE;
+	const bool active = authority == LeaseAuthority::active_generation &&
+		state_ == State::active && registration->authority_identity == generation_ &&
+		!failure_latched_;
+	const bool cleanup = authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && registration->authority_identity == cleanup_identity_;
+	const bool recovery = authority == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery && registration->authority_identity == recovery_identity_;
+	if (!active && !cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+	if (receipt.mutation_sequence != mutation_sequence_ ||
+		(clock_.NowMs() >= registration->absolute_deadline_ms &&
+		 receipt.result == MISTER_RESULT_OK))
+		return MISTER_RESULT_DEADLINE;
+	if (active_failure) {
+		const bool no_residue_before_first_mutation =
+			receipt.mutation_sequence == state->initial_mutation_sequence &&
+			receipt.transaction_closed && receipt.mapping_absent &&
+			receipt.descriptor_absent && receipt.local_resources_absent &&
+			!receipt.closure_unknown;
+		if (!active || receipt.result == MISTER_RESULT_OK ||
+			(receipt.mutation_sequence <= state->initial_mutation_sequence &&
+			 !no_residue_before_first_mutation))
+			return MISTER_RESULT_INVALID_STATE;
+		failure_latched_ = true;
+		state_ = State::quiescing;
+		quiesce_complete_ = false;
+		ConsumePeripheralSessionState(*registration, state,
+			PeripheralBrokerDisposition::failure_completed);
+		lease_released_.notify_all();
+		return MISTER_RESULT_OK;
+	}
+	if (abandon) {
+		if (active || (!receipt.closure_unknown &&
+			(!receipt.mapping_absent || !receipt.descriptor_absent)))
+			return MISTER_RESULT_INVALID_STATE;
+		state->recheckout_allowed = !receipt.closure_unknown &&
+			!state->action_progress_unknown;
+		state->phase.store(PeripheralSessionPhase::abandoned);
+		return MISTER_RESULT_OK;
+	}
+	if (!PeripheralReceiptComplete(receipt) ||
+		(state->action != PeripheralSessionAction::none &&
+			(state->action_progress_unknown || !state->action_transaction_closed ||
+			 state->action_next_word_index != state->action_word_count)) ||
+		(active && receipt.mutation_sequence <= state->initial_mutation_sequence))
+		return MISTER_RESULT_INVALID_STATE;
+	if (cleanup && kind == PeripheralSessionKind::audio)
+		cleanup_audio_shutdown_complete_ = true;
+	if (recovery && kind == PeripheralSessionKind::audio)
+		recovery_audio_shutdown_complete_ = true;
+	ConsumePeripheralSessionState(*registration, state,
+		PeripheralBrokerDisposition::success_completed);
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CompleteCoupledSession(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	LeaseAuthority authority, bool active_failure, bool abandon,
+	const CoupledCompletionReceipt &receipt, Result primary_result)
+{
+	if (!state) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() || registration->peripheral_session_state.get() !=
+			state.get() || !state->view || state->kind != PeripheralSessionKind::audio_video ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		registration->operation_kind != OperationKind::audio_video ||
+		registration->authority != authority || !hardware_transaction_active_ ||
+		containment_evidence_pending_ || receipt.mutation_sequence != mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	const bool active = authority == LeaseAuthority::active_generation &&
+		state_ == State::active && registration->authority_identity == generation_ &&
+		!failure_latched_;
+	const bool cleanup = authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup &&
+		registration->authority_identity == cleanup_identity_;
+	const bool recovery = authority == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery &&
+		registration->authority_identity == recovery_identity_ &&
+		!recovery_terminal_neutral_ &&
+		IsRecoveryOperation(OperationKind::audio_video,
+			recovery_requested_resource_flags_);
+	if (!active && !cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+	if (active_failure) {
+		const bool no_residue_before_first_mutation =
+			receipt.mutation_sequence == state->initial_mutation_sequence &&
+			receipt.transaction_closed && receipt.local_resources_absent &&
+			!receipt.closure_unknown;
+		if (!active || primary_result == MISTER_RESULT_OK ||
+			(receipt.mutation_sequence <= state->initial_mutation_sequence &&
+			 !no_residue_before_first_mutation))
+			return MISTER_RESULT_INVALID_STATE;
+		failure_latched_ = true;
+		state_ = State::quiescing;
+		quiesce_complete_ = false;
+		ConsumePeripheralSessionState(*registration, state,
+			PeripheralBrokerDisposition::failure_completed);
+		lease_released_.notify_all();
+		return MISTER_RESULT_OK;
+	}
+	if (abandon) {
+		if (authority == LeaseAuthority::active_generation)
+			return MISTER_RESULT_INVALID_STATE;
+		state->recheckout_allowed = !receipt.closure_unknown &&
+			!state->action_progress_unknown;
+		state->phase.store(PeripheralSessionPhase::abandoned);
+		return MISTER_RESULT_OK;
+	}
+	if (!CoupledReceiptComplete(receipt) ||
+		(state->action != PeripheralSessionAction::none &&
+			(state->action_progress_unknown || !state->action_transaction_closed ||
+			 state->action_next_word_index != state->action_word_count)) ||
+		(clock_.NowMs() >= registration->absolute_deadline_ms &&
+		 receipt.result == MISTER_RESULT_OK) ||
+		(active && receipt.mutation_sequence <= state->initial_mutation_sequence))
+		return MISTER_RESULT_INVALID_STATE;
+	ConsumePeripheralSessionState(*registration, state,
+		PeripheralBrokerDisposition::success_completed);
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
+}
+
+#define MISTER_DEFINE_PERIPHERAL_ACQUIRE(name, session_type, bundle_type, kind_value) \
+Result HardwareBroker::name(const OperationLease &lease, const NativeCoreProfile &profile, \
+	const PeripheralBackendIdentity &backend, std::unique_ptr<bundle_type> *bundle) \
+{ \
+	if (bundle == nullptr || bundle->get() != nullptr) \
+		return MISTER_RESULT_INVALID_ARGUMENT; \
+	std::shared_ptr<PeripheralSessionState> state; \
+	const Result result = AcquirePeripheralState(lease, kind_value, &profile, nullptr, \
+		backend, &state); \
+	if (result != MISTER_RESULT_OK) return result; \
+	if (!PeripheralSessionWrapperAllocationAllowed()) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	std::unique_ptr<session_type> admitted(new (std::nothrow) session_type()); \
+	if (!admitted) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	if (!PeripheralSessionWrapperAllocationAllowed()) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	std::unique_ptr<bundle_type> admitted_bundle(new (std::nothrow) bundle_type( \
+		std::move(admitted), backend)); \
+	if (!admitted_bundle) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	admitted_bundle->session_->state_ = state; \
+	*bundle = std::move(admitted_bundle); \
+	return MISTER_RESULT_OK; \
+}
+
+MISTER_DEFINE_PERIPHERAL_ACQUIRE(AcquireActiveAudioSessionFor,
+	ActiveAudioSession, ActiveAudioSessionBundle, PeripheralSessionKind::audio)
+MISTER_DEFINE_PERIPHERAL_ACQUIRE(AcquireActiveVideoSessionFor,
+	ActiveVideoSession, ActiveVideoSessionBundle, PeripheralSessionKind::video)
+MISTER_DEFINE_PERIPHERAL_ACQUIRE(AcquireActiveAudioVideoSessionFor,
+	ActiveAudioVideoSession, ActiveAudioVideoSessionBundle,
+	PeripheralSessionKind::audio_video)
+
+#undef MISTER_DEFINE_PERIPHERAL_ACQUIRE
+
+#define MISTER_DEFINE_PERIPHERAL_CLEANUP_ACQUIRE(name, session_type, bundle_type, kind_value) \
+Result HardwareBroker::name(const OperationLease &lease, \
+	const PeripheralBackendIdentity &backend, std::unique_ptr<bundle_type> *bundle) \
+{ \
+	if (bundle == nullptr || bundle->get() != nullptr) \
+		return MISTER_RESULT_INVALID_ARGUMENT; \
+	std::shared_ptr<PeripheralSessionState> state; \
+	const Result result = AcquirePeripheralState(lease, kind_value, nullptr, nullptr, \
+		backend, &state); \
+	if (result != MISTER_RESULT_OK) return result; \
+	if (!PeripheralSessionWrapperAllocationAllowed()) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	std::unique_ptr<session_type> admitted(new (std::nothrow) session_type()); \
+	if (!admitted) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	if (!PeripheralSessionWrapperAllocationAllowed()) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	std::unique_ptr<bundle_type> admitted_bundle(new (std::nothrow) bundle_type( \
+		std::move(admitted), backend)); \
+	if (!admitted_bundle) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	admitted_bundle->session_->state_ = state; \
+	*bundle = std::move(admitted_bundle); \
+	return MISTER_RESULT_OK; \
+}
+
+MISTER_DEFINE_PERIPHERAL_CLEANUP_ACQUIRE(AcquireCleanupAudioSessionFor,
+	CleanupAudioSession, CleanupAudioSessionBundle, PeripheralSessionKind::audio)
+MISTER_DEFINE_PERIPHERAL_CLEANUP_ACQUIRE(AcquireCleanupVideoSessionFor,
+	CleanupVideoSession, CleanupVideoSessionBundle, PeripheralSessionKind::video)
+MISTER_DEFINE_PERIPHERAL_CLEANUP_ACQUIRE(AcquireCleanupAudioVideoSessionFor,
+	CleanupAudioVideoSession, CleanupAudioVideoSessionBundle,
+	PeripheralSessionKind::audio_video)
+
+#undef MISTER_DEFINE_PERIPHERAL_CLEANUP_ACQUIRE
+
+#define MISTER_DEFINE_PERIPHERAL_RECOVERY_ACQUIRE(name, session_type, bundle_type, kind_value, record_type) \
+Result HardwareBroker::name(const OperationLease &lease, const record_type &record, \
+	const PeripheralBackendIdentity &backend, std::unique_ptr<bundle_type> *bundle) \
+{ \
+	if (bundle == nullptr || bundle->get() != nullptr) \
+		return MISTER_RESULT_INVALID_ARGUMENT; \
+	std::shared_ptr<PeripheralSessionState> state; \
+	const Result result = AcquirePeripheralState(lease, kind_value, nullptr, &record.base, \
+		backend, &state); \
+	if (result != MISTER_RESULT_OK) return result; \
+	if (!PeripheralSessionWrapperAllocationAllowed()) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	std::unique_ptr<session_type> admitted(new (std::nothrow) session_type()); \
+	if (!admitted) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	if (!PeripheralSessionWrapperAllocationAllowed()) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	std::unique_ptr<bundle_type> admitted_bundle(new (std::nothrow) bundle_type( \
+		std::move(admitted), backend)); \
+	if (!admitted_bundle) { \
+		const Result resolved = ResolvePeripheralWrapperAllocationFailure(state); \
+		return resolved == MISTER_RESULT_OK ? MISTER_RESULT_PLATFORM : resolved; \
+	} \
+	admitted_bundle->session_->state_ = state; \
+	*bundle = std::move(admitted_bundle); \
+	return MISTER_RESULT_OK; \
+}
+
+MISTER_DEFINE_PERIPHERAL_RECOVERY_ACQUIRE(AcquireRecoveryAudioSessionFor,
+	RecoveryAudioSession, RecoveryAudioSessionBundle, PeripheralSessionKind::audio,
+	SafeAudioRecoveryRecord)
+MISTER_DEFINE_PERIPHERAL_RECOVERY_ACQUIRE(AcquireRecoveryVideoSessionFor,
+	RecoveryVideoSession, RecoveryVideoSessionBundle, PeripheralSessionKind::video,
+	SafeVideoRecoveryRecord)
+MISTER_DEFINE_PERIPHERAL_RECOVERY_ACQUIRE(AcquireRecoveryAudioVideoSessionFor,
+	RecoveryAudioVideoSession, RecoveryAudioVideoSessionBundle,
+	PeripheralSessionKind::audio_video,
+	SafeAudioVideoRecoveryRecord)
+
+#undef MISTER_DEFINE_PERIPHERAL_RECOVERY_ACQUIRE
+
+Result HardwareBroker::GetAudioSessionDispositionFor(const OperationLease &lease,
+	PeripheralBrokerDisposition *disposition)
+{
+	return GetPeripheralDisposition(lease, PeripheralSessionKind::audio,
+		disposition);
+}
+
+Result HardwareBroker::GetVideoSessionDispositionFor(const OperationLease &lease,
+	PeripheralBrokerDisposition *disposition)
+{
+	return GetPeripheralDisposition(lease, PeripheralSessionKind::video,
+		disposition);
+}
+
+Result HardwareBroker::GetAudioVideoSessionDispositionFor(
+	const OperationLease &lease, PeripheralBrokerDisposition *disposition)
+{
+	return GetPeripheralDisposition(lease, PeripheralSessionKind::audio_video,
+		disposition);
+}
+
+#define MISTER_DEFINE_PERIPHERAL_COMPLETE(name, session_type, kind_value, authority_value, failure, abandoned) \
+Result HardwareBroker::name(std::unique_ptr<session_type> &&session, \
+	const PeripheralCompletionReceipt &receipt) \
+{ \
+	if (!session) return MISTER_RESULT_INVALID_ARGUMENT; \
+	const std::shared_ptr<PeripheralSessionState> state = session->state_; \
+	const Result result = CompletePeripheralSession(state, kind_value, authority_value, \
+		failure, abandoned, receipt); \
+	if (result == MISTER_RESULT_OK && !abandoned) session.reset(); \
+	return result; \
+}
+
+MISTER_DEFINE_PERIPHERAL_COMPLETE(CompleteActiveAudioSuccess, ActiveAudioSession,
+	PeripheralSessionKind::audio, LeaseAuthority::active_generation, false, false)
+MISTER_DEFINE_PERIPHERAL_COMPLETE(CompleteCleanupAudio, CleanupAudioSession,
+	PeripheralSessionKind::audio, LeaseAuthority::cleanup_epoch, false, false)
+MISTER_DEFINE_PERIPHERAL_COMPLETE(CompleteRecoveryAudio, RecoveryAudioSession,
+	PeripheralSessionKind::audio, LeaseAuthority::recovery_epoch, false, false)
+MISTER_DEFINE_PERIPHERAL_COMPLETE(CompleteActiveVideoSuccess, ActiveVideoSession,
+	PeripheralSessionKind::video, LeaseAuthority::active_generation, false, false)
+MISTER_DEFINE_PERIPHERAL_COMPLETE(CompleteCleanupVideo, CleanupVideoSession,
+	PeripheralSessionKind::video, LeaseAuthority::cleanup_epoch, false, false)
+MISTER_DEFINE_PERIPHERAL_COMPLETE(CompleteRecoveryVideo, RecoveryVideoSession,
+	PeripheralSessionKind::video, LeaseAuthority::recovery_epoch, false, false)
+
+#undef MISTER_DEFINE_PERIPHERAL_COMPLETE
+
+#define MISTER_DEFINE_PERIPHERAL_FAILURE(name, session_type, kind_value, authority_value, active_failure, abandoned) \
+Result HardwareBroker::name(std::unique_ptr<session_type> &&session, \
+	const PeripheralFailureReceipt &receipt) \
+{ \
+	if (!session) return MISTER_RESULT_INVALID_ARGUMENT; \
+	PeripheralCompletionReceipt completion = receipt.release; \
+	completion.result = receipt.primary_result; \
+	const std::shared_ptr<PeripheralSessionState> state = session->state_; \
+	const Result result = CompletePeripheralSession(state, kind_value, authority_value, \
+		active_failure, abandoned, completion); \
+	if (result == MISTER_RESULT_OK && !abandoned) session.reset(); \
+	return result; \
+}
+
+MISTER_DEFINE_PERIPHERAL_FAILURE(CompleteActiveAudioFailure, ActiveAudioSession,
+	PeripheralSessionKind::audio, LeaseAuthority::active_generation, true, false)
+MISTER_DEFINE_PERIPHERAL_FAILURE(AbandonCleanupAudio, CleanupAudioSession,
+	PeripheralSessionKind::audio, LeaseAuthority::cleanup_epoch, false, true)
+MISTER_DEFINE_PERIPHERAL_FAILURE(AbandonRecoveryAudio, RecoveryAudioSession,
+	PeripheralSessionKind::audio, LeaseAuthority::recovery_epoch, false, true)
+MISTER_DEFINE_PERIPHERAL_FAILURE(CompleteActiveVideoFailure, ActiveVideoSession,
+	PeripheralSessionKind::video, LeaseAuthority::active_generation, true, false)
+MISTER_DEFINE_PERIPHERAL_FAILURE(AbandonCleanupVideo, CleanupVideoSession,
+	PeripheralSessionKind::video, LeaseAuthority::cleanup_epoch, false, true)
+MISTER_DEFINE_PERIPHERAL_FAILURE(AbandonRecoveryVideo, RecoveryVideoSession,
+	PeripheralSessionKind::video, LeaseAuthority::recovery_epoch, false, true)
+
+#undef MISTER_DEFINE_PERIPHERAL_FAILURE
+
+Result HardwareBroker::CompleteActiveAudioVideoSuccess(
+	std::unique_ptr<ActiveAudioVideoSession> &&session,
+	const CoupledAcquisitionReceipt &receipt)
+{
+	const CoupledCompletionReceipt completion = {receipt.result,
+		receipt.affected_flags, 0, 0, receipt.local_resources_absent,
+		receipt.closure_unknown, receipt.mutation_sequence,
+		receipt.transaction_closed, receipt.transaction_residue};
+	if (!session) return MISTER_RESULT_INVALID_ARGUMENT;
+	const Result result = CompleteCoupledSession(session->state_,
+		LeaseAuthority::active_generation, false, false, completion, receipt.result);
+	if (result == MISTER_RESULT_OK) session.reset();
+	return result;
+}
+
+Result HardwareBroker::CompleteActiveAudioVideoFailure(
+	std::unique_ptr<ActiveAudioVideoSession> &&session,
+	const CoupledFailureReceipt &receipt)
+{
+	const CoupledCompletionReceipt completion = {receipt.release.result,
+		receipt.release.affected_flags, 0, 0,
+		receipt.release.local_resources_absent, receipt.release.closure_unknown,
+		receipt.release.mutation_sequence, receipt.release.transaction_closed,
+		receipt.release.transaction_residue};
+	if (!session) return MISTER_RESULT_INVALID_ARGUMENT;
+	const Result result = CompleteCoupledSession(session->state_,
+		LeaseAuthority::active_generation, true, false, completion,
+		receipt.primary_result);
+	if (result == MISTER_RESULT_OK) session.reset();
+	return result;
+}
+
+#define MISTER_DEFINE_COUPLED_COMPLETE(name, session_type, authority_value, abandon) \
+Result HardwareBroker::name(std::unique_ptr<session_type> &&session, \
+	const CoupledCompletionReceipt &receipt) \
+{ \
+	if (!session) return MISTER_RESULT_INVALID_ARGUMENT; \
+	const Result result = CompleteCoupledSession(session->state_, authority_value, \
+		false, abandon, receipt, receipt.result); \
+	if (result == MISTER_RESULT_OK && !abandon) session.reset(); \
+	return result; \
+}
+
+MISTER_DEFINE_COUPLED_COMPLETE(CompleteCleanupAudioVideo,
+	CleanupAudioVideoSession, LeaseAuthority::cleanup_epoch, false)
+MISTER_DEFINE_COUPLED_COMPLETE(CompleteRecoveryAudioVideo,
+	RecoveryAudioVideoSession, LeaseAuthority::recovery_epoch, false)
+
+#undef MISTER_DEFINE_COUPLED_COMPLETE
+
+#define MISTER_DEFINE_COUPLED_ABANDON(name, session_type, authority_value) \
+Result HardwareBroker::name(std::unique_ptr<session_type> &&session, \
+	const CoupledFailureReceipt &receipt) \
+{ \
+	const CoupledCompletionReceipt completion = {receipt.release.result, \
+		receipt.release.affected_flags, 0, 0, receipt.release.local_resources_absent, \
+		receipt.release.closure_unknown, receipt.release.mutation_sequence, \
+		receipt.release.transaction_closed, receipt.release.transaction_residue}; \
+	if (!session) return MISTER_RESULT_INVALID_ARGUMENT; \
+	return CompleteCoupledSession(session->state_, authority_value, false, true, \
+		completion, receipt.primary_result); \
+}
+
+MISTER_DEFINE_COUPLED_ABANDON(AbandonCleanupAudioVideo,
+	CleanupAudioVideoSession, LeaseAuthority::cleanup_epoch)
+MISTER_DEFINE_COUPLED_ABANDON(AbandonRecoveryAudioVideo,
+	RecoveryAudioVideoSession, LeaseAuthority::recovery_epoch)
+
+#undef MISTER_DEFINE_COUPLED_ABANDON
+
+Result HardwareBroker::RecordPeripheralMutation(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	uint64_t *mutation_sequence)
+{
+	if (mutation_sequence == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	*mutation_sequence = 0;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state ? state->owner_registration.lock() :
+		std::shared_ptr<OperationRegistration>();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!state || !registration || !registration->registered ||
+		registration->broker != this || current.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		!hardware_transaction_active_ || containment_evidence_pending_ ||
+		clock_.NowMs() >= registration->absolute_deadline_ms ||
+		mutation_sequence_ == UINT64_MAX)
+		return MISTER_RESULT_INVALID_STATE;
+	*mutation_sequence = ++mutation_sequence_;
+	state->last_mutation_sequence = *mutation_sequence;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::PreparePeripheralAction(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	PeripheralSessionAction action, const void *profile_identity,
+	uint8_t word_count, uint8_t *next_word_index)
+{
+	if (next_word_index == nullptr || action == PeripheralSessionAction::none ||
+		profile_identity == nullptr || word_count == 0 || !state)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	*next_word_index = 0;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() ||
+		registration->peripheral_session_state.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		!hardware_transaction_active_ || containment_evidence_pending_ ||
+		!PeripheralActionMatchesSession(action, state->kind))
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	if (state->action == PeripheralSessionAction::none) {
+		state->action = action;
+		state->action_profile_identity = profile_identity;
+		state->action_word_count = word_count;
+		state->action_next_word_index = 0;
+		// Preparing an exact retry binds its immutable recipe but does not open
+		// a transport transaction. A failed Begin must retain this closed state
+		// and the completed-word suffix unchanged.
+		state->action_transaction_closed = true;
+		state->action_progress_unknown = false;
+	} else if (state->action != action ||
+		state->action_profile_identity != profile_identity ||
+		state->action_word_count != word_count || state->action_progress_unknown ||
+		!state->action_transaction_closed) {
+		return MISTER_RESULT_INVALID_STATE;
+	}
+	*next_word_index = state->action_next_word_index;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::AdmitPeripheralAction(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	PeripheralSessionAction action)
+{
+	if (!state || action == PeripheralSessionAction::none)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() ||
+		registration->peripheral_session_state.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		!hardware_transaction_active_ || containment_evidence_pending_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	if (state->action != action || state->action_progress_unknown ||
+		!state->action_transaction_closed ||
+		state->action_next_word_index > state->action_word_count)
+		return MISTER_RESULT_INVALID_STATE;
+	state->action_transaction_closed = false;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::RecordPeripheralActionWord(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	PeripheralSessionAction action, uint8_t word_index)
+{
+	if (!state) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() ||
+		registration->peripheral_session_state.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		!hardware_transaction_active_ || containment_evidence_pending_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms) {
+		state->action_progress_unknown = true;
+		return MISTER_RESULT_DEADLINE;
+	}
+	if (state->action != action || state->action_transaction_closed ||
+		state->action_progress_unknown || word_index != state->action_next_word_index ||
+		word_index >= state->action_word_count) {
+		state->action_progress_unknown = true;
+		return MISTER_RESULT_INVALID_STATE;
+	}
+	++state->action_next_word_index;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::ClosePeripheralAction(
+	const std::shared_ptr<PeripheralSessionState> &state,
+	PeripheralSessionAction action)
+{
+	if (!state) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		state->owner_registration.lock();
+	const std::shared_ptr<PeripheralSessionState> current =
+		peripheral_session_state_.lock();
+	if (!registration || !registration->registered || registration->broker != this ||
+		current.get() != state.get() ||
+		registration->peripheral_session_state.get() != state.get() ||
+		!state->view || state->view->registration_.get() != registration.get() ||
+		state->phase.load() != PeripheralSessionPhase::live ||
+		!hardware_transaction_active_ || containment_evidence_pending_)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->absolute_deadline_ms ||
+		state->action != action || state->action_transaction_closed ||
+		state->action_progress_unknown) {
+		state->action_progress_unknown = true;
+		return clock_.NowMs() >= registration->absolute_deadline_ms ?
+			MISTER_RESULT_DEADLINE : MISTER_RESULT_INVALID_STATE;
+	}
+	state->action_transaction_closed = true;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::RecordCoupledRecoveryOperation(
+	const RecoveryEpoch &epoch, const OperationLease &lease,
+	const CoupledRecoveryReceipt &receipt, Result operation_result)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+		MISTER_RESOURCE_NATIVE_VIDEO;
+	if (state_ != State::recovery || !IsCurrentRecovery(epoch) ||
+		recovery_terminal_neutral_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->authority != LeaseAuthority::recovery_epoch ||
+		registration->authority_identity != epoch.identity_ ||
+		registration->operation_kind != OperationKind::audio_video ||
+		(recovery_requested_resource_flags_ & affected) != affected ||
+		receipt.affected_flags != affected ||
+		(receipt.observed_flags & receipt.neutral_flags) != 0 ||
+		((receipt.observed_flags | receipt.neutral_flags) & ~affected) != 0)
+		return MISTER_RESULT_INVALID_STATE;
+	if (operation_result == MISTER_RESULT_OK &&
+		clock_.NowMs() >= registration->absolute_deadline_ms)
+		operation_result = MISTER_RESULT_DEADLINE;
+	const uint32_t classified = receipt.observed_flags |
+		receipt.neutral_flags;
+	recovery_observed_resource_flags_ &= ~classified;
+	recovery_neutral_resource_flags_ &= ~classified;
+	RecordRecoveryPartition(receipt.observed_flags, receipt.neutral_flags);
+	LatchRecoveryResult(operation_result);
+	return operation_result;
+}
+
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 Result HardwareBroker::RecordActiveCoreProtocolMutationForTest(
 	const OperationLease &lease, ActiveCoreProtocolSession &session,
@@ -1474,6 +2451,7 @@ Result HardwareBroker::BeginRecovery(uint32_t requested_resource_flags,
 	recovery_result_ = MISTER_RESULT_OK;
 	recovery_observation_active_ = false;
 	recovery_terminal_neutral_ = false;
+	recovery_audio_shutdown_complete_ = false;
 	ClearContainmentReceipt();
 	recovery_registered_ = true;
 	state_ = State::recovery;
@@ -1561,6 +2539,7 @@ Result HardwareBroker::FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
 		recovery_neutral_resource_flags_ = 0;
 		recovery_result_ = MISTER_RESULT_OK;
 		recovery_terminal_neutral_ = false;
+		recovery_audio_shutdown_complete_ = false;
 		terminal_lease_deadline_ms_ = 0;
 		ClearContainmentReceipt();
 		state_ = State::idle;
@@ -1631,6 +2610,12 @@ void HardwareBroker::ReleaseOperation(OperationRegistration &registration)
 		--terminal_lease_count_;
 		if (terminal_lease_count_ == 0) terminal_lease_deadline_ms_ = 0;
 	}
+	// A broker-atomic active A/V failure latches quiescence before the owning
+	// operation lease is released. Once that final lease drops, cleanup may
+	// begin without reopening the failed registration.
+	if (failure_latched_ && state_ == State::quiescing &&
+		active_lease_count_ == 0)
+		quiesce_complete_ = true;
 	lease_released_.notify_all();
 }
 
@@ -1979,6 +2964,29 @@ Result HardwareBroker::CommitCleanupContainment(const CleanupEpoch &epoch,
 	return MISTER_RESULT_OK;
 }
 
+Result HardwareBroker::PromoteCleanupAudioWithContainment(
+	const CleanupEpoch &epoch, const OperationLease &terminal_lease)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		terminal_lease.registration_;
+	if (state_ != State::terminal_neutral || !IsCurrentCleanup(epoch) ||
+		!cleanup_audio_shutdown_complete_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != epoch.identity_ ||
+		registration->operation_kind != OperationKind::terminal_fpga_cleanup ||
+		active_lease_count_ != 1 || terminal_lease_count_ != 1 ||
+		!ReceiptMatchesCleanup(epoch))
+		return MISTER_RESULT_INVALID_STATE;
+	// Audio local shutdown expires at the non-FPGA deadline even if terminal
+	// containment itself remains admissible until the longer FPGA deadline.
+	if (clock_.NowMs() >= cleanup_non_fpga_deadline_ms_ ||
+		clock_.NowMs() >= registration->absolute_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	return MISTER_RESULT_OK;
+}
+
 Result HardwareBroker::CommitRecoveryContainment(const RecoveryEpoch &epoch,
 	const OperationLease &terminal_lease)
 {
@@ -2005,8 +3013,16 @@ Result HardwareBroker::CommitRecoveryContainment(const RecoveryEpoch &epoch,
 	containment_evidence_pending_ = false;
 	containment_receipt_current_ = true;
 	recovery_terminal_neutral_ = true;
-	RecordRecoveryPartition(0, MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
-		MISTER_RESOURCE_CORE_PROTOCOL);
+	uint32_t neutral = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	// A mute ACK is only local shutdown. Promote AUDIO through this exact
+	// terminal receipt while both immutable recovery deadlines remain live.
+	if ((recovery_requested_resource_flags_ & MISTER_RESOURCE_NATIVE_AUDIO) != 0 &&
+		recovery_audio_shutdown_complete_ &&
+		clock_.NowMs() < recovery_non_fpga_deadline_ms_ &&
+		clock_.NowMs() < registration->absolute_deadline_ms)
+		neutral |= MISTER_RESOURCE_NATIVE_AUDIO;
+	RecordRecoveryPartition(0, neutral);
 	return MISTER_RESULT_OK;
 }
 
@@ -2127,6 +3143,46 @@ Result HardwareBroker::RecordRecoveryFailure(const RecoveryEpoch &epoch,
 	return result;
 }
 
+Result HardwareBroker::SnapshotRecovery(const RecoveryEpoch &epoch,
+	MisterRecoveryObservationV2 *observation) const
+{
+	if (observation == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_ != State::recovery || !IsCurrentRecovery(epoch))
+		return MISTER_RESULT_INVALID_STATE;
+	observation->observed_resource_flags =
+		recovery_observed_resource_flags_ & epoch.requested_resource_flags_;
+	observation->neutral_resource_flags =
+		recovery_neutral_resource_flags_ & epoch.requested_resource_flags_;
+	if (recovery_result_ != MISTER_RESULT_OK) return recovery_result_;
+	return observation->observed_resource_flags == 0 &&
+		observation->neutral_resource_flags == epoch.requested_resource_flags_ ?
+		MISTER_RESULT_OK : MISTER_RESULT_CLEANUP_INCOMPLETE;
+}
+
+Result HardwareBroker::ValidateRecoveryRequestedFlags(
+	const RecoveryEpoch &epoch, uint32_t callback_requested_flags) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_ != State::recovery || !IsCurrentRecovery(epoch))
+		return MISTER_RESULT_INVALID_STATE;
+	const uint32_t still_unproved = recovery_requested_resource_flags_ &
+		~recovery_neutral_resource_flags_;
+	return callback_requested_flags == still_unproved ? MISTER_RESULT_OK :
+		MISTER_RESULT_INVALID_STATE;
+}
+
+bool HardwareBroker::CanFinishRecovery(const RecoveryEpoch &epoch) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return state_ == State::recovery && IsCurrentRecovery(epoch) &&
+		active_lease_count_ == 0 && !recovery_observation_active_ &&
+		recovery_result_ == MISTER_RESULT_OK &&
+		recovery_observed_resource_flags_ == 0 &&
+		recovery_neutral_resource_flags_ ==
+			epoch.requested_resource_flags_;
+}
+
 uint32_t HardwareBroker::RecoveryResourceForOperation(
 	OperationKind operation_kind)
 {
@@ -2135,6 +3191,8 @@ uint32_t HardwareBroker::RecoveryResourceForOperation(
 	case OperationKind::save: return MISTER_RESOURCE_SAVES;
 	case OperationKind::audio: return MISTER_RESOURCE_NATIVE_AUDIO;
 	case OperationKind::video: return MISTER_RESOURCE_NATIVE_VIDEO;
+	case OperationKind::audio_video:
+		return MISTER_RESOURCE_NATIVE_AUDIO | MISTER_RESOURCE_NATIVE_VIDEO;
 	case OperationKind::content: return MISTER_RESOURCE_CONTENT;
 	case OperationKind::core_protocol: return MISTER_RESOURCE_CORE_PROTOCOL;
 	case OperationKind::terminal_fpga_cleanup:
@@ -2248,6 +3306,7 @@ bool HardwareBroker::IsHardwareOperation(OperationKind operation_kind)
 	case OperationKind::input:
 	case OperationKind::audio:
 	case OperationKind::video:
+	case OperationKind::audio_video:
 	case OperationKind::terminal_fpga_cleanup:
 		return true;
 	case OperationKind::scheduler:
@@ -2272,6 +3331,7 @@ bool HardwareBroker::CleanupDeadline(OperationKind operation_kind,
 	case OperationKind::save:
 	case OperationKind::audio:
 	case OperationKind::video:
+	case OperationKind::audio_video:
 	case OperationKind::content:
 		*absolute_deadline_ms = epoch.non_fpga_deadline_ms_;
 		return true;
@@ -2297,6 +3357,10 @@ bool HardwareBroker::IsRecoveryOperation(OperationKind operation_kind,
 		return (requested_resource_flags & MISTER_RESOURCE_NATIVE_AUDIO) != 0;
 	case OperationKind::video:
 		return (requested_resource_flags & MISTER_RESOURCE_NATIVE_VIDEO) != 0;
+	case OperationKind::audio_video:
+		return (requested_resource_flags & (MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO)) ==
+			(MISTER_RESOURCE_NATIVE_AUDIO | MISTER_RESOURCE_NATIVE_VIDEO);
 	case OperationKind::content:
 		return (requested_resource_flags & MISTER_RESOURCE_CONTENT) != 0;
 	case OperationKind::core_protocol:
@@ -2330,6 +3394,7 @@ bool HardwareBroker::RecoveryDeadline(OperationKind operation_kind,
 	case OperationKind::save:
 	case OperationKind::audio:
 	case OperationKind::video:
+	case OperationKind::audio_video:
 	case OperationKind::content:
 		*absolute_deadline_ms = epoch.non_fpga_deadline_ms_;
 		return true;

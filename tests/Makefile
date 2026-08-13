@@ -50,6 +50,7 @@ RUNTIME_OFFLOAD_LIFECYCLE_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_offload_
 OFFLOAD_TEST_OBJECT = $(HOST_TEST_DIR)/offload_test.o
 NATIVE_HARDWARE_BROKER_TEST_OBJECT = $(HOST_TEST_DIR)/native_hardware_broker_test.o
 NATIVE_HARDWARE_BROKER_OBJECT = $(HOST_TEST_DIR)/hardware_broker.o
+NATIVE_PERIPHERAL_SESSION_OBJECT = $(HOST_TEST_DIR)/native_peripheral_session.o
 NATIVE_SPI_BUS_TEST_OBJECT = $(HOST_TEST_DIR)/native_spi_bus_test.o
 NATIVE_SPI_BUS_OBJECT = $(HOST_TEST_DIR)/native_spi_bus.o
 NATIVE_SPI_BUS_TEST_IMPLEMENTATION_OBJECT = \
@@ -70,6 +71,13 @@ NATIVE_CONTAINMENT_TEST_OBJECT = $(HOST_TEST_DIR)/native_containment_test.o
 NATIVE_CONTAINMENT_OBJECT = $(HOST_TEST_DIR)/native_containment.o
 NATIVE_RECOVERY_TEST_OBJECT = $(HOST_TEST_DIR)/native_recovery_test.o
 NATIVE_RECOVERY_OBJECT = $(HOST_TEST_DIR)/native_recovery.o
+NATIVE_AUDIO_VIDEO_ADAPTER_TEST_OBJECT = \
+	$(HOST_TEST_DIR)/native_audio_video_adapter_test.o
+NATIVE_AUDIO_VIDEO_ADAPTER_OBJECTS = \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(HOST_TEST_DIR)/native_av_io_adapter.o \
+	$(HOST_TEST_DIR)/native_audio_adapter.o \
+	$(HOST_TEST_DIR)/native_video_adapter.o
 NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT = \
 	$(HOST_TEST_DIR)/native_linux_artifact_programmer_test.o
 NATIVE_LINUX_ARTIFACT_PROGRAMMER_OBJECTS = \
@@ -120,7 +128,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 test-native-linux-core-protocol-io: \
 	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test \
@@ -133,6 +141,19 @@ test-native-linux-core-protocol-io-sanitize:
 
 test-native-linux-core-protocol-io-tsan:
 	TSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-core-protocol-io-tsan-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' test-native-linux-core-protocol-io
+
+test-native-audio-video-adapter: $(HOST_TEST_DIR)/native_audio_video_adapter_test
+	$(HOST_TEST_DIR)/native_audio_video_adapter_test
+
+test-native-audio-video-adapter-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-audio-video-sanitize-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-audio-video-adapter
+
+test-native-audio-video-adapter-tsan:
+	TSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-audio-video-tsan-inner HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' test-native-audio-video-adapter
+
+test-native-audio-video-adapter-production:
+	mkdir -p $(HOST_TEST_DIR)/native-audio-video-production
+	for f in runtime/native/hardware_broker.cpp runtime/native/native_peripheral_session.cpp runtime/native/native_core_profile.cpp runtime/native/native_lifecycle.cpp runtime/native/native_recovery.cpp runtime/native/linux/native_av_io_adapter.cpp runtime/native/linux/native_audio_adapter.cpp runtime/native/linux/native_video_adapter.cpp; do $(HOST_CXX) -std=c++14 $(HOST_FLAGS) -fno-exceptions -fno-rtti -I. -pthread -c $$f -o $(HOST_TEST_DIR)/native-audio-video-production/$$(basename $$f).o || exit 1; done
 
 test-native-core-protocol-capability-reachability: \
 	$(HOST_TEST_DIR)/native_core_protocol_capability_reachability_test
@@ -519,6 +540,7 @@ $(NATIVE_HARDWARE_BROKER_TEST_OBJECT): tests/native_hardware_broker_test.cpp \
 
 $(NATIVE_HARDWARE_BROKER_OBJECT): runtime/native/hardware_broker.cpp \
 	runtime/native/hardware_broker.hpp runtime/native/native_clock.hpp \
+	runtime/native/native_peripheral_session.hpp \
 	runtime/native/native_core_profile.hpp runtime/native/native_recovery.hpp \
 	runtime/native/native_core_protocol.hpp \
 	runtime/native/native_core_protocol_session_state.hpp \
@@ -547,6 +569,7 @@ $(NATIVE_SPI_BUS_TEST_IMPLEMENTATION_OBJECT): runtime/native/native_spi_bus.cpp 
 
 $(HOST_TEST_DIR)/native_spi_bus_test: $(NATIVE_SPI_BUS_TEST_OBJECT) \
 	$(NATIVE_SPI_BUS_TEST_IMPLEMENTATION_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
@@ -595,6 +618,7 @@ $(NATIVE_CORE_PROTOCOL_OBJECT): runtime/native/native_core_protocol.cpp \
 $(HOST_TEST_DIR)/native_core_protocol_test: \
 	$(NATIVE_CORE_PROTOCOL_TEST_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -625,7 +649,9 @@ $(NATIVE_LINUX_CORE_PROTOCOL_IO_PRODUCTION_OBJECT): \
 $(HOST_TEST_DIR)/native_linux_core_protocol_io_test: \
 	$(NATIVE_LINUX_CORE_PROTOCOL_IO_TEST_OBJECT) \
 	$(NATIVE_LINUX_CORE_PROTOCOL_IO_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
-	$(NATIVE_RECOVERY_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_RECOVERY_OBJECT) $(NATIVE_CONTAINMENT_OBJECT) \
+	$(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -704,26 +730,80 @@ $(NATIVE_RECOVERY_OBJECT): runtime/native/native_recovery.cpp \
 $(HOST_TEST_DIR)/native_input_test: $(NATIVE_INPUT_TEST_OBJECT) \
 	$(NATIVE_INPUT_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_SPI_BUS_OBJECT) \
-	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(HOST_TEST_DIR)/native_lifecycle_test: $(NATIVE_LIFECYCLE_TEST_OBJECT) \
 	$(NATIVE_LIFECYCLE_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(HOST_TEST_DIR)/native_containment_test: $(NATIVE_CONTAINMENT_TEST_OBJECT) \
 	$(NATIVE_CONTAINMENT_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(HOST_TEST_DIR)/native_recovery_test: $(NATIVE_RECOVERY_TEST_OBJECT) \
 	$(NATIVE_RECOVERY_OBJECT) $(NATIVE_CONTAINMENT_OBJECT) \
-	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) \
+	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
+
+$(NATIVE_AUDIO_VIDEO_ADAPTER_TEST_OBJECT): \
+	tests/native_audio_video_adapter_test.cpp \
+	runtime/native/native_peripheral_session.hpp \
+	runtime/native/linux/native_av_io_adapter.hpp \
+	runtime/native/linux/native_audio_adapter.hpp \
+	runtime/native/linux/native_video_adapter.hpp \
+	runtime/native/native_core_profile.hpp runtime/native/hardware_broker.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_AUDIO_VIDEO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_peripheral_session.o: \
+	runtime/native/native_peripheral_session.cpp \
+	runtime/native/native_peripheral_session.hpp \
+	runtime/native/hardware_broker.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_AUDIO_VIDEO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_av_io_adapter.o: \
+	runtime/native/linux/native_av_io_adapter.cpp \
+	runtime/native/linux/native_av_io_adapter.hpp \
+	runtime/native/native_peripheral_session.hpp \
+	runtime/native/native_core_profile.hpp runtime/native/native_clock.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_AUDIO_VIDEO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_audio_adapter.o: \
+	runtime/native/linux/native_audio_adapter.cpp \
+	runtime/native/linux/native_audio_adapter.hpp \
+	runtime/native/linux/native_av_io_adapter.hpp \
+	runtime/native/native_peripheral_session.hpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_resources.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_AUDIO_VIDEO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_video_adapter.o: \
+	runtime/native/linux/native_video_adapter.cpp \
+	runtime/native/linux/native_video_adapter.hpp \
+	runtime/native/linux/native_av_io_adapter.hpp \
+	runtime/native/native_peripheral_session.hpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_resources.hpp | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_AUDIO_VIDEO_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(HOST_TEST_DIR)/native_audio_video_adapter_test: \
+	$(NATIVE_AUDIO_VIDEO_ADAPTER_TEST_OBJECT) \
+	$(NATIVE_AUDIO_VIDEO_ADAPTER_OBJECTS) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT): \
@@ -739,7 +819,8 @@ $(NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT): \
 $(HOST_TEST_DIR)/native_linux_artifact_programmer_test: \
 	$(NATIVE_LINUX_ARTIFACT_PROGRAMMER_TEST_OBJECT) \
 	$(NATIVE_LINUX_ARTIFACT_PROGRAMMER_OBJECTS) \
-	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) \
+	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -830,6 +911,7 @@ $(HOST_TEST_DIR)/native_linux_input_execution_test: \
 	$(NATIVE_LINUX_INPUT_EXECUTION_TEST_OBJECT) \
 	$(NATIVE_LINUX_INPUT_EXECUTION_OBJECTS) $(NATIVE_INPUT_OBJECT) \
 	$(NATIVE_SPI_BUS_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) \
+	$(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
 	$(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
@@ -837,7 +919,8 @@ $(HOST_TEST_DIR)/native_linux_input_execution_test: \
 $(HOST_TEST_DIR)/native_linux_mmio_containment_test: \
 	$(NATIVE_LINUX_MMIO_CONTAINMENT_TEST_OBJECT) \
 	$(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT) $(NATIVE_CONTAINMENT_OBJECT) \
-	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) \
+	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
@@ -999,7 +1082,7 @@ $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test: $(RUNTIME_RESOURCE_TEARD
 $(HOST_TEST_DIR)/mister_runtime_offload_lifecycle_test: $(RUNTIME_OFFLOAD_LIFECYCLE_TEST_OBJECT) $(OFFLOAD_TEST_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
-$(HOST_TEST_DIR)/native_hardware_broker_test: $(NATIVE_HARDWARE_BROKER_TEST_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
+$(HOST_TEST_DIR)/native_hardware_broker_test: $(NATIVE_HARDWARE_BROKER_TEST_OBJECT) $(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) $(NATIVE_CORE_PROFILE_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(HOST_TEST_DIR)/fogcast-runtime-storage-probe: $(FOGCAST_STORAGE_PROBE_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)

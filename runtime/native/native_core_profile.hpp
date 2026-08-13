@@ -25,6 +25,7 @@ static const uint8_t kNativeDigitalWordCount = 2;
 static const uint8_t kNativeExtensionCount = 3;
 static const size_t kNativeInitialStatusBytes = 16;
 static const size_t kNativeMaximumCoreNameBytes = 255;
+static const size_t kNativeVideoWireWordCount = 2;
 
 struct NativeArtifactRecord {
 	const char *sha256;
@@ -50,6 +51,78 @@ enum class NativeContentTransform : uint8_t {
 	megadrive_raw = 1
 };
 
+// Audio/video values are private, immutable fixture authority. Production
+// records deliberately remain unavailable until Task 10 supplies image-bound
+// provenance and recovery records.
+enum class NativeAudioRecipeId : uint8_t {
+	fixture_synthetic_v1,
+	production_unavailable
+};
+
+enum class NativeAudioNeutralProof : uint8_t {
+	terminal_containment,
+	stable_state_readback
+};
+
+struct NativeAudioProfile {
+	NativeAudioRecipeId recipe;
+	uint8_t active_attenuation;
+	uint8_t mute_attenuation;
+	NativeAudioNeutralProof neutral_proof;
+	uint8_t stable_readback_recipe_sha256[32];
+};
+
+enum class NativeVideoRecipeId : uint8_t {
+	fixture_synthetic_v1,
+	production_unavailable
+};
+
+struct NativeVideoProfile {
+	NativeVideoRecipeId recipe;
+	uint8_t recipe_sha256[32];
+	uint8_t effect_manifest_sha256[32];
+	uint32_t affected_resource_flags;
+	uint16_t set_video_words[kNativeVideoWireWordCount];
+	uint16_t framebuffer_disable_word;
+	uint32_t i2c_device_major;
+	uint32_t i2c_device_minor;
+	uint16_t i2c_bus_number;
+	uint8_t adv7513_main_address;
+	uint8_t power_on_value;
+	uint8_t power_down_value;
+	uint8_t power_read_mask;
+	uint8_t power_on_expected;
+	uint8_t power_down_expected;
+	bool edid_disabled;
+	bool hotplug_disabled;
+	bool cec_disabled;
+	bool spd_disabled;
+	bool hps_framebuffer_disabled;
+	// The sole currently classified transmitter operation is ADV7513 0x41.
+	// It is always owned by the separate coupled A/V registration.
+	bool coupled_transmitter;
+};
+
+struct SafePeripheralRecoveryRecord {
+	NativeProfileAuthority authority;
+	NativeSystem system_id;
+};
+
+struct SafeAudioRecoveryRecord {
+	SafePeripheralRecoveryRecord base;
+	NativeAudioProfile audio;
+};
+
+struct SafeVideoRecoveryRecord {
+	SafePeripheralRecoveryRecord base;
+	NativeVideoProfile video;
+};
+
+struct SafeAudioVideoRecoveryRecord {
+	SafePeripheralRecoveryRecord base;
+	NativeVideoProfile video;
+};
+
 // This is private fixture/profile authority. Production records remain
 // unavailable until the image-locked Task 10 inputs exist.
 struct NativeCoreProtocolProfile {
@@ -73,6 +146,8 @@ struct NativeCoreProfile {
 	NativeArtifactRecord artifact;
 	NativeInputProfile input;
 	NativeCoreProtocolProfile protocol;
+	NativeAudioProfile audio;
+	NativeVideoProfile video;
 	NativeProfileAuthority authority;
 };
 
@@ -86,6 +161,17 @@ bool IsExactFixtureNativeCoreProfile(const NativeCoreProfile &profile);
 bool ValidateNativeCoreProfileRecord(const NativeCoreProfile &profile);
 bool NativeCoreProfileAcceptsExtension(const NativeCoreProfile &profile,
 	const char *extension);
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+const SafeAudioRecoveryRecord *FixtureSafeAudioRecoveryRecordForTest(
+	NativeSystem system_id);
+const SafeVideoRecoveryRecord *FixtureSafeVideoRecoveryRecordForTest(
+	NativeSystem system_id);
+const SafeAudioVideoRecoveryRecord *FixtureSafeAudioVideoRecoveryRecordForTest(
+	NativeSystem system_id);
+bool IsExactFixtureSafePeripheralRecoveryRecordForTest(
+	const SafePeripheralRecoveryRecord *record);
+#endif
 
 } // namespace native
 } // namespace mister

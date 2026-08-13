@@ -14,7 +14,7 @@ NativeResourceLedger EmptyLedger()
 {
 	const NativeDigitalNeutral empty = {0, {0, 0}};
 	const NativeResourceLedger ledger = {
-		0, false, false, false, false, false, false,
+		0, false, false, false, false, false, false, false, false,
 		{false, false}, {empty, empty}
 	};
 	return ledger;
@@ -53,6 +53,9 @@ NativeLifecycle::~NativeLifecycle()
 	// This only releases the registration. The protocol resource owns the
 	// process-exit close path and session-handle destruction performs no I/O.
 	core_protocol_cleanup_lease_.reset();
+	audio_cleanup_lease_.reset();
+	video_cleanup_lease_.reset();
+	coupled_audio_video_cleanup_lease_.reset();
 	cleanup_epoch_.reset();
 	if (ledger_.scheduler)
 		resources_.scheduler.CloseSchedulerForProcessExit();
@@ -65,9 +68,9 @@ NativeLifecycle::~NativeLifecycle()
 	if ((ledger_.resource_flags & MISTER_RESOURCE_CONTENT) != 0)
 		resources_.content.CloseContentForProcessExit();
 	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_VIDEO) != 0)
-		resources_.hardware.CloseVideoForProcessExit();
+		resources_.video.CloseVideoForProcessExit();
 	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_AUDIO) != 0)
-		resources_.hardware.CloseAudioForProcessExit();
+		resources_.audio.CloseAudioForProcessExit();
 	if ((ledger_.resource_flags & MISTER_RESOURCE_CORE_PROTOCOL) != 0)
 		resources_.hardware.CloseCoreProtocolForProcessExit();
 	if ((ledger_.resource_flags & (MISTER_RESOURCE_FPGA |
@@ -190,21 +193,73 @@ Result NativeLifecycle::ActivateLocked(const NativeCoreProfile &profile,
 
 	result = broker_.Begin(generation_, OperationKind::video,
 		activation_deadline_ms, &lease);
-	outcome = {result, false};
-	if (result == MISTER_RESULT_OK) outcome = resources_.hardware.StartVideo(*lease);
+	NativePeripheralAcquisitionOutcome peripheral_outcome = {result, false};
+	PeripheralBrokerDisposition peripheral_disposition =
+		PeripheralBrokerDisposition::no_session;
+	if (result == MISTER_RESULT_OK) {
+		std::unique_ptr<ActiveVideoSessionBundle> bundle;
+		result = lease->AcquireActiveVideoSession(broker_, profile,
+			resources_.video.BackendIdentity(), &bundle);
+		if (result == MISTER_RESULT_OK)
+			peripheral_outcome = resources_.video.StartVideo(std::move(bundle));
+		else
+			peripheral_outcome = {result, false};
+		if (lease->GetVideoSessionDisposition(broker_,
+			&peripheral_disposition) != MISTER_RESULT_OK)
+			peripheral_outcome = {MISTER_RESULT_PLATFORM, false};
+	}
 	lease.reset();
-	result = FinishAcquisitionLocked(outcome, MISTER_RESOURCE_NATIVE_VIDEO,
-		nullptr, activation_deadline_ms);
+	result = FinishPeripheralAcquisitionLocked(peripheral_outcome,
+		peripheral_disposition, MISTER_RESOURCE_NATIVE_VIDEO,
+		activation_deadline_ms);
 	if (result != MISTER_RESULT_OK) return result;
 
 	result = broker_.Begin(generation_, OperationKind::audio,
 		activation_deadline_ms, &lease);
-	outcome = {result, false};
-	if (result == MISTER_RESULT_OK) outcome = resources_.hardware.StartAudio(*lease);
+	peripheral_outcome = {result, false};
+	peripheral_disposition = PeripheralBrokerDisposition::no_session;
+	if (result == MISTER_RESULT_OK) {
+		std::unique_ptr<ActiveAudioSessionBundle> bundle;
+		result = lease->AcquireActiveAudioSession(broker_, profile,
+			resources_.audio.BackendIdentity(), &bundle);
+		if (result == MISTER_RESULT_OK)
+			peripheral_outcome = resources_.audio.StartAudio(std::move(bundle));
+		else
+			peripheral_outcome = {result, false};
+		if (lease->GetAudioSessionDisposition(broker_,
+			&peripheral_disposition) != MISTER_RESULT_OK)
+			peripheral_outcome = {MISTER_RESULT_PLATFORM, false};
+	}
 	lease.reset();
-	result = FinishAcquisitionLocked(outcome, MISTER_RESOURCE_NATIVE_AUDIO,
-		nullptr, activation_deadline_ms);
+	result = FinishPeripheralAcquisitionLocked(peripheral_outcome,
+		peripheral_disposition, MISTER_RESOURCE_NATIVE_AUDIO,
+		activation_deadline_ms);
 	if (result != MISTER_RESULT_OK) return result;
+
+	if (profile.video.coupled_transmitter) {
+		result = broker_.Begin(generation_, OperationKind::audio_video,
+			activation_deadline_ms, &lease);
+		NativeCoupledAcquisitionOutcome coupled_outcome = {result, 0, false};
+		PeripheralBrokerDisposition coupled_disposition =
+			PeripheralBrokerDisposition::no_session;
+		if (result == MISTER_RESULT_OK) {
+			std::unique_ptr<ActiveAudioVideoSessionBundle> bundle;
+			result = lease->AcquireActiveAudioVideoSession(broker_, profile,
+				resources_.audio_video.BackendIdentity(), &bundle);
+			if (result == MISTER_RESULT_OK)
+				coupled_outcome = resources_.audio_video.StartAudioVideo(
+					std::move(bundle));
+			else
+				coupled_outcome = {result, 0, false};
+			if (lease->GetAudioVideoSessionDisposition(broker_,
+				&coupled_disposition) != MISTER_RESULT_OK)
+				coupled_outcome = {MISTER_RESULT_PLATFORM, 0, false};
+		}
+		lease.reset();
+		result = FinishCoupledAcquisitionLocked(coupled_outcome,
+			coupled_disposition, activation_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+	}
 
 	result = broker_.Begin(generation_, OperationKind::input_descriptors,
 		activation_deadline_ms, &lease);
@@ -262,6 +317,83 @@ Result NativeLifecycle::FinishAcquisitionLocked(NativeAcquisitionOutcome outcome
 	if (!outcome.acquired) return FailActivationLocked(MISTER_RESULT_PLATFORM);
 	if (clock_.NowMs() >= activation_deadline_ms)
 		return FailActivationLocked(MISTER_RESULT_DEADLINE);
+	return MISTER_RESULT_OK;
+}
+
+Result NativeLifecycle::FinishPeripheralAcquisitionLocked(
+	NativePeripheralAcquisitionOutcome outcome,
+	PeripheralBrokerDisposition disposition, uint64_t resource_flags,
+	uint64_t activation_deadline_ms)
+{
+	const bool valid_success = outcome.result == MISTER_RESULT_OK &&
+		outcome.acquired &&
+		disposition == PeripheralBrokerDisposition::success_completed;
+	const bool valid_failure = outcome.result != MISTER_RESULT_OK &&
+		(disposition == PeripheralBrokerDisposition::failure_completed ||
+		 (!outcome.acquired &&
+		  disposition == PeripheralBrokerDisposition::no_session));
+	if (!valid_success && !valid_failure)
+		return FailActivationLocked(MISTER_RESULT_PLATFORM);
+	const NativeAcquisitionOutcome normalized = {outcome.result,
+		outcome.acquired};
+	return FinishAcquisitionLocked(normalized, resource_flags, nullptr,
+		activation_deadline_ms);
+}
+
+Result NativeLifecycle::FinishPeripheralCleanupLocked(
+	const NativePeripheralReleaseOutcome &outcome,
+	PeripheralBrokerDisposition disposition) const
+{
+	if (outcome.result != MISTER_RESULT_OK ||
+		disposition != PeripheralBrokerDisposition::success_completed ||
+		!outcome.local_shutdown_complete || outcome.closure_unknown)
+		return CleanupFailure(outcome.result == MISTER_RESULT_OK ?
+			MISTER_RESULT_CLEANUP_INCOMPLETE : outcome.result);
+	return MISTER_RESULT_OK;
+}
+
+Result NativeLifecycle::FinishCoupledAcquisitionLocked(
+	NativeCoupledAcquisitionOutcome outcome,
+	PeripheralBrokerDisposition disposition, uint64_t activation_deadline_ms)
+{
+	const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+		MISTER_RESOURCE_NATIVE_VIDEO;
+	const bool valid_success = outcome.result == MISTER_RESULT_OK &&
+		outcome.acquired && outcome.affected_flags == affected &&
+		disposition == PeripheralBrokerDisposition::success_completed;
+	const bool valid_failure = outcome.result != MISTER_RESULT_OK &&
+		(disposition == PeripheralBrokerDisposition::failure_completed ||
+		 (!outcome.acquired &&
+		  disposition == PeripheralBrokerDisposition::no_session));
+	if (!valid_success && !valid_failure)
+		return FailActivationLocked(MISTER_RESULT_PLATFORM);
+	if (outcome.acquired) {
+		ledger_.resource_flags |= affected;
+		// A partial coupled acquisition affects both bits. Its cleanup still
+		// requires the typed coupled path even though the active registration
+		// has already been atomically failed and consumed.
+		ledger_.coupled_audio_video_active = true;
+	}
+	if (outcome.result != MISTER_RESULT_OK)
+		return FailActivationLocked(outcome.result);
+	if (clock_.NowMs() >= activation_deadline_ms)
+		return FailActivationLocked(MISTER_RESULT_DEADLINE);
+	return MISTER_RESULT_OK;
+}
+
+Result NativeLifecycle::FinishCoupledCleanupLocked(
+	const NativeCoupledReleaseOutcome &outcome,
+	PeripheralBrokerDisposition disposition) const
+{
+	const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+		MISTER_RESOURCE_NATIVE_VIDEO;
+	if (outcome.result != MISTER_RESULT_OK || outcome.affected_flags != affected ||
+		disposition != PeripheralBrokerDisposition::success_completed ||
+		(outcome.observed_flags & outcome.neutral_flags) != 0 ||
+		((outcome.observed_flags | outcome.neutral_flags) & ~affected) != 0 ||
+		!outcome.local_resources_absent || outcome.closure_unknown)
+		return CleanupFailure(outcome.result == MISTER_RESULT_OK ?
+			MISTER_RESULT_CLEANUP_INCOMPLETE : outcome.result);
 	return MISTER_RESULT_OK;
 }
 
@@ -537,22 +669,82 @@ Result NativeLifecycle::RunCleanupLocked()
 		ledger_.input_descriptors = false;
 	}
 	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_VIDEO) != 0) {
-		result = BeginCleanupOperationLocked(OperationKind::video, &lease);
+		if (!video_cleanup_lease_) {
+			result = BeginCleanupOperationLocked(OperationKind::video,
+				&video_cleanup_lease_);
+			if (result != MISTER_RESULT_OK) return result;
+		}
+		std::unique_ptr<CleanupVideoSessionBundle> bundle;
+		result = video_cleanup_lease_->AcquireCleanupVideoSession(broker_,
+			resources_.video.BackendIdentity(), &bundle);
+		NativePeripheralReleaseOutcome peripheral_outcome = {result, false,
+			false, false, false};
+		if (result == MISTER_RESULT_OK)
+			peripheral_outcome = resources_.video.StopVideo(std::move(bundle));
+		PeripheralBrokerDisposition peripheral_disposition =
+			PeripheralBrokerDisposition::no_session;
+		if (video_cleanup_lease_->GetVideoSessionDisposition(broker_,
+			&peripheral_disposition) != MISTER_RESULT_OK)
+			peripheral_outcome.result = MISTER_RESULT_PLATFORM;
+		result = FinishPeripheralCleanupLocked(peripheral_outcome,
+			peripheral_disposition);
 		if (result != MISTER_RESULT_OK) return result;
-		result = resources_.hardware.StopVideo(*lease);
-		result = FinishCleanupOperationLocked(result, *lease);
-		lease.reset();
-		if (result != MISTER_RESULT_OK) return result;
-		ledger_.resource_flags &= ~MISTER_RESOURCE_NATIVE_VIDEO;
+		video_cleanup_lease_.reset();
+		if (!ledger_.coupled_audio_video_active)
+			ledger_.resource_flags &= ~MISTER_RESOURCE_NATIVE_VIDEO;
 	}
-	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_AUDIO) != 0) {
-		result = BeginCleanupOperationLocked(OperationKind::audio, &lease);
+	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_AUDIO) != 0 &&
+		!ledger_.audio_shutdown_complete) {
+		if (!audio_cleanup_lease_) {
+			result = BeginCleanupOperationLocked(OperationKind::audio,
+				&audio_cleanup_lease_);
+			if (result != MISTER_RESULT_OK) return result;
+		}
+		std::unique_ptr<CleanupAudioSessionBundle> bundle;
+		result = audio_cleanup_lease_->AcquireCleanupAudioSession(broker_,
+			resources_.audio.BackendIdentity(), &bundle);
+		NativePeripheralReleaseOutcome peripheral_outcome = {result, false,
+			false, false, false};
+		if (result == MISTER_RESULT_OK)
+			peripheral_outcome = resources_.audio.StopAudio(std::move(bundle));
+		PeripheralBrokerDisposition peripheral_disposition =
+			PeripheralBrokerDisposition::no_session;
+		if (audio_cleanup_lease_->GetAudioSessionDisposition(broker_,
+			&peripheral_disposition) != MISTER_RESULT_OK)
+			peripheral_outcome.result = MISTER_RESULT_PLATFORM;
+		result = FinishPeripheralCleanupLocked(peripheral_outcome,
+			peripheral_disposition);
 		if (result != MISTER_RESULT_OK) return result;
-		result = resources_.hardware.StopAudio(*lease);
-		result = FinishCleanupOperationLocked(result, *lease);
-		lease.reset();
+		audio_cleanup_lease_.reset();
+		ledger_.audio_shutdown_complete = true;
+		// A mute/ACK is only a local shutdown fact. AUDIO remains in the
+		// ledger until this exact cleanup epoch has terminal containment.
+	}
+	if (ledger_.coupled_audio_video_active) {
+		if (!coupled_audio_video_cleanup_lease_) {
+			result = BeginCleanupOperationLocked(OperationKind::audio_video,
+				&coupled_audio_video_cleanup_lease_);
+			if (result != MISTER_RESULT_OK) return result;
+		}
+		std::unique_ptr<CleanupAudioVideoSessionBundle> bundle;
+		result = coupled_audio_video_cleanup_lease_->AcquireCleanupAudioVideoSession(broker_,
+			resources_.audio_video.BackendIdentity(), &bundle);
+		NativeCoupledReleaseOutcome coupled_outcome = {result, 0, 0, 0, false,
+			false, 0};
+		if (result == MISTER_RESULT_OK)
+			coupled_outcome = resources_.audio_video.StopAudioVideo(
+				std::move(bundle));
+		PeripheralBrokerDisposition coupled_disposition =
+			PeripheralBrokerDisposition::no_session;
+		if (coupled_audio_video_cleanup_lease_->GetAudioVideoSessionDisposition(broker_,
+			&coupled_disposition) != MISTER_RESULT_OK)
+			coupled_outcome.result = MISTER_RESULT_PLATFORM;
+		result = FinishCoupledCleanupLocked(coupled_outcome, coupled_disposition);
 		if (result != MISTER_RESULT_OK) return result;
-		ledger_.resource_flags &= ~MISTER_RESOURCE_NATIVE_AUDIO;
+		coupled_audio_video_cleanup_lease_.reset();
+		ledger_.coupled_audio_video_active = false;
+		if ((coupled_outcome.neutral_flags & MISTER_RESOURCE_NATIVE_VIDEO) != 0)
+			ledger_.resource_flags &= ~MISTER_RESOURCE_NATIVE_VIDEO;
 	}
 	if ((ledger_.resource_flags & MISTER_RESOURCE_CONTENT) != 0) {
 		result = BeginCleanupOperationLocked(OperationKind::content, &lease);
@@ -589,8 +781,18 @@ Result NativeLifecycle::RunCleanupLocked()
 		return result;
 	}
 	result = broker_.ObserveContainment(*cleanup_epoch_, *lease);
-	lease.reset();
 	if (result != MISTER_RESULT_OK) return CleanupFailure(result);
+	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_AUDIO) != 0) {
+		result = broker_.PromoteCleanupAudioWithContainment(*cleanup_epoch_,
+			*lease);
+		if (result != MISTER_RESULT_OK) {
+			lease.reset();
+			return CleanupFailure(result);
+		}
+		ledger_.resource_flags &= ~MISTER_RESOURCE_NATIVE_AUDIO;
+		ledger_.audio_shutdown_complete = false;
+	}
+	lease.reset();
 
 	ledger_.resource_flags &= ~(MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
 		MISTER_RESOURCE_CORE_PROTOCOL | MISTER_RESOURCE_CORE_INPUT);
@@ -617,6 +819,9 @@ void NativeLifecycle::ClearGenerationLocked()
 	latched_activation_result_ = MISTER_RESULT_OK;
 	profile_ = nullptr;
 	core_protocol_cleanup_lease_.reset();
+	audio_cleanup_lease_.reset();
+	video_cleanup_lease_.reset();
+	coupled_audio_video_cleanup_lease_.reset();
 }
 
 NativeLifecycleState NativeLifecycle::state() const

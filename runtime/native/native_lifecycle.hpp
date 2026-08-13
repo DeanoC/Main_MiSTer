@@ -31,6 +31,10 @@ struct NativeResourceLedger {
 	bool offload;
 	bool input_descriptors;
 	bool core_protocol_shutdown_complete;
+	// Mute/close completed locally. This is deliberately distinct from
+	// neutral: AUDIO remains represented by resource_flags until containment.
+	bool audio_shutdown_complete;
+	bool coupled_audio_video_active;
 	bool digital_neutral_captured;
 	bool digital_neutral_valid[kNativePlayerCount];
 	NativeDigitalNeutral digital_neutral[kNativePlayerCount];
@@ -79,6 +83,20 @@ private:
 	Result FinishAcquisitionLocked(NativeAcquisitionOutcome outcome,
 		uint64_t resource_flags,
 		bool *supporting_ledger, uint64_t activation_deadline_ms);
+	Result FinishPeripheralAcquisitionLocked(
+		NativePeripheralAcquisitionOutcome outcome,
+		PeripheralBrokerDisposition disposition, uint64_t resource_flags,
+		uint64_t activation_deadline_ms);
+	Result FinishPeripheralCleanupLocked(
+		const NativePeripheralReleaseOutcome &outcome,
+		PeripheralBrokerDisposition disposition) const;
+	Result FinishCoupledAcquisitionLocked(
+		NativeCoupledAcquisitionOutcome outcome,
+		PeripheralBrokerDisposition disposition,
+		uint64_t activation_deadline_ms);
+	Result FinishCoupledCleanupLocked(
+		const NativeCoupledReleaseOutcome &outcome,
+		PeripheralBrokerDisposition disposition) const;
 	Result FinishCoreProtocolAcquisitionLocked(
 		NativeCoreProtocolOutcome outcome,
 		std::unique_ptr<OperationLease> *lease,
@@ -111,6 +129,9 @@ private:
 	const NativeCoreProfile *profile_;
 	std::unique_ptr<CleanupEpoch> cleanup_epoch_;
 	std::unique_ptr<OperationLease> core_protocol_cleanup_lease_;
+	std::unique_ptr<OperationLease> audio_cleanup_lease_;
+	std::unique_ptr<OperationLease> video_cleanup_lease_;
+	std::unique_ptr<OperationLease> coupled_audio_video_cleanup_lease_;
 };
 
 } // namespace native

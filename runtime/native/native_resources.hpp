@@ -8,6 +8,8 @@
 
 #include <stdint.h>
 
+#include <memory>
+
 namespace mister {
 namespace native {
 
@@ -29,6 +31,36 @@ struct NativeCoreProtocolOutcome {
 	// A future broker-atomic failure path consumes the active protocol session
 	// before this outcome is returned. The ordinary fixture path remains false.
 	bool broker_failure_completed;
+};
+
+struct NativePeripheralAcquisitionOutcome {
+	Result result;
+	// True means a descriptor or accepted mutation exists, even on failure.
+	bool acquired;
+};
+
+struct NativePeripheralReleaseOutcome {
+	Result result;
+	bool local_shutdown_complete;
+	bool stable_neutral_observed;
+	bool local_resources_absent;
+	bool closure_unknown;
+};
+
+struct NativeCoupledAcquisitionOutcome {
+	Result result;
+	uint32_t affected_flags;
+	bool acquired;
+};
+
+struct NativeCoupledReleaseOutcome {
+	Result result;
+	uint32_t affected_flags;
+	uint32_t observed_flags;
+	uint32_t neutral_flags;
+	bool local_resources_absent;
+	bool closure_unknown;
+	uint64_t mutation_sequence;
 };
 
 struct NativeRetainedContentDescription {
@@ -56,20 +88,51 @@ public:
 	virtual NativeCoreProtocolOutcome StartCoreProtocol(
 		const OperationLease &lease, const NativeCoreProfile &profile,
 		NativeContentResource &content) = 0;
-	virtual NativeAcquisitionOutcome StartVideo(
-		const OperationLease &lease) = 0;
-	virtual NativeAcquisitionOutcome StartAudio(
-		const OperationLease &lease) = 0;
 	virtual Result ReplayDigitalNeutral(const OperationLease &lease,
 		const NativeDigitalNeutral &neutral) = 0;
-	virtual Result StopVideo(const OperationLease &lease) = 0;
-	virtual Result StopAudio(const OperationLease &lease) = 0;
 	virtual Result ShutdownCoreProtocol(const OperationLease &lease) = 0;
 	virtual Result TerminalFpgaCleanup(const OperationLease &lease) = 0;
-	virtual void CloseVideoForProcessExit() = 0;
-	virtual void CloseAudioForProcessExit() = 0;
 	virtual void CloseCoreProtocolForProcessExit() = 0;
 	virtual void CloseFpgaMappingsForProcessExit() = 0;
+};
+
+class NativeAudioResource {
+public:
+	virtual ~NativeAudioResource() {}
+	virtual PeripheralBackendIdentity BackendIdentity() const = 0;
+	virtual NativePeripheralAcquisitionOutcome StartAudio(
+		std::unique_ptr<ActiveAudioSessionBundle> &&bundle) = 0;
+	virtual NativePeripheralReleaseOutcome StopAudio(
+		std::unique_ptr<CleanupAudioSessionBundle> &&bundle) = 0;
+	virtual NativePeripheralReleaseOutcome RecoverAudio(
+		std::unique_ptr<RecoveryAudioSessionBundle> &&bundle) = 0;
+	virtual void CloseAudioForProcessExit() = 0;
+};
+
+class NativeVideoResource {
+public:
+	virtual ~NativeVideoResource() {}
+	virtual PeripheralBackendIdentity BackendIdentity() const = 0;
+	virtual NativePeripheralAcquisitionOutcome StartVideo(
+		std::unique_ptr<ActiveVideoSessionBundle> &&bundle) = 0;
+	virtual NativePeripheralReleaseOutcome StopVideo(
+		std::unique_ptr<CleanupVideoSessionBundle> &&bundle) = 0;
+	virtual NativePeripheralReleaseOutcome RecoverVideo(
+		std::unique_ptr<RecoveryVideoSessionBundle> &&bundle) = 0;
+	virtual void CloseVideoForProcessExit() = 0;
+};
+
+class NativeAudioVideoResource {
+public:
+	virtual ~NativeAudioVideoResource() {}
+	virtual PeripheralBackendIdentity BackendIdentity() const = 0;
+	virtual NativeCoupledAcquisitionOutcome StartAudioVideo(
+		std::unique_ptr<ActiveAudioVideoSessionBundle> &&bundle) = 0;
+	virtual NativeCoupledReleaseOutcome StopAudioVideo(
+		std::unique_ptr<CleanupAudioVideoSessionBundle> &&bundle) = 0;
+	virtual NativeCoupledReleaseOutcome RecoverAudioVideo(
+		std::unique_ptr<RecoveryAudioVideoSessionBundle> &&bundle) = 0;
+	virtual void CloseAudioVideoForProcessExit() = 0;
 };
 
 // These process-resource interfaces intentionally have no hardware capability.
@@ -126,6 +189,9 @@ public:
 struct NativeResourceSet {
 	NativePreflight &preflight;
 	NativeHardwareResources &hardware;
+	NativeAudioResource &audio;
+	NativeVideoResource &video;
+	NativeAudioVideoResource &audio_video;
 	NativeSchedulerResource &scheduler;
 	NativeOffloadResource &offload;
 	NativeSaveResource &save;

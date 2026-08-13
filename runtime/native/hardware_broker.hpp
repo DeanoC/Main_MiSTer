@@ -7,6 +7,7 @@
 #include "runtime/mister_runtime.h"
 #include "runtime/native/native_clock.hpp"
 #include "runtime/native/native_core_profile.hpp"
+#include "runtime/native/native_peripheral_session.hpp"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -36,6 +37,7 @@ enum class OperationKind : uint8_t {
 	save,
 	audio,
 	video,
+	audio_video,
 	content,
 	input_descriptors,
 	terminal_fpga_cleanup
@@ -59,9 +61,19 @@ class NativeCoreProtocol;
 class NativeCoreProtocolTeardown;
 class NativeLifecycle;
 class CoreProtocolAuthorityTestPeer;
+class PeripheralAuthorityTestPeer;
 class ActiveCoreProtocolSession;
 class CleanupCoreProtocolSession;
 class RecoveryCoreProtocolSession;
+class ActiveAudioSession;
+class CleanupAudioSession;
+class RecoveryAudioSession;
+class ActiveVideoSession;
+class CleanupVideoSession;
+class RecoveryVideoSession;
+class ActiveAudioVideoSession;
+class CleanupAudioVideoSession;
+class RecoveryAudioVideoSession;
 class ContainmentResumeKey;
 enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
@@ -77,6 +89,9 @@ class NativeCoreProtocolIoAdapterImpl;
 class NativeCoreProtocolActiveAdapterView;
 class NativeCoreProtocolCleanupAdapterView;
 class NativeCoreProtocolRecoveryAdapterView;
+class NativeAudioAdapter;
+class NativeVideoAdapter;
+class NativeAvIoAdapter;
 }
 
 class ProcessOperationGuard final {
@@ -95,6 +110,9 @@ private:
 	friend class linux_native::NativeInputAdapter;
 	friend class linux_native::NativeSchedulerAdapter;
 	friend class linux_native::NativeOffloadAdapter;
+	friend class linux_native::NativeAudioAdapter;
+	friend class linux_native::NativeVideoAdapter;
+	friend class linux_native::NativeAvIoAdapter;
 	explicit ProcessOperationGuard(
 		const std::shared_ptr<OperationRegistration> &registration);
 	LeaseAuthority authority() const;
@@ -178,9 +196,12 @@ private:
 	friend class NativeLifecycle;
 	friend class NativeRecovery;
 	friend class CoreProtocolAuthorityTestPeer;
+	friend class PeripheralAuthorityTestPeer;
 	friend class linux_native::NativeInputAdapter;
 	friend class linux_native::NativeSchedulerAdapter;
 	friend class linux_native::NativeOffloadAdapter;
+	friend class linux_native::NativeAudioAdapter;
+	friend class linux_native::NativeVideoAdapter;
 	explicit OperationLease(
 		const std::shared_ptr<OperationRegistration> &registration);
 	Result AcquireHardwareLeaseView(
@@ -213,6 +234,42 @@ private:
 		Result primary_result) const;
 	Result GetCoreProtocolBrokerDisposition(HardwareBroker &owner,
 		CoreProtocolBrokerDisposition *disposition) const;
+	Result AcquireActiveAudioSession(HardwareBroker &owner,
+		const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+		std::unique_ptr<ActiveAudioSessionBundle> *bundle) const;
+	Result AcquireCleanupAudioSession(HardwareBroker &owner,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<CleanupAudioSessionBundle> *bundle) const;
+	Result AcquireRecoveryAudioSession(HardwareBroker &owner,
+		const SafeAudioRecoveryRecord &record,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<RecoveryAudioSessionBundle> *bundle) const;
+	Result GetAudioSessionDisposition(HardwareBroker &owner,
+		PeripheralBrokerDisposition *disposition) const;
+	Result AcquireActiveVideoSession(HardwareBroker &owner,
+		const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+		std::unique_ptr<ActiveVideoSessionBundle> *bundle) const;
+	Result AcquireCleanupVideoSession(HardwareBroker &owner,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<CleanupVideoSessionBundle> *bundle) const;
+	Result AcquireRecoveryVideoSession(HardwareBroker &owner,
+		const SafeVideoRecoveryRecord &record,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<RecoveryVideoSessionBundle> *bundle) const;
+	Result GetVideoSessionDisposition(HardwareBroker &owner,
+		PeripheralBrokerDisposition *disposition) const;
+	Result AcquireActiveAudioVideoSession(HardwareBroker &owner,
+		const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+		std::unique_ptr<ActiveAudioVideoSessionBundle> *bundle) const;
+	Result AcquireCleanupAudioVideoSession(HardwareBroker &owner,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<CleanupAudioVideoSessionBundle> *bundle) const;
+	Result AcquireRecoveryAudioVideoSession(HardwareBroker &owner,
+		const SafeAudioVideoRecoveryRecord &record,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<RecoveryAudioVideoSessionBundle> *bundle) const;
+	Result GetAudioVideoSessionDisposition(HardwareBroker &owner,
+		PeripheralBrokerDisposition *disposition) const;
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result BeginConcurrentActiveOperationForTest(HardwareBroker &owner,
 		OperationKind operation_kind, uint64_t absolute_deadline_ms,
@@ -366,6 +423,11 @@ private:
 	friend class NativeSpiBus;
 	friend class NativeContainment;
 	friend class NativeRecovery;
+	friend class NativeLifecycle;
+	friend class PeripheralAuthorityTestPeer;
+	friend class linux_native::NativeAvIoAdapter;
+	friend class linux_native::NativeAudioAdapter;
+	friend class linux_native::NativeVideoAdapter;
 	friend struct OperationRegistration;
 
 	enum class State : uint8_t {
@@ -418,6 +480,105 @@ private:
 		Result primary_result);
 	Result GetCoreProtocolBrokerDispositionFor(const OperationLease &lease,
 		CoreProtocolBrokerDisposition *disposition);
+	PeripheralBackendIdentity CreatePeripheralBackendIdentity(
+		const void *adapter_instance);
+	Result AcquireActiveAudioSessionFor(const OperationLease &lease,
+		const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+		std::unique_ptr<ActiveAudioSessionBundle> *bundle);
+	Result AcquireCleanupAudioSessionFor(const OperationLease &lease,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<CleanupAudioSessionBundle> *bundle);
+	Result AcquireRecoveryAudioSessionFor(const OperationLease &lease,
+		const SafeAudioRecoveryRecord &record,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<RecoveryAudioSessionBundle> *bundle);
+	Result GetAudioSessionDispositionFor(const OperationLease &lease,
+		PeripheralBrokerDisposition *disposition);
+	Result AcquireActiveVideoSessionFor(const OperationLease &lease,
+		const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+		std::unique_ptr<ActiveVideoSessionBundle> *bundle);
+	Result AcquireCleanupVideoSessionFor(const OperationLease &lease,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<CleanupVideoSessionBundle> *bundle);
+	Result AcquireRecoveryVideoSessionFor(const OperationLease &lease,
+		const SafeVideoRecoveryRecord &record,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<RecoveryVideoSessionBundle> *bundle);
+	Result GetVideoSessionDispositionFor(const OperationLease &lease,
+		PeripheralBrokerDisposition *disposition);
+	Result AcquireActiveAudioVideoSessionFor(const OperationLease &lease,
+		const NativeCoreProfile &profile, const PeripheralBackendIdentity &backend,
+		std::unique_ptr<ActiveAudioVideoSessionBundle> *bundle);
+	Result AcquireCleanupAudioVideoSessionFor(const OperationLease &lease,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<CleanupAudioVideoSessionBundle> *bundle);
+	Result AcquireRecoveryAudioVideoSessionFor(const OperationLease &lease,
+		const SafeAudioVideoRecoveryRecord &record,
+		const PeripheralBackendIdentity &backend,
+		std::unique_ptr<RecoveryAudioVideoSessionBundle> *bundle);
+	Result GetAudioVideoSessionDispositionFor(const OperationLease &lease,
+		PeripheralBrokerDisposition *disposition);
+	Result CompleteActiveAudioSuccess(std::unique_ptr<ActiveAudioSession> &&session,
+		const PeripheralCompletionReceipt &receipt);
+	Result CompleteActiveAudioFailure(std::unique_ptr<ActiveAudioSession> &&session,
+		const PeripheralFailureReceipt &receipt);
+	Result CompleteCleanupAudio(std::unique_ptr<CleanupAudioSession> &&session,
+		const PeripheralCompletionReceipt &receipt);
+	Result AbandonCleanupAudio(std::unique_ptr<CleanupAudioSession> &&session,
+		const PeripheralFailureReceipt &receipt);
+	Result CompleteRecoveryAudio(std::unique_ptr<RecoveryAudioSession> &&session,
+		const PeripheralCompletionReceipt &receipt);
+	Result AbandonRecoveryAudio(std::unique_ptr<RecoveryAudioSession> &&session,
+		const PeripheralFailureReceipt &receipt);
+	Result CompleteActiveVideoSuccess(std::unique_ptr<ActiveVideoSession> &&session,
+		const PeripheralCompletionReceipt &receipt);
+	Result CompleteActiveVideoFailure(std::unique_ptr<ActiveVideoSession> &&session,
+		const PeripheralFailureReceipt &receipt);
+	Result CompleteCleanupVideo(std::unique_ptr<CleanupVideoSession> &&session,
+		const PeripheralCompletionReceipt &receipt);
+	Result AbandonCleanupVideo(std::unique_ptr<CleanupVideoSession> &&session,
+		const PeripheralFailureReceipt &receipt);
+	Result CompleteRecoveryVideo(std::unique_ptr<RecoveryVideoSession> &&session,
+		const PeripheralCompletionReceipt &receipt);
+	Result AbandonRecoveryVideo(std::unique_ptr<RecoveryVideoSession> &&session,
+		const PeripheralFailureReceipt &receipt);
+	Result CompleteActiveAudioVideoSuccess(
+		std::unique_ptr<ActiveAudioVideoSession> &&session,
+		const CoupledAcquisitionReceipt &receipt);
+	Result CompleteActiveAudioVideoFailure(
+		std::unique_ptr<ActiveAudioVideoSession> &&session,
+		const CoupledFailureReceipt &receipt);
+	Result CompleteCleanupAudioVideo(
+		std::unique_ptr<CleanupAudioVideoSession> &&session,
+		const CoupledCompletionReceipt &receipt);
+	Result AbandonCleanupAudioVideo(
+		std::unique_ptr<CleanupAudioVideoSession> &&session,
+		const CoupledFailureReceipt &receipt);
+	Result CompleteRecoveryAudioVideo(
+		std::unique_ptr<RecoveryAudioVideoSession> &&session,
+		const CoupledRecoveryReceipt &receipt);
+	Result AbandonRecoveryAudioVideo(
+		std::unique_ptr<RecoveryAudioVideoSession> &&session,
+		const CoupledFailureReceipt &receipt);
+	Result RecordPeripheralMutation(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		uint64_t *mutation_sequence);
+	Result PreparePeripheralAction(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		PeripheralSessionAction action, const void *profile_identity,
+		uint8_t word_count, uint8_t *next_word_index);
+	Result AdmitPeripheralAction(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		PeripheralSessionAction action);
+	Result RecordPeripheralActionWord(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		PeripheralSessionAction action, uint8_t word_index);
+	Result ClosePeripheralAction(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		PeripheralSessionAction action);
+	Result RecordCoupledRecoveryOperation(const RecoveryEpoch &epoch,
+		const OperationLease &lease, const CoupledRecoveryReceipt &receipt,
+		Result operation_result);
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result RecordActiveCoreProtocolMutationForTest(const OperationLease &lease,
 		ActiveCoreProtocolSession &session,
@@ -447,6 +608,8 @@ private:
 		bool mappings_released);
 	Result CommitCleanupContainment(const CleanupEpoch &epoch,
 		const OperationLease &terminal_lease);
+	Result PromoteCleanupAudioWithContainment(const CleanupEpoch &epoch,
+		const OperationLease &terminal_lease);
 	Result CommitRecoveryContainment(const RecoveryEpoch &epoch,
 		const OperationLease &terminal_lease);
 	Result BeginRecoveryObservation(const RecoveryEpoch &epoch);
@@ -461,6 +624,11 @@ private:
 		const OperationLease &lease, RecoveryResourceState resource_state,
 		Result result);
 	Result RecordRecoveryFailure(const RecoveryEpoch &epoch, Result result);
+	Result SnapshotRecovery(const RecoveryEpoch &epoch,
+		MisterRecoveryObservationV2 *observation) const;
+	Result ValidateRecoveryRequestedFlags(const RecoveryEpoch &epoch,
+		uint32_t callback_requested_flags) const;
+	bool CanFinishRecovery(const RecoveryEpoch &epoch) const;
 	static uint32_t RecoveryResourceForOperation(OperationKind operation_kind);
 	void RecordRecoveryPartition(uint32_t observed_resource_flags,
 		uint32_t neutral_resource_flags);
@@ -469,12 +637,33 @@ private:
 	void ClearCoreProtocolFailureReceipt();
 	void ConsumeCoreProtocolSessionState(OperationRegistration &registration,
 		const std::shared_ptr<ProtocolSessionState> &state);
+	Result AcquirePeripheralState(const OperationLease &lease,
+		PeripheralSessionKind kind, const NativeCoreProfile *profile,
+		const SafePeripheralRecoveryRecord *recovery_record,
+		const PeripheralBackendIdentity &backend,
+		std::shared_ptr<PeripheralSessionState> *state);
+	Result GetPeripheralDisposition(const OperationLease &lease,
+		PeripheralSessionKind kind, PeripheralBrokerDisposition *disposition);
+	Result CompletePeripheralSession(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		PeripheralSessionKind kind, LeaseAuthority authority,
+		bool active_failure, bool abandon,
+		const PeripheralCompletionReceipt &receipt);
+	Result CompleteCoupledSession(
+		const std::shared_ptr<PeripheralSessionState> &state,
+		LeaseAuthority authority, bool active_failure, bool abandon,
+		const CoupledCompletionReceipt &receipt, Result primary_result);
+	Result ResolvePeripheralWrapperAllocationFailure(
+		const std::shared_ptr<PeripheralSessionState> &state);
+	void ConsumePeripheralSessionState(OperationRegistration &registration,
+		const std::shared_ptr<PeripheralSessionState> &state,
+		PeripheralBrokerDisposition disposition);
 	bool ReceiptMatchesCleanup(const CleanupEpoch &epoch) const;
 	bool ReceiptMatchesRecovery(const RecoveryEpoch &epoch) const;
 
 	NativeClock &clock_;
 	std::shared_ptr<BrokerLifetime> lifetime_;
-	std::mutex mutex_;
+	mutable std::mutex mutex_;
 	std::condition_variable lease_released_;
 	State state_;
 	PlatformGenerationId generation_;
@@ -495,6 +684,8 @@ private:
 	bool quiesce_call_active_;
 	bool containment_receipt_current_;
 	bool containment_evidence_pending_;
+	bool cleanup_audio_shutdown_complete_;
+	bool recovery_audio_shutdown_complete_;
 	bool recovery_registered_;
 	bool recovery_observation_active_;
 	bool recovery_terminal_neutral_;
@@ -518,6 +709,7 @@ private:
 	bool core_protocol_failure_receipt_current_;
 	ActiveProtocolFailureReceipt core_protocol_failure_receipt_;
 	std::weak_ptr<ProtocolSessionState> core_protocol_session_state_;
+	std::weak_ptr<PeripheralSessionState> peripheral_session_state_;
 	const NativeCoreProfile *profile_;
 };
 

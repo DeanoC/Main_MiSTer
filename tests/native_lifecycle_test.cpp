@@ -3,6 +3,7 @@
 
 #include "runtime/native/native_lifecycle.hpp"
 #include "tests/native_core_protocol_authority_test_peer.hpp"
+#include "tests/native_peripheral_authority_test_peer.hpp"
 
 #include <assert.h>
 #include <stdint.h>
@@ -60,6 +61,7 @@ enum class Event : uint8_t {
 	start_core_protocol,
 	start_video,
 	start_audio,
+	start_audio_video,
 	open_input_descriptors,
 	open_save,
 	start_scheduler,
@@ -72,6 +74,7 @@ enum class Event : uint8_t {
 	close_input_descriptors,
 	stop_video,
 	stop_audio,
+	stop_audio_video,
 	close_content,
 	shutdown_core_protocol,
 	terminal_fpga_cleanup,
@@ -95,6 +98,9 @@ enum class MalformedProtocolOutcome : uint8_t {
 
 class FakeResources final : public NativePreflight,
 	public NativeHardwareResources,
+	public NativeAudioResource,
+	public NativeVideoResource,
+	public NativeAudioVideoResource,
 	public NativeSchedulerResource,
 	public NativeOffloadResource,
 	public NativeSaveResource,
@@ -102,7 +108,9 @@ class FakeResources final : public NativePreflight,
 	public NativeInputDescriptorResource {
 public:
 	FakeResources(FakeClock &clock, HardwareBroker &broker)
-		: clock_(clock), broker_(broker), failed_event_(Event::preflight),
+		: clock_(clock), broker_(broker),
+		  peripheral_backend_(PeripheralAuthorityTestPeer::Backend(broker_, this)),
+		  failed_event_(Event::preflight),
 		  fail_enabled_(false),
 		  activation_delay_event_(Event::preflight), activation_delay_ms_(0),
 		  expected_deadline_ms_(0), saw_wrong_deadline_(false),
@@ -131,7 +139,8 @@ public:
 
 	NativeResourceSet Set()
 	{
-		return {*this, *this, *this, *this, *this, *this, *this};
+		return {*this, *this, *this, *this, *this, *this, *this, *this,
+			*this, *this};
 	}
 
 	void Fail(Event event)
@@ -240,14 +249,21 @@ public:
 			true, completed == MISTER_RESULT_OK};
 	}
 
-	NativeAcquisitionOutcome StartVideo(const OperationLease &lease) override
+	NativePeripheralAcquisitionOutcome StartVideo(
+		std::unique_ptr<ActiveVideoSessionBundle> &&session) override
 	{
-		return AcquireHardware(Event::start_video, lease);
+		return StartPeripheral(Event::start_video, std::move(session));
 	}
 
-	NativeAcquisitionOutcome StartAudio(const OperationLease &lease) override
+	PeripheralBackendIdentity BackendIdentity() const override
 	{
-		return AcquireHardware(Event::start_audio, lease);
+		return peripheral_backend_;
+	}
+
+	NativePeripheralAcquisitionOutcome StartAudio(
+		std::unique_ptr<ActiveAudioSessionBundle> &&session) override
+	{
+		return StartPeripheral(Event::start_audio, std::move(session));
 	}
 
 	Result ReplayDigitalNeutral(const OperationLease &lease,
@@ -258,14 +274,84 @@ public:
 		return result;
 	}
 
-	Result StopVideo(const OperationLease &lease) override
+	NativePeripheralReleaseOutcome StopVideo(
+		std::unique_ptr<CleanupVideoSessionBundle> &&session) override
 	{
-		return RunHardware(Event::stop_video, lease);
+		return StopPeripheral(Event::stop_video, std::move(session));
 	}
 
-	Result StopAudio(const OperationLease &lease) override
+	NativePeripheralReleaseOutcome StopAudio(
+		std::unique_ptr<CleanupAudioSessionBundle> &&session) override
 	{
-		return RunHardware(Event::stop_audio, lease);
+		return StopPeripheral(Event::stop_audio, std::move(session));
+	}
+
+	NativePeripheralReleaseOutcome RecoverVideo(
+		std::unique_ptr<RecoveryVideoSessionBundle> &&) override
+	{
+		return {MISTER_RESULT_UNSUPPORTED, false, false, false, false};
+	}
+
+	NativePeripheralReleaseOutcome RecoverAudio(
+		std::unique_ptr<RecoveryAudioSessionBundle> &&) override
+	{
+		return {MISTER_RESULT_UNSUPPORTED, false, false, false, false};
+	}
+
+	NativeCoupledAcquisitionOutcome StartAudioVideo(
+		std::unique_ptr<ActiveAudioVideoSessionBundle> &&session) override
+	{
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, 0, false};
+		Result primary = Run(Event::start_audio_video);
+		const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO;
+		if (primary == MISTER_RESULT_OK && clock_.NowMs() >=
+			PeripheralAuthorityTestPeer::Deadline(*session)) {
+			const CoupledAcquisitionReceipt receipt = {MISTER_RESULT_DEADLINE,
+				affected, true, true, false, broker_.mutation_sequence_for_test(),
+				0xa55a};
+			const Result completed = PeripheralAuthorityTestPeer::FailAudioVideo(
+				broker_, std::move(session), {MISTER_RESULT_DEADLINE, receipt});
+			return {completed == MISTER_RESULT_OK ? MISTER_RESULT_DEADLINE :
+				completed, affected, true};
+		}
+		uint64_t sequence = 0;
+		const Result recorded = PeripheralAuthorityTestPeer::Record(broker_,
+			*session, &sequence);
+		if (recorded != MISTER_RESULT_OK) return {recorded, 0, false};
+		const CoupledAcquisitionReceipt receipt = {MISTER_RESULT_OK, affected,
+			true, true, false, sequence, 0xa55a};
+		const Result completed = primary == MISTER_RESULT_OK ?
+			PeripheralAuthorityTestPeer::CompleteAudioVideo(broker_,
+				std::move(session), receipt) :
+			PeripheralAuthorityTestPeer::FailAudioVideo(broker_,
+				std::move(session), {primary, receipt});
+		return {completed == MISTER_RESULT_OK ? primary : completed, affected,
+			primary == MISTER_RESULT_OK || failure_after_acquire_};
+	}
+
+	NativeCoupledReleaseOutcome StopAudioVideo(
+		std::unique_ptr<CleanupAudioVideoSessionBundle> &&session) override
+	{
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, 0, 0, 0, false,
+			false, 0};
+		const Result primary = Run(Event::stop_audio_video);
+		const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO;
+		const CoupledCompletionReceipt receipt = {MISTER_RESULT_OK, affected, 0,
+			MISTER_RESOURCE_NATIVE_VIDEO, true, false,
+			broker_.mutation_sequence_for_test(), true, 0xa55a};
+		const Result completed = PeripheralAuthorityTestPeer::CompleteAudioVideo(
+			broker_, std::move(session), receipt);
+		return {completed == MISTER_RESULT_OK ? primary : completed, affected, 0,
+			MISTER_RESOURCE_NATIVE_VIDEO, true, false,
+			broker_.mutation_sequence_for_test()};
+	}
+
+	NativeCoupledReleaseOutcome RecoverAudioVideo(
+		std::unique_ptr<RecoveryAudioVideoSessionBundle> &&) override
+	{
+		return {MISTER_RESULT_UNSUPPORTED, 0, 0, 0, false, false, 0};
 	}
 
 	Result ShutdownCoreProtocol(const OperationLease &lease) override
@@ -296,6 +382,7 @@ public:
 	}
 	void CloseVideoForProcessExit() override { Record(Event::destruct_video); }
 	void CloseAudioForProcessExit() override { Record(Event::destruct_audio); }
+	void CloseAudioVideoForProcessExit() override {}
 	void CloseCoreProtocolForProcessExit() override
 	{
 		Record(Event::destruct_core_protocol);
@@ -424,6 +511,7 @@ public:
 
 	FakeClock &clock_;
 	HardwareBroker &broker_;
+	PeripheralBackendIdentity peripheral_backend_;
 	std::vector<Event> events;
 	std::vector<Event> hardware_events;
 	std::vector<uint64_t> hardware_deadlines;
@@ -449,6 +537,112 @@ public:
 	std::unique_ptr<OperationLease> concurrent_protocol_peer_;
 
 private:
+	template <typename Session>
+	NativePeripheralAcquisitionOutcome StartPeripheral(Event event,
+		std::unique_ptr<Session> &&session)
+	{
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, false};
+		const uint64_t deadline = PeripheralAuthorityTestPeer::Deadline(*session);
+		hardware_events.push_back(event);
+		hardware_deadlines.push_back(deadline);
+		Result primary = Run(event);
+		if (primary == MISTER_RESULT_OK && clock_.NowMs() >=
+			deadline) {
+			const PeripheralCompletionReceipt receipt = {MISTER_RESULT_DEADLINE,
+				true, true, true, true, false,
+				broker_.mutation_sequence_for_test(), 0xa55a};
+			const Result completed = PeripheralAuthorityTestPeer::FailVideo(broker_,
+				std::move(session), {MISTER_RESULT_DEADLINE, receipt});
+			return {completed == MISTER_RESULT_OK ? MISTER_RESULT_DEADLINE :
+				completed, true};
+		}
+		uint64_t sequence = 0;
+		const Result recorded = PeripheralAuthorityTestPeer::Record(broker_,
+			*session, &sequence);
+		if (recorded != MISTER_RESULT_OK) return {recorded, false};
+		const PeripheralCompletionReceipt receipt = {MISTER_RESULT_OK, true,
+			true, true, true, false, sequence, 0xa55a};
+		const Result completed = primary == MISTER_RESULT_OK ?
+			PeripheralAuthorityTestPeer::CompleteVideo(broker_, std::move(session),
+				receipt) : PeripheralAuthorityTestPeer::FailVideo(broker_,
+				std::move(session), {primary, receipt});
+		const Result final_result = completed == MISTER_RESULT_OK ? primary :
+			completed;
+		return {final_result, primary == MISTER_RESULT_OK ||
+			failure_after_acquire_};
+	}
+
+	NativePeripheralAcquisitionOutcome StartPeripheral(Event event,
+		std::unique_ptr<ActiveAudioSessionBundle> &&session)
+	{
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, false};
+		const uint64_t deadline = PeripheralAuthorityTestPeer::Deadline(*session);
+		hardware_events.push_back(event);
+		hardware_deadlines.push_back(deadline);
+		Result primary = Run(event);
+		if (primary == MISTER_RESULT_OK && clock_.NowMs() >=
+			deadline) {
+			const PeripheralCompletionReceipt receipt = {MISTER_RESULT_DEADLINE,
+				true, true, true, true, false,
+				broker_.mutation_sequence_for_test(), 0xa55a};
+			const Result completed = PeripheralAuthorityTestPeer::FailAudio(broker_,
+				std::move(session), {MISTER_RESULT_DEADLINE, receipt});
+			return {completed == MISTER_RESULT_OK ? MISTER_RESULT_DEADLINE :
+				completed, true};
+		}
+		uint64_t sequence = 0;
+		const Result recorded = PeripheralAuthorityTestPeer::Record(broker_,
+			*session, &sequence);
+		if (recorded != MISTER_RESULT_OK) return {recorded, false};
+		const PeripheralCompletionReceipt receipt = {MISTER_RESULT_OK, true,
+			true, true, true, false, sequence, 0xa55a};
+		const Result completed = primary == MISTER_RESULT_OK ?
+			PeripheralAuthorityTestPeer::CompleteAudio(broker_, std::move(session),
+				receipt) : PeripheralAuthorityTestPeer::FailAudio(broker_,
+				std::move(session), {primary, receipt});
+		const Result final_result = completed == MISTER_RESULT_OK ? primary :
+			completed;
+		return {final_result, primary == MISTER_RESULT_OK ||
+			failure_after_acquire_};
+	}
+
+	template <typename Session>
+	NativePeripheralReleaseOutcome StopPeripheral(Event event,
+		std::unique_ptr<Session> &&session)
+	{
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, false, false,
+			false, false};
+		hardware_events.push_back(event);
+		hardware_deadlines.push_back(PeripheralAuthorityTestPeer::Deadline(*session));
+		const Result primary = Run(event);
+		const PeripheralCompletionReceipt receipt = {MISTER_RESULT_OK, true,
+			true, true, true, false, broker_.mutation_sequence_for_test(), 0xa55a};
+		const Result completed = primary == MISTER_RESULT_OK ?
+			PeripheralAuthorityTestPeer::CompleteVideo(broker_, std::move(session),
+				receipt) : PeripheralAuthorityTestPeer::AbandonVideo(broker_,
+				std::move(session), {primary, receipt});
+		return {completed == MISTER_RESULT_OK ? primary : completed,
+			primary == MISTER_RESULT_OK, false, primary == MISTER_RESULT_OK, false};
+	}
+
+	NativePeripheralReleaseOutcome StopPeripheral(Event event,
+		std::unique_ptr<CleanupAudioSessionBundle> &&session)
+	{
+		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, false, false,
+			false, false};
+		hardware_events.push_back(event);
+		hardware_deadlines.push_back(PeripheralAuthorityTestPeer::Deadline(*session));
+		const Result primary = Run(event);
+		const PeripheralCompletionReceipt receipt = {MISTER_RESULT_OK, true,
+			true, true, true, false, broker_.mutation_sequence_for_test(), 0xa55a};
+		const Result completed = primary == MISTER_RESULT_OK ?
+			PeripheralAuthorityTestPeer::CompleteAudio(broker_, std::move(session),
+				receipt) : PeripheralAuthorityTestPeer::AbandonAudio(broker_,
+				std::move(session), {primary, receipt});
+		return {completed == MISTER_RESULT_OK ? primary : completed,
+			primary == MISTER_RESULT_OK, false, primary == MISTER_RESULT_OK, false};
+	}
+
 	void Record(Event event)
 	{
 		events.push_back(event);
@@ -507,6 +701,7 @@ const Event kActivationEvents[] = {
 	Event::start_core_protocol,
 	Event::start_video,
 	Event::start_audio,
+	Event::start_audio_video,
 	Event::open_input_descriptors,
 	Event::open_save,
 	Event::start_scheduler,
@@ -519,6 +714,7 @@ const Event kCleanupForFailedAcquisition[] = {
 	Event::shutdown_core_protocol,
 	Event::stop_video,
 	Event::stop_audio,
+	Event::stop_audio_video,
 	Event::close_input_descriptors,
 	Event::flush_close_save,
 	Event::stop_scheduler,
@@ -1002,6 +1198,7 @@ void TestNormalStopUsesTheNormativeOrder()
 		Event::close_input_descriptors,
 		Event::stop_video,
 		Event::stop_audio,
+		Event::stop_audio_video,
 		Event::close_content,
 		Event::shutdown_core_protocol,
 		Event::terminal_fpga_cleanup
@@ -1012,7 +1209,9 @@ void TestNormalStopUsesTheNormativeOrder()
 		assert(fixture.resources.events[activation_events + index] == expected[index]);
 	assert(fixture.lifecycle.ledger().resource_flags ==
 		(MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
-		 MISTER_RESOURCE_CORE_PROTOCOL | MISTER_RESOURCE_CORE_INPUT));
+		 MISTER_RESOURCE_CORE_PROTOCOL | MISTER_RESOURCE_CORE_INPUT |
+		 MISTER_RESOURCE_NATIVE_AUDIO));
+	assert(fixture.lifecycle.ledger().audio_shutdown_complete);
 	assert(fixture.lifecycle.ledger().core_protocol_shutdown_complete);
 	assert(!fixture.lifecycle.ledger().scheduler);
 	assert(!fixture.lifecycle.ledger().offload);

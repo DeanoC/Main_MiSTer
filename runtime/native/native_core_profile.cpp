@@ -3,11 +3,15 @@
 
 #include "runtime/native/native_core_profile.hpp"
 
+#include "runtime/mister_runtime.h"
+
 #include <string.h>
 
 namespace mister {
 namespace native {
 namespace {
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 
 const NativeCoreProfile kSnesProfile = {
 	NativeSystem::snes, "snes", "SNES", {"sfc", "smc", "bin"},
@@ -18,6 +22,22 @@ const NativeCoreProfile kSnesProfile = {
 		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 		NativeContentTransform::snes_header_and_mirror,
 		0x8000, 8 * 1024 * 1024, 16 * 1024 * 1024},
+	{NativeAudioRecipeId::fixture_synthetic_v1, 0x06, 0x10,
+		NativeAudioNeutralProof::terminal_containment,
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+	{NativeVideoRecipeId::fixture_synthetic_v1,
+		{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+		 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+		 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+		 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11},
+		{0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22},
+		MISTER_RESOURCE_NATIVE_VIDEO, {0x0400, 0x0000}, 0,
+		0, 0, 0, 0x39, 0x10, 0x50, 0xff, 0x10, 0x50,
+		true, true, true, true, true, true},
 	NativeProfileAuthority::fixture
 };
 
@@ -30,8 +50,40 @@ const NativeCoreProfile kMegaDriveProfile = {
 		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 		NativeContentTransform::megadrive_raw,
 		1, 8 * 1024 * 1024, 8 * 1024 * 1024},
+	{NativeAudioRecipeId::fixture_synthetic_v1, 0x08, 0x10,
+		NativeAudioNeutralProof::terminal_containment,
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+	{NativeVideoRecipeId::fixture_synthetic_v1,
+		{0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+		 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+		 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+		 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33},
+		{0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+		 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+		 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+		 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44},
+		MISTER_RESOURCE_NATIVE_VIDEO, {0x0500, 0x0000}, 0,
+		0, 0, 0, 0x39, 0x10, 0x50, 0xff, 0x10, 0x50,
+		true, true, true, true, true, true},
 	NativeProfileAuthority::fixture
 };
+
+const SafeAudioRecoveryRecord kSnesAudioRecovery = {
+	{NativeProfileAuthority::fixture, NativeSystem::snes}, kSnesProfile.audio};
+const SafeAudioRecoveryRecord kMegaDriveAudioRecovery = {
+	{NativeProfileAuthority::fixture, NativeSystem::megadrive},
+	kMegaDriveProfile.audio};
+const SafeVideoRecoveryRecord kSnesVideoRecovery = {
+	{NativeProfileAuthority::fixture, NativeSystem::snes}, kSnesProfile.video};
+const SafeVideoRecoveryRecord kMegaDriveVideoRecovery = {
+	{NativeProfileAuthority::fixture, NativeSystem::megadrive},
+	kMegaDriveProfile.video};
+const SafeAudioVideoRecoveryRecord kSnesAudioVideoRecovery = {
+	{NativeProfileAuthority::fixture, NativeSystem::snes}, kSnesProfile.video};
+const SafeAudioVideoRecoveryRecord kMegaDriveAudioVideoRecovery = {
+	{NativeProfileAuthority::fixture, NativeSystem::megadrive},
+	kMegaDriveProfile.video};
 
 bool SameString(const char *left, const char *right)
 {
@@ -60,6 +112,8 @@ bool SameRecord(const NativeCoreProfile &left,
 		left.protocol.minimum_source_bytes != right.protocol.minimum_source_bytes ||
 		left.protocol.maximum_source_bytes != right.protocol.maximum_source_bytes ||
 		left.protocol.maximum_wire_bytes != right.protocol.maximum_wire_bytes ||
+		memcmp(&left.audio, &right.audio, sizeof(left.audio)) != 0 ||
+		memcmp(&left.video, &right.video, sizeof(left.video)) != 0 ||
 		left.authority != right.authority)
 		return false;
 	for (size_t index = 0; index < 3; ++index)
@@ -92,14 +146,40 @@ bool ValidProtocolRecord(const NativeCoreProfile &profile)
 		 protocol.transform == NativeContentTransform::megadrive_raw);
 }
 
+bool ValidAudioVideoRecord(const NativeCoreProfile &profile)
+{
+	const NativeAudioProfile &audio = profile.audio;
+	const NativeVideoProfile &video = profile.video;
+	if (audio.recipe != NativeAudioRecipeId::fixture_synthetic_v1 ||
+		audio.neutral_proof != NativeAudioNeutralProof::terminal_containment ||
+		video.recipe != NativeVideoRecipeId::fixture_synthetic_v1 ||
+		video.affected_resource_flags != MISTER_RESOURCE_NATIVE_VIDEO ||
+		video.framebuffer_disable_word != 0 || !video.edid_disabled ||
+		!video.hotplug_disabled || !video.cec_disabled || !video.spd_disabled ||
+		!video.hps_framebuffer_disabled || !video.coupled_transmitter ||
+		video.adv7513_main_address != 0x39 ||
+		video.power_on_value != 0x10 || video.power_down_value != 0x50 ||
+		video.power_read_mask != 0xff || video.power_on_expected != 0x10 ||
+		video.power_down_expected != 0x50)
+		return false;
+	return true;
+}
+
+#endif
+
 } // namespace
 
 const NativeCoreProfile *FixtureNativeCoreProfile(const char *system)
 {
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 	if (SameString(system, kSnesProfile.system)) return &kSnesProfile;
 	if (SameString(system, kMegaDriveProfile.system))
 		return &kMegaDriveProfile;
 	return nullptr;
+#else
+	(void)system;
+	return nullptr;
+#endif
 }
 
 const NativeCoreProfile *ProductionNativeCoreProfile(const char *)
@@ -109,11 +189,17 @@ const NativeCoreProfile *ProductionNativeCoreProfile(const char *)
 
 bool IsExactFixtureNativeCoreProfile(const NativeCoreProfile &profile)
 {
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 	return &profile == &kSnesProfile || &profile == &kMegaDriveProfile;
+#else
+	(void)profile;
+	return false;
+#endif
 }
 
 bool ValidateNativeCoreProfileRecord(const NativeCoreProfile &profile)
 {
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
 	if (!IsExactFixtureNativeCoreProfile(profile)) return false;
 	if (profile.authority != NativeProfileAuthority::fixture ||
 		profile.input.system_id != profile.system_id ||
@@ -122,11 +208,50 @@ bool ValidateNativeCoreProfileRecord(const NativeCoreProfile &profile)
 		profile.input.digital_word_count != kNativeDigitalWordCount ||
 		profile.input.player_command[0] != 0x02 ||
 		profile.input.player_command[1] != 0x03 ||
-		profile.input.joystick_swap || !ValidProtocolRecord(profile))
+		profile.input.joystick_swap || !ValidProtocolRecord(profile) ||
+		!ValidAudioVideoRecord(profile))
 		return false;
 	return SameRecord(profile, profile.system != nullptr &&
 		strcmp(profile.system, "snes") == 0 ? kSnesProfile : kMegaDriveProfile);
+#else
+	(void)profile;
+	return false;
+#endif
 }
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+const SafeAudioRecoveryRecord *FixtureSafeAudioRecoveryRecordForTest(
+	NativeSystem system_id)
+{
+	return system_id == NativeSystem::snes ? &kSnesAudioRecovery :
+		system_id == NativeSystem::megadrive ? &kMegaDriveAudioRecovery : nullptr;
+}
+
+const SafeVideoRecoveryRecord *FixtureSafeVideoRecoveryRecordForTest(
+	NativeSystem system_id)
+{
+	return system_id == NativeSystem::snes ? &kSnesVideoRecovery :
+		system_id == NativeSystem::megadrive ? &kMegaDriveVideoRecovery : nullptr;
+}
+
+const SafeAudioVideoRecoveryRecord *FixtureSafeAudioVideoRecoveryRecordForTest(
+	NativeSystem system_id)
+{
+	return system_id == NativeSystem::snes ? &kSnesAudioVideoRecovery :
+		system_id == NativeSystem::megadrive ? &kMegaDriveAudioVideoRecovery : nullptr;
+}
+
+bool IsExactFixtureSafePeripheralRecoveryRecordForTest(
+	const SafePeripheralRecoveryRecord *record)
+{
+	return record == &kSnesAudioRecovery.base ||
+		record == &kMegaDriveAudioRecovery.base ||
+		record == &kSnesVideoRecovery.base ||
+		record == &kMegaDriveVideoRecovery.base ||
+		record == &kSnesAudioVideoRecovery.base ||
+		record == &kMegaDriveAudioVideoRecovery.base;
+}
+#endif
 
 bool NativeCoreProfileAcceptsExtension(const NativeCoreProfile &profile,
 	const char *extension)

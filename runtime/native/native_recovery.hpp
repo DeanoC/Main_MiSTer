@@ -5,9 +5,12 @@
 #define MISTER_RUNTIME_NATIVE_NATIVE_RECOVERY_HPP
 
 #include "runtime/native/hardware_broker.hpp"
+#include "runtime/native/native_resources.hpp"
 
 namespace mister {
 namespace native {
+
+class NativeContainment;
 
 enum class RecoveryResourceState : uint8_t {
 	unknown,
@@ -18,6 +21,20 @@ enum class RecoveryResourceState : uint8_t {
 class NativeRecoveryIo {
 public:
 	virtual ~NativeRecoveryIo() {}
+	// Task 10-owned safe recovery authority is injected privately. The base
+	// implementation exposes none, so production cannot guess a profile.
+	virtual const SafeAudioRecoveryRecord *SafeAudioRecord() const
+	{
+		return nullptr;
+	}
+	virtual const SafeVideoRecoveryRecord *SafeVideoRecord() const
+	{
+		return nullptr;
+	}
+	virtual const SafeAudioVideoRecoveryRecord *SafeAudioVideoRecord() const
+	{
+		return nullptr;
+	}
 
 private:
 	friend class NativeRecovery;
@@ -38,18 +55,43 @@ private:
 class NativeRecovery final {
 public:
 	NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io);
+	NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
+		NativeAudioResource &audio, NativeVideoResource &video,
+		NativeAudioVideoResource &audio_video);
+	NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
+		NativeAudioResource &audio, NativeVideoResource &video,
+		NativeAudioVideoResource &audio_video, NativeContainment &containment);
 	Result Perform(const RecoveryEpoch &epoch, OperationKind operation_kind);
+	Result Snapshot(const RecoveryEpoch &epoch,
+		MisterRecoveryObservationV2 *observation) const;
+	Result ValidateCallbackRequestedFlags(const RecoveryEpoch &epoch,
+		uint32_t callback_requested_flags) const;
 	Result Finish(std::unique_ptr<RecoveryEpoch> &&epoch,
 		MisterRecoveryObservationV2 *observation);
 
 private:
+	enum class RetainedRecoveryKind : uint8_t {
+		none,
+		core_protocol,
+		audio,
+		video,
+		audio_video
+	};
+	Result BeginTypedRecovery(const RecoveryEpoch &epoch,
+		OperationKind operation_kind);
+	void ClearRetainedRecovery();
 	NativeRecovery(const NativeRecovery &) = delete;
 	NativeRecovery &operator=(const NativeRecovery &) = delete;
 
 	HardwareBroker &broker_;
 	NativeRecoveryIo &io_;
-	const RecoveryEpoch *core_protocol_epoch_;
-	std::unique_ptr<OperationLease> core_protocol_lease_;
+	NativeAudioResource *audio_;
+	NativeVideoResource *video_;
+	NativeAudioVideoResource *audio_video_;
+	NativeContainment *containment_;
+	const RecoveryEpoch *retained_epoch_;
+	RetainedRecoveryKind retained_kind_;
+	std::unique_ptr<OperationLease> retained_lease_;
 };
 
 } // namespace native
