@@ -71,23 +71,33 @@ private:
 
 class FakeHardware final : public NativeHardwareIo {
 public:
-	Result Select(const HardwareLeaseView &, uint32_t) override
+	NativeSpiMutationResult Select(const HardwareLeaseView &,
+		NativeSpiTarget) override
 	{
-		return MISTER_RESULT_OK;
+		return {MISTER_RESULT_OK, true, true, true};
 	}
-	Result WriteWord(const HardwareLeaseView &, uint16_t value) override
+	NativeSpiMutationResult WriteWordWithStrobeLow(
+		const HardwareLeaseView &, uint16_t value) override
 	{
 		words.push_back(value);
+		return {MISTER_RESULT_OK, true, true, true};
+	}
+	NativeSpiMutationResult SetStrobe(const HardwareLeaseView &, bool) override
+	{
+		return {MISTER_RESULT_OK, true, true, true};
+	}
+	Result ReadAckSample(const HardwareLeaseView &,
+		NativeSpiAckSample *sample) override
+	{
+		sample->ack_high = (ack_index++ % 2) == 0;
+		sample->fault = false;
+		sample->response = 0;
 		return MISTER_RESULT_OK;
 	}
-	Result ReadAck(const HardwareLeaseView &, bool *high) override
+	NativeSpiMutationResult Deselect(const HardwareLeaseView &, NativeSpiTarget,
+		uint64_t) override
 	{
-		*high = (ack_index++ % 2) == 0;
-		return MISTER_RESULT_OK;
-	}
-	Result Deselect(const HardwareLeaseView &, uint32_t, uint64_t) override
-	{
-		return MISTER_RESULT_OK;
+		return {MISTER_RESULT_OK, true, true, true};
 	}
 	size_t ack_index = 0;
 	std::vector<uint16_t> words;
@@ -267,7 +277,7 @@ public:
 struct Fixture {
 	Fixture()
 		: profile(FixtureNativeCoreProfile("snes")), broker(clock), io(),
-		  bus(clock, io), input(bus)
+		  bus(clock, io), input(bus.input_port())
 	{
 		assert(profile != nullptr);
 		assert(broker.EnterFixtureForTest(*profile, &generation) == MISTER_RESULT_OK);

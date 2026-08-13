@@ -6,8 +6,8 @@
 namespace mister {
 namespace native {
 
-NativeInput::NativeInput(NativeSpiBus &bus)
-	: bus_(bus), profile_(nullptr), ledger_(), ledger_valid_{false, false},
+NativeInput::NativeInput(NativeInputSpiPort &port)
+	: port_(port), profile_(nullptr), ledger_(), ledger_valid_{false, false},
 	  uncertain_{false, false}, uncertain_map_{0, 0},
 	  uncertain_identity_{{0, 0}, {0, 0}},
 	  last_sequence_{0, 0}, last_map_{0, 0},
@@ -34,7 +34,20 @@ void NativeInput::ClearReceipt(SpiReceipt *receipt)
 	receipt->selected = false;
 	receipt->completed_words = 0;
 	receipt->ack_low_observed = false;
+	receipt->response_words_observed = 0;
+	receipt->captured_words = 0;
+	receipt->ack_high_observed = false;
+	receipt->select_attempted = false;
+	receipt->deselect_attempted = false;
 	receipt->deselected = false;
+	receipt->strobe_low_observed = false;
+	receipt->force_strobe_low_attempted = false;
+	receipt->force_strobe_low_applied = false;
+	receipt->force_strobe_low_observed = false;
+	receipt->target = NativeSpiTarget::user_io;
+	receipt->target_may_be_selected = false;
+	receipt->strobe_may_be_high = false;
+	receipt->mapping_retained = false;
 	receipt->mutation_sequence = 0;
 }
 
@@ -184,10 +197,9 @@ Result NativeInput::Deliver(const NativeCoreProfile *profile,
 	pending_ = {true, event.player,
 		map, profile->input.player_command[player], identity};
 	const uint16_t words[2] = {pending_.command, map};
-	const SpiTransaction transaction = {1, words, kNativeDigitalWordCount,
-		AckPolicy::required, 1};
+	const SpiWords transaction = {words, nullptr, kNativeDigitalWordCount, 0};
 	const SpiReceiptCommitToken token(this, &NativeInput::CommitReceipt);
-	const Result result = bus_.ExecuteWithHardwareLeaseView(*view, transaction,
+	const Result result = port_.Execute(*view, transaction,
 		receipt, &token);
 	if (result != MISTER_RESULT_OK) {
 		uncertain_[player] = true;

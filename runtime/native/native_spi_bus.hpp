@@ -14,28 +14,54 @@
 namespace mister {
 namespace native {
 
-enum class AckPolicy : uint8_t {
-	required
-};
-
-struct SpiTransaction {
-	uint32_t select_mask;
-	const uint16_t *words;
+struct SpiWords {
+	const uint16_t *transmit_words;
+	uint16_t *received_words;
 	size_t word_count;
-	AckPolicy ack_policy;
-	uint32_t deselect_mask;
+	size_t received_capacity;
 };
 
 struct SpiReceipt {
 	Result result;
 	bool selected;
 	size_t completed_words;
+	size_t response_words_observed;
+	size_t captured_words;
+	bool ack_high_observed;
 	bool ack_low_observed;
+	bool select_attempted;
+	bool deselect_attempted;
 	bool deselected;
+	bool strobe_low_observed;
+	bool force_strobe_low_attempted;
+	bool force_strobe_low_applied;
+	bool force_strobe_low_observed;
+	NativeSpiTarget target;
+	bool target_may_be_selected;
+	bool strobe_may_be_high;
+	bool mapping_retained;
 	uint64_t mutation_sequence;
 };
 
 class NativeInput;
+class NativeSpiBus;
+class SpiReceiptCommitToken;
+
+// This capability is the only production admission to the input SPI route.
+// It deliberately has no target parameter, so input code cannot select file
+// I/O or compose a generic selected exchange.
+class NativeInputSpiPort final {
+public:
+	NativeInputSpiPort(const NativeInputSpiPort &) = delete;
+	NativeInputSpiPort &operator=(const NativeInputSpiPort &) = delete;
+private:
+	friend class NativeSpiBus;
+	friend class NativeInput;
+	explicit NativeInputSpiPort(NativeSpiBus &bus);
+	Result Execute(HardwareLeaseView &view, const SpiWords &words,
+		SpiReceipt *receipt, const SpiReceiptCommitToken *commit);
+	NativeSpiBus &bus_;
+};
 
 class SpiReceiptCommitToken final {
 public:
@@ -57,21 +83,28 @@ private:
 class NativeSpiBus final {
 public:
 	NativeSpiBus(NativeClock &clock, NativeHardwareIo &hardware);
-	Result Execute(const OperationLease &lease,
-		const SpiTransaction &transaction, SpiReceipt *receipt,
-		const SpiReceiptCommitToken *commit = nullptr);
+	NativeInputSpiPort &input_port() { return input_port_; }
+#if defined(MISTER_NATIVE_SPI_TESTING)
+	// Test-only typed admission. Production callers receive only their
+	// purpose-specific entry points below.
+	Result ExchangeForTest(const OperationLease &lease, NativeSpiTarget target,
+		const SpiWords &words, SpiReceipt *receipt);
+#endif
 
 private:
-	friend class NativeInput;
-	Result ExecuteWithHardwareLeaseView(HardwareLeaseView &view,
-		const SpiTransaction &transaction, SpiReceipt *receipt,
+	friend class NativeInputSpiPort;
+	Result ExchangeWithHardwareLeaseView(HardwareLeaseView &view,
+		NativeSpiTarget target, const SpiWords &words, SpiReceipt *receipt,
 		const SpiReceiptCommitToken *commit);
-	bool RecordObservedMutation(HardwareLeaseView &view, SpiReceipt *receipt);
+	bool RecordAppliedMutation(HardwareLeaseView &view, SpiReceipt *receipt);
+	void RecordMutationResult(HardwareLeaseView &view, SpiReceipt *receipt,
+		const NativeSpiMutationResult &mutation, Result *primary);
 	Result WaitForAck(const HardwareLeaseView &view, bool want_high,
-		uint64_t deadline_ms, bool *observed);
+		uint64_t deadline_ms, bool *observed, uint16_t *response);
 
 	NativeClock &clock_;
 	NativeHardwareIo &hardware_;
+	NativeInputSpiPort input_port_;
 };
 
 } // namespace native

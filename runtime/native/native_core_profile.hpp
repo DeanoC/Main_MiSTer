@@ -23,6 +23,8 @@ enum class NativeSystem : uint8_t {
 static const uint8_t kNativePlayerCount = 2;
 static const uint8_t kNativeDigitalWordCount = 2;
 static const uint8_t kNativeExtensionCount = 3;
+static const size_t kNativeInitialStatusBytes = 16;
+static const size_t kNativeMaximumCoreNameBytes = 255;
 
 struct NativeArtifactRecord {
 	const char *sha256;
@@ -38,6 +40,29 @@ struct NativeInputProfile {
 	bool joystick_swap;
 };
 
+enum class NativeFileIoWidth : uint8_t {
+	byte_per_word = 0,
+	little_endian_byte_pairs = 1
+};
+
+enum class NativeContentTransform : uint8_t {
+	snes_header_and_mirror = 0,
+	megadrive_raw = 1
+};
+
+// This is private fixture/profile authority. Production records remain
+// unavailable until the image-locked Task 10 inputs exist.
+struct NativeCoreProtocolProfile {
+	uint8_t exact_core_type;
+	NativeFileIoWidth file_io_width;
+	uint16_t sdram_size_word;
+	uint8_t initial_status[kNativeInitialStatusBytes];
+	NativeContentTransform transform;
+	uint64_t minimum_source_bytes;
+	uint64_t maximum_source_bytes;
+	uint64_t maximum_wire_bytes;
+};
+
 // A profile is an immutable record when obtained from one of the authority
 // accessors below. Callers must not manufacture a record for admission.
 struct NativeCoreProfile {
@@ -47,6 +72,7 @@ struct NativeCoreProfile {
 	const char *extensions[kNativeExtensionCount];
 	NativeArtifactRecord artifact;
 	NativeInputProfile input;
+	NativeCoreProtocolProfile protocol;
 	NativeProfileAuthority authority;
 };
 

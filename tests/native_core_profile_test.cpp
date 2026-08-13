@@ -160,6 +160,29 @@ void TestExtensionsAndRecordAuthorityAreExact()
 	assert(!ValidateNativeCoreProfileRecord(mega_copy));
 }
 
+void TestFixtureProtocolProfilesRequireExactHandshakeRecords()
+{
+	const NativeCoreProfile *snes = FixtureNativeCoreProfile("snes");
+	const NativeCoreProfile *megadrive = FixtureNativeCoreProfile("megadrive");
+	assert(snes != nullptr);
+	assert(megadrive != nullptr);
+	assert(snes->protocol.exact_core_type == 0xa4);
+	assert(snes->protocol.file_io_width == NativeFileIoWidth::byte_per_word);
+	assert(snes->protocol.sdram_size_word == 0x1234);
+	assert(snes->protocol.transform ==
+		NativeContentTransform::snes_header_and_mirror);
+	assert(megadrive->protocol.exact_core_type == 0xa8);
+	assert(megadrive->protocol.file_io_width ==
+		NativeFileIoWidth::little_endian_byte_pairs);
+	assert(megadrive->protocol.sdram_size_word == 0x4321);
+	assert(megadrive->protocol.transform == NativeContentTransform::megadrive_raw);
+	assert(ValidateNativeCoreProfileRecord(*snes));
+	assert(ValidateNativeCoreProfileRecord(*megadrive));
+
+	NativeCoreProfile copied = *snes;
+	assert(!ValidateNativeCoreProfileRecord(copied));
+}
+
 } // namespace
 } // namespace native
 } // namespace mister
@@ -168,5 +191,6 @@ int main()
 {
 	mister::native::TestExactFixtureProfiles();
 	mister::native::TestExtensionsAndRecordAuthorityAreExact();
+	mister::native::TestFixtureProtocolProfilesRequireExactHandshakeRecords();
 	return 0;
 }

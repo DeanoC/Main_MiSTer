@@ -92,7 +92,8 @@ public:
 		  activation_delay_event_(Event::preflight), activation_delay_ms_(0),
 		  expected_deadline_ms_(0), saw_wrong_deadline_(false),
 		  content_saw_live_generation_(false), failure_after_acquire_(true),
-		  captured_valid_{false, false}, captured_(), neutral_()
+		  captured_valid_{false, false}, captured_(), neutral_(),
+		  protocol_profile_(nullptr), protocol_content_(nullptr)
 	{
 	}
 
@@ -152,9 +153,14 @@ public:
 		return AcquireHardware(Event::enable_bridges, lease);
 	}
 
-	NativeAcquisitionOutcome StartCoreProtocol(const OperationLease &lease) override
+	NativeCoreProtocolOutcome StartCoreProtocol(const OperationLease &lease,
+		const NativeCoreProfile &profile, NativeContentResource &content) override
 	{
-		return AcquireHardware(Event::start_core_protocol, lease);
+		protocol_profile_ = &profile;
+		protocol_content_ = &content;
+		const NativeAcquisitionOutcome outcome =
+			AcquireHardware(Event::start_core_protocol, lease);
+		return {outcome.result, outcome.acquired, false};
 	}
 
 	NativeAcquisitionOutcome StartVideo(const OperationLease &lease) override
@@ -242,6 +248,32 @@ public:
 	{
 		return RunBounded(Event::close_content, absolute_deadline_ms);
 	}
+	Result DescribeRetained(NativeRetainedContentDescription *description,
+		uint64_t absolute_deadline_ms) override
+	{
+		if (description == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+		const Result result = RunBounded(Event::retain_content,
+			absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		description->size = 1;
+		description->extension_length = 3;
+		description->extension[0] = 's';
+		description->extension[1] = 'f';
+		description->extension[2] = 'c';
+		description->extension[3] = '\0';
+		return MISTER_RESULT_OK;
+	}
+	Result ReadRetainedAt(uint64_t offset, void *bytes, size_t count,
+		uint64_t absolute_deadline_ms) override
+	{
+		if (bytes == nullptr || offset != 0 || count != 1)
+			return MISTER_RESULT_INVALID_ARGUMENT;
+		const Result result = RunBounded(Event::retain_content,
+			absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		static_cast<uint8_t *>(bytes)[0] = 0;
+		return MISTER_RESULT_OK;
+	}
 	void CloseContentForProcessExit() override { Record(Event::destruct_content); }
 	NativeAcquisitionOutcome OpenInputDescriptors(
 		const OperationLease &lease) override
@@ -314,6 +346,8 @@ public:
 	bool captured_valid_[kNativePlayerCount];
 	NativeDigitalNeutral captured_[kNativePlayerCount];
 	std::vector<NativeDigitalNeutral> neutral_;
+	const NativeCoreProfile *protocol_profile_;
+	NativeContentResource *protocol_content_;
 
 private:
 	void Record(Event event)
@@ -474,6 +508,30 @@ void TestSuccessfulInitializationRecordsEveryAcquisition()
 		index < sizeof(kActivationEvents) / sizeof(kActivationEvents[0]); ++index) {
 		assert(fixture.resources.Count(kActivationEvents[index]) == 1);
 	}
+}
+
+void TestCoreProtocolReceivesAdmittedProfileAndRetainedContent()
+{
+	Fixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	assert(fixture.resources.protocol_profile_ == &fixture.profile);
+	assert(fixture.resources.protocol_content_ == &fixture.resources);
+}
+
+void TestRetainedContentDescriptionAndReadStayBounded()
+{
+	Fixture fixture(100);
+	NativeRetainedContentDescription description = {};
+	assert(fixture.resources.DescribeRetained(&description, 1000) ==
+		MISTER_RESULT_OK);
+	assert(description.size == 1);
+	assert(description.extension_length == 3);
+	assert(strcmp(description.extension, "sfc") == 0);
+	uint8_t byte = 0xff;
+	assert(fixture.resources.ReadRetainedAt(0, &byte, 1, 1000) ==
+		MISTER_RESULT_OK);
+	assert(byte == 0);
 }
 
 void TestFailureAfterEveryAcquisitionUnwindsWithoutChangingResult()
@@ -857,6 +915,8 @@ int main()
 	mister::native::TestContentIsResolvedBeforeOwnershipAndRetainedOnFirstHardwareFailure();
 	mister::native::TestFirstAcquisitionIsLedgeredBeforeFollowingFailure();
 	mister::native::TestSuccessfulInitializationRecordsEveryAcquisition();
+	mister::native::TestCoreProtocolReceivesAdmittedProfileAndRetainedContent();
+	mister::native::TestRetainedContentDescriptionAndReadStayBounded();
 	mister::native::TestFailureAfterEveryAcquisitionUnwindsWithoutChangingResult();
 	mister::native::TestContentFailureOrOverrunNeverMintsOwnership();
 	mister::native::TestPreownershipContentCloseFailureBlocksReactivationAndRetriesLocally();

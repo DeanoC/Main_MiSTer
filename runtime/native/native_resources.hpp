@@ -22,6 +22,23 @@ struct NativeAcquisitionOutcome {
 	bool acquired;
 };
 
+struct NativeCoreProtocolOutcome {
+	Result result;
+	// True means protocol ownership/mutation exists, including partial state.
+	bool acquired;
+	// A future broker-atomic failure path consumes the active protocol session
+	// before this outcome is returned. The ordinary fixture path remains false.
+	bool broker_failure_completed;
+};
+
+struct NativeRetainedContentDescription {
+	uint64_t size;
+	uint8_t extension_length;
+	char extension[4];
+};
+
+class NativeContentResource;
+
 class NativePreflight {
 public:
 	virtual ~NativePreflight() {}
@@ -36,8 +53,9 @@ public:
 		const OperationLease &lease) = 0;
 	virtual NativeAcquisitionOutcome EnableBridges(
 		const OperationLease &lease) = 0;
-	virtual NativeAcquisitionOutcome StartCoreProtocol(
-		const OperationLease &lease) = 0;
+	virtual NativeCoreProtocolOutcome StartCoreProtocol(
+		const OperationLease &lease, const NativeCoreProfile &profile,
+		NativeContentResource &content) = 0;
 	virtual NativeAcquisitionOutcome StartVideo(
 		const OperationLease &lease) = 0;
 	virtual NativeAcquisitionOutcome StartAudio(
@@ -85,6 +103,10 @@ class NativeContentResource {
 public:
 	virtual ~NativeContentResource() {}
 	virtual NativeAcquisitionOutcome RetainContent(
+		uint64_t absolute_deadline_ms) = 0;
+	virtual Result DescribeRetained(NativeRetainedContentDescription *description,
+		uint64_t absolute_deadline_ms) = 0;
+	virtual Result ReadRetainedAt(uint64_t offset, void *bytes, size_t count,
 		uint64_t absolute_deadline_ms) = 0;
 	virtual Result CloseContent(uint64_t absolute_deadline_ms) = 0;
 	virtual void CloseContentForProcessExit() = 0;

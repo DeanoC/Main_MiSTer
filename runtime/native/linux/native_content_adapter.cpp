@@ -90,6 +90,30 @@ NativeAcquisitionOutcome NativeContentAdapter::RetainContent(
 	return {ToResult(result), content_.owns_descriptors()};
 }
 
+Result NativeContentAdapter::DescribeRetained(
+	NativeRetainedContentDescription *description, uint64_t absolute_deadline_ms)
+{
+	if (description == nullptr || !content_.valid() || authority_.extension == nullptr ||
+		authority_.extension_length == 0 ||
+		authority_.extension_length >= sizeof(description->extension))
+		return MISTER_RESULT_INVALID_STATE;
+	if (filesystem_.NowMs() >= absolute_deadline_ms) return MISTER_RESULT_DEADLINE;
+	description->size = content_.size();
+	description->extension_length =
+		static_cast<uint8_t>(authority_.extension_length);
+	memset(description->extension, 0, sizeof(description->extension));
+	memcpy(description->extension, authority_.extension,
+		authority_.extension_length);
+	return filesystem_.NowMs() < absolute_deadline_ms ? MISTER_RESULT_OK :
+		MISTER_RESULT_DEADLINE;
+}
+
+Result NativeContentAdapter::ReadRetainedAt(uint64_t offset, void *bytes,
+	size_t count, uint64_t absolute_deadline_ms)
+{
+	return ReadAt(offset, bytes, count, absolute_deadline_ms);
+}
+
 Result NativeContentAdapter::ReadAt(uint64_t offset, void *bytes, size_t count,
 	uint64_t absolute_deadline_ms)
 {

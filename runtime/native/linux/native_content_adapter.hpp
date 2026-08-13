@@ -23,6 +23,10 @@ public:
 	Result Configure(const NativeArtifactAuthority &authority);
 	NativeAcquisitionOutcome RetainContent(
 		uint64_t absolute_deadline_ms) override;
+	Result DescribeRetained(NativeRetainedContentDescription *description,
+		uint64_t absolute_deadline_ms) override;
+	Result ReadRetainedAt(uint64_t offset, void *bytes, size_t count,
+		uint64_t absolute_deadline_ms) override;
 	Result ReadAt(uint64_t offset, void *bytes, size_t count,
 		uint64_t absolute_deadline_ms);
 	Result CloseContent(uint64_t absolute_deadline_ms) override;

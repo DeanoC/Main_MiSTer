@@ -164,9 +164,10 @@ Result NativeLifecycle::ActivateLocked(const NativeCoreProfile &profile,
 
 	result = broker_.Begin(generation_, OperationKind::core_protocol,
 		activation_deadline_ms, &lease);
-	outcome = {result, false};
-	if (result == MISTER_RESULT_OK)
-		outcome = resources_.hardware.StartCoreProtocol(*lease);
+	NativeCoreProtocolOutcome protocol_outcome = {result, false, false};
+	if (result == MISTER_RESULT_OK) protocol_outcome =
+		resources_.hardware.StartCoreProtocol(*lease, profile, resources_.content);
+	outcome = {protocol_outcome.result, protocol_outcome.acquired};
 	lease.reset();
 	result = FinishAcquisitionLocked(outcome, MISTER_RESOURCE_CORE_PROTOCOL,
 		nullptr, activation_deadline_ms);

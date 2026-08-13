@@ -36,30 +36,46 @@ class FakeIo final : public NativeHardwareIo {
 public:
 	FakeIo() : ack_index(0), fail_word(false), fail_deselect(false),
 		force_deselect_deadline(false), now(nullptr), words(), events() {}
-	Result Select(const HardwareLeaseView &, uint32_t mask) override
+	NativeSpiMutationResult Select(const HardwareLeaseView &,
+		NativeSpiTarget target) override
 	{
-		events.push_back("select:" + std::to_string(mask));
-		return MISTER_RESULT_OK;
+		events.push_back(target == NativeSpiTarget::user_io ?
+			"select:user_io" : "select:file_io");
+		return {MISTER_RESULT_OK, true, true, true};
 	}
-	Result WriteWord(const HardwareLeaseView &, uint16_t word) override
+	NativeSpiMutationResult WriteWordWithStrobeLow(
+		const HardwareLeaseView &, uint16_t word) override
 	{
 		words.push_back(word);
 		events.push_back("word:" + std::to_string(word));
-		return fail_word ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
+		return fail_word ?
+			NativeSpiMutationResult{MISTER_RESULT_PLATFORM, true, true, false} :
+			NativeSpiMutationResult{MISTER_RESULT_OK, true, true, true};
 	}
-	Result ReadAck(const HardwareLeaseView &, bool *high) override
+	NativeSpiMutationResult SetStrobe(const HardwareLeaseView &, bool high) override
+	{
+		events.push_back(high ? "strobe:high" : "strobe:low");
+		return {MISTER_RESULT_OK, true, true, true};
+	}
+	Result ReadAckSample(const HardwareLeaseView &,
+		NativeSpiAckSample *sample) override
 	{
 		events.push_back("ack");
 		if (ack_index >= ack_values.size()) return MISTER_RESULT_PLATFORM;
-		*high = ack_values[ack_index++];
+		sample->ack_high = ack_values[ack_index++];
+		sample->fault = false;
+		sample->response = 0;
 		return MISTER_RESULT_OK;
 	}
-	Result Deselect(const HardwareLeaseView &, uint32_t mask,
+	NativeSpiMutationResult Deselect(const HardwareLeaseView &, NativeSpiTarget target,
 		uint64_t) override
 	{
-		events.push_back("deselect:" + std::to_string(mask));
+		events.push_back(target == NativeSpiTarget::user_io ?
+			"deselect:user_io" : "deselect:file_io");
 		if (force_deselect_deadline && now != nullptr) *now = 100;
-		return fail_deselect ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
+		return fail_deselect ?
+			NativeSpiMutationResult{MISTER_RESULT_PLATFORM, true, false, false} :
+			NativeSpiMutationResult{MISTER_RESULT_OK, true, true, true};
 	}
 	size_t ack_index;
 	bool fail_word;
@@ -74,7 +90,7 @@ public:
 struct Fixture {
 	Fixture()
 		: clock(10), broker(clock), profile(FixtureNativeCoreProfile("snes")),
-		  generation(0), lease(), io(), bus(clock, io), input(bus)
+		  generation(0), lease(), io(), bus(clock, io), input(bus.input_port())
 	{
 		assert(profile != nullptr);
 		assert(broker.EnterFixtureForTest(*profile, &generation) == MISTER_RESULT_OK);
@@ -161,6 +177,7 @@ void TestUnsupportedInputDoesZeroMmioAndNoLedger()
 {
 	Fixture fixture;
 	SpiReceipt receipt = {};
+	receipt.response_words_observed = 9;
 	const NativeInputKind unsupported[] = {
 		NativeInputKind::keyboard, NativeInputKind::mouse,
 		NativeInputKind::analog, NativeInputKind::rumble,
@@ -189,6 +206,7 @@ void TestUnsupportedInputDoesZeroMmioAndNoLedger()
 		&receipt) == MISTER_RESULT_UNSUPPORTED);
 	assert(fixture.io.events.empty());
 	assert(fixture.input.ledger_size() == 0);
+	assert(receipt.response_words_observed == 0);
 }
 
 void TestPartialFailureRetainsConservativeLedgerAndRetry()
@@ -497,7 +515,7 @@ void TestActiveNonInputLeasesCannotDeliverOrAdvanceInput()
 	SpiReceipt receipt = {};
 	assert(fixture.input.Deliver(fixture.profile, *fixture.lease, accepted,
 		&receipt) == MISTER_RESULT_OK);
-	assert(receipt.mutation_sequence == 4);
+	assert(receipt.mutation_sequence == 8);
 	assert(fixture.input.ledger_size() == 1);
 }
 
@@ -539,7 +557,7 @@ void TestCleanupAcceptsOnlyExactInputOperation()
 	SpiReceipt receipt = {};
 	assert(fixture.input.Deliver(fixture.profile, *input_lease, accepted,
 		&receipt) == MISTER_RESULT_OK);
-	assert(receipt.mutation_sequence == 4);
+	assert(receipt.mutation_sequence == 8);
 	assert(fixture.input.ledger_size() == 1);
 }
 
@@ -551,7 +569,7 @@ void TestRecoveryHardwareLeasesCannotDeliverOrAdvanceInput()
 	assert(profile != nullptr);
 	FakeIo io;
 	NativeSpiBus bus(clock, io);
-	NativeInput input(bus);
+	NativeInput input(bus.input_port());
 	const uint32_t mask = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
 		MISTER_RESOURCE_CORE_PROTOCOL | MISTER_RESOURCE_NATIVE_AUDIO |
 		MISTER_RESOURCE_NATIVE_VIDEO;
@@ -589,7 +607,7 @@ void TestRecoveryHardwareLeasesCannotDeliverOrAdvanceInput()
 	SpiReceipt receipt = {};
 	assert(input.Deliver(profile, *input_lease, accepted, &receipt) ==
 		MISTER_RESULT_OK);
-	assert(receipt.mutation_sequence == 4);
+	assert(receipt.mutation_sequence == 8);
 	assert(input.ledger_size() == 1);
 }
 
@@ -643,7 +661,7 @@ void TestNoopPathsValidateDeadlineBeforeChangingSequence()
 	fixture.io.ack_values = {true, false, true, false};
 	assert(fixture.input.Deliver(fixture.profile, *fixture.lease, replacement,
 		&receipt) == MISTER_RESULT_OK);
-	assert(receipt.mutation_sequence == 8);
+	assert(receipt.mutation_sequence == 16);
 	assert(fixture.input.GetDeliveredInput(0, &delivered));
 	assert(delivered.identity.sequence == 3);
 }
@@ -662,7 +680,7 @@ void TestNoopPathsRejectLeaseAfterBrokerDestruction()
 	FakeIo io;
 	io.ack_values = {true, false, true, false};
 	NativeSpiBus bus(clock, io);
-	NativeInput input(bus);
+	NativeInput input(bus.input_port());
 	SpiReceipt receipt = {};
 	NativeInputEvent initial = EventWithIdentity(
 		NativeInputKind::digital, 0, 0x0001, true, 1);
@@ -701,7 +719,7 @@ void TestNoopPathsRejectAbaStaleLease()
 	FakeIo io;
 	io.ack_values = {true, false, true, false};
 	NativeSpiBus bus(clock, io);
-	NativeInput input(bus);
+	NativeInput input(bus.input_port());
 	SpiReceipt receipt = {};
 	NativeInputEvent initial = EventWithIdentity(
 		NativeInputKind::digital, 0, 0x0001, true, 1);
@@ -750,7 +768,7 @@ void TestDefensiveCommitFailureKeepsReceiptTruthful()
 	assert(receipt.completed_words == 2);
 	assert(receipt.ack_low_observed);
 	assert(receipt.deselected);
-	assert(receipt.mutation_sequence == 4);
+	assert(receipt.mutation_sequence == 8);
 	assert(fixture.input.ledger_size() == 0);
 
 	fixture.io.ack_index = 0;

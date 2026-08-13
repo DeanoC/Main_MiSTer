@@ -53,7 +53,7 @@ struct DeliveredInput {
 
 class NativeInput final {
 public:
-	explicit NativeInput(NativeSpiBus &bus);
+	explicit NativeInput(NativeInputSpiPort &port);
 
 	Result Deliver(const NativeCoreProfile *profile,
 		const OperationLease &lease, const NativeInputEvent &event,
@@ -80,7 +80,7 @@ private:
 	static void CommitReceipt(void *context,
 		const SpiReceipt &receipt) noexcept;
 	void CommitDelivered(const SpiReceipt &receipt) noexcept;
-	NativeSpiBus &bus_;
+	NativeInputSpiPort &port_;
 	const NativeCoreProfile *profile_;
 	DeliveredInput ledger_[kNativePlayerCount];
 	bool ledger_valid_[kNativePlayerCount];

@@ -6,6 +6,7 @@
 
 #include <assert.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <thread>
 #include <string>
@@ -26,6 +27,19 @@ static_assert(!std::is_constructible<SpiReceiptCommitToken, void *,
 	"SPI receipt commit callback constructor must be private");
 
 namespace {
+
+enum class MutationBoundary : uint8_t {
+	select,
+	word,
+	strobe_high,
+	strobe_low,
+	deselect
+};
+
+enum class MutationFailureTiming : uint8_t {
+	before_mutation,
+	after_mutation
+};
 
 class TestClock final : public NativeClock {
 public:
@@ -49,36 +63,65 @@ public:
 		advance_deadline_on_ack(false), advance_after_ack(0), now(nullptr), block_deselect(false),
 		deselect_entered(false), release_deselect(false),
 		force_deselect_deadline(false), deselect_deadline(0), ack_reads(),
-		ack_index(0), words(), events() {}
+		ack_responses(), ack_index(0), mutation_boundary(MutationBoundary::select),
+		mutation_failure(false), mutation_failure_timing(
+			MutationFailureTiming::before_mutation), mutation_failure_consumed(false),
+		force_strobe_low_failure(false), force_strobe_low_failure_timing(
+			MutationFailureTiming::before_mutation),
+		force_strobe_low_not_attempted(false),
+			words(), events() {}
 
-	Result Select(const HardwareLeaseView &, uint32_t mask) override
+	NativeSpiMutationResult Select(const HardwareLeaseView &,
+		NativeSpiTarget target) override
 	{
-		events.push_back("select:" + std::to_string(mask));
-		return fail_select ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
+		events.push_back(target == NativeSpiTarget::user_io ?
+			"select:user_io" : "select:file_io");
+		if (fail_select) return {MISTER_RESULT_PLATFORM, true, false, false};
+		return MutationResult(MutationBoundary::select);
 	}
-	Result WriteWord(const HardwareLeaseView &, uint16_t word) override
+	NativeSpiMutationResult WriteWordWithStrobeLow(
+		const HardwareLeaseView &, uint16_t word) override
 	{
 		words.push_back(word);
 		events.push_back("word:" + std::to_string(word));
 		if (fail_word_at >= 0 &&
 			static_cast<int>(words.size() - 1) == fail_word_at)
-			return MISTER_RESULT_PLATFORM;
-		return MISTER_RESULT_OK;
+			return {MISTER_RESULT_PLATFORM, true, true, false};
+		return MutationResult(MutationBoundary::word);
 	}
-	Result ReadAck(const HardwareLeaseView &, bool *high) override
+	NativeSpiMutationResult SetStrobe(const HardwareLeaseView &, bool high) override
+	{
+		events.push_back(high ? "strobe:high" : "strobe:low");
+		if (!high && force_strobe_low_not_attempted)
+			return {MISTER_RESULT_PLATFORM, false, false, false};
+		if (!high && force_strobe_low_failure)
+			return force_strobe_low_failure_timing ==
+				MutationFailureTiming::after_mutation ?
+				NativeSpiMutationResult{MISTER_RESULT_PLATFORM, true, true, false} :
+				NativeSpiMutationResult{MISTER_RESULT_PLATFORM, true, false, false};
+		return MutationResult(high ? MutationBoundary::strobe_high :
+			MutationBoundary::strobe_low);
+	}
+	Result ReadAckSample(const HardwareLeaseView &,
+		NativeSpiAckSample *sample) override
 	{
 		events.push_back("ack");
 		if (ack_index >= ack_reads.size()) return MISTER_RESULT_PLATFORM;
-		*high = ack_reads[ack_index++];
+		const size_t response_index = ack_index++;
+		sample->ack_high = ack_reads[response_index];
+		sample->fault = false;
+		sample->response = response_index < ack_responses.size() ?
+			ack_responses[response_index] : 0;
 		if (advance_deadline_on_ack && now != nullptr &&
 			(advance_after_ack == 0 || ack_index >= advance_after_ack))
 			*now = 100;
 		return MISTER_RESULT_OK;
 	}
-	Result Deselect(const HardwareLeaseView &, uint32_t mask,
+	NativeSpiMutationResult Deselect(const HardwareLeaseView &, NativeSpiTarget target,
 		uint64_t absolute_deadline_ms) override
 	{
-		events.push_back("deselect:" + std::to_string(mask));
+		events.push_back(target == NativeSpiTarget::user_io ?
+			"deselect:user_io" : "deselect:file_io");
 		deselect_deadline = absolute_deadline_ms;
 		if (block_deselect) {
 			std::unique_lock<std::mutex> lock(block_mutex);
@@ -88,9 +131,10 @@ public:
 		}
 		if (force_deselect_deadline) {
 			if (now != nullptr) *now = absolute_deadline_ms;
-			return MISTER_RESULT_DEADLINE;
+			return {MISTER_RESULT_DEADLINE, true, false, false};
 		}
-		return fail_deselect ? MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
+		if (fail_deselect) return {MISTER_RESULT_PLATFORM, true, false, false};
+		return MutationResult(MutationBoundary::deselect);
 	}
 	void WaitForDeselect()
 	{
@@ -116,12 +160,44 @@ public:
 	bool force_deselect_deadline;
 	uint64_t deselect_deadline;
 	std::vector<bool> ack_reads;
+	std::vector<uint16_t> ack_responses;
 	size_t ack_index;
+	MutationBoundary mutation_boundary;
+	bool mutation_failure;
+	MutationFailureTiming mutation_failure_timing;
+	bool mutation_failure_consumed;
+	bool force_strobe_low_failure;
+	MutationFailureTiming force_strobe_low_failure_timing;
+	bool force_strobe_low_not_attempted;
 	std::vector<uint16_t> words;
 	std::vector<std::string> events;
 	std::mutex block_mutex;
 	std::condition_variable block_condition;
+
+private:
+	NativeSpiMutationResult MutationResult(MutationBoundary boundary)
+	{
+		if (!mutation_failure || mutation_failure_consumed ||
+			mutation_boundary != boundary)
+			return {MISTER_RESULT_OK, true, true, true};
+		mutation_failure_consumed = true;
+		return mutation_failure_timing == MutationFailureTiming::after_mutation ?
+			NativeSpiMutationResult{MISTER_RESULT_PLATFORM, true, true, false} :
+			NativeSpiMutationResult{MISTER_RESULT_PLATFORM, true, false, false};
+	}
 };
+
+Result Exchange(NativeSpiBus &bus, OperationLease &lease,
+	NativeSpiTarget target, const SpiWords &words, SpiReceipt *receipt)
+{
+	return bus.ExchangeForTest(lease, target, words, receipt);
+}
+
+Result Exchange(NativeSpiBus &bus, OperationLease &lease,
+	const SpiWords &words, SpiReceipt *receipt)
+{
+	return Exchange(bus, lease, NativeSpiTarget::user_io, words, receipt);
+}
 
 void Enter(HardwareBroker &broker, TestClock &clock,
 	PlatformGenerationId *generation)
@@ -151,19 +227,24 @@ void TestCompleteTransactionAndReceipt()
 	FakeIo io;
 	NativeSpiBus bus(clock, io);
 	const uint16_t words[] = {0x1234, 0xabcd};
-	SpiTransaction transaction = {
-		0x10, words, 2, AckPolicy::required, 0x10};
+	uint16_t responses[] = {0, 0};
+	const SpiWords transaction = {words, responses, 2, 2};
 	io.ack_reads = {true, false, true, false};
+	io.ack_responses = {0, 0x1111, 0, 0x2222};
 	SpiReceipt receipt = {};
-	assert(bus.Execute(*lease, transaction, &receipt) == MISTER_RESULT_OK);
+	assert(Exchange(bus, *lease, NativeSpiTarget::file_io, transaction,
+		&receipt) == MISTER_RESULT_OK);
 	assert(receipt.result == MISTER_RESULT_OK);
 	assert(receipt.selected);
 	assert(receipt.completed_words == 2);
 	assert(receipt.ack_low_observed);
 	assert(receipt.deselected);
+	assert(receipt.response_words_observed == 2);
+	assert(responses[0] == 0x1111 && responses[1] == 0x2222);
 	assert((io.events == std::vector<std::string>{
-		"select:16", "word:4660", "ack", "ack", "word:43981",
-		"ack", "ack", "deselect:16"}));
+		"select:file_io", "word:4660", "strobe:high", "ack",
+		"strobe:low", "ack", "word:43981", "strobe:high", "ack",
+		"strobe:low", "ack", "deselect:file_io"}));
 }
 
 void TestFailureResidueAndNoOutputWithoutLease()
@@ -177,10 +258,10 @@ void TestFailureResidueAndNoOutputWithoutLease()
 	FakeIo io;
 	NativeSpiBus bus(clock, io);
 	const uint16_t words[] = {1, 2};
-	SpiTransaction transaction = {1, words, 2, AckPolicy::required, 1};
+	const SpiWords transaction = {words, nullptr, 2, 0};
 	io.ack_reads = {true};
 	SpiReceipt receipt = {};
-	assert(bus.Execute(*lease, transaction, &receipt) == MISTER_RESULT_PLATFORM);
+	assert(Exchange(bus, *lease, transaction, &receipt) == MISTER_RESULT_PLATFORM);
 	assert(receipt.selected);
 	assert(receipt.completed_words == 0);
 	assert(!receipt.ack_low_observed);
@@ -192,7 +273,7 @@ void TestFailureResidueAndNoOutputWithoutLease()
 	Enter(nonhardware_broker, clock, &nonhardware_generation);
 	std::unique_ptr<OperationLease> nonhardware_lease = Begin(
 		nonhardware_broker, nonhardware_generation, OperationKind::scheduler);
-	assert(bus.Execute(*nonhardware_lease, transaction, &receipt) != MISTER_RESULT_OK);
+	assert(Exchange(bus, *nonhardware_lease, transaction, &receipt) != MISTER_RESULT_OK);
 	assert(io.events.empty());
 }
 
@@ -209,7 +290,7 @@ void TestEveryBoundaryReportsObservedResidue()
 		FakeIo io;
 		io.now = &clock.now_for_test();
 		NativeSpiBus bus(clock, io);
-		SpiTransaction transaction = {1, words, 2, AckPolicy::required, 1};
+		const SpiWords transaction = {words, nullptr, 2, 0};
 		SpiReceipt receipt = {};
 		if (boundary == 0) io.fail_select = true;
 		if (boundary == 1) io.fail_word_at = 0;
@@ -227,12 +308,13 @@ void TestEveryBoundaryReportsObservedResidue()
 			io.advance_after_ack = 2;
 		}
 		if (boundary == 5) io.force_deselect_deadline = true;
-		const Result result = bus.Execute(*lease, transaction, &receipt);
+		const Result result = Exchange(bus, *lease, transaction, &receipt);
 		assert(result != MISTER_RESULT_OK);
 		if (boundary == 0) {
 			assert(!receipt.selected);
 			assert(receipt.completed_words == 0);
-			assert(!receipt.deselected);
+			assert(receipt.deselected);
+			assert(!receipt.target_may_be_selected);
 		} else {
 			assert(receipt.selected);
 			if (boundary == 2) {
@@ -248,6 +330,168 @@ void TestEveryBoundaryReportsObservedResidue()
 	}
 }
 
+void TestPostMutationFailuresRetainTruthfulResidueAndForceLow()
+{
+	const uint16_t word = 0x0042;
+	const SpiWords transaction = {&word, nullptr, 1, 0};
+	const MutationBoundary boundaries[] = {
+		MutationBoundary::select, MutationBoundary::word,
+		MutationBoundary::strobe_high, MutationBoundary::strobe_low,
+		MutationBoundary::deselect};
+	const MutationFailureTiming timings[] = {
+		MutationFailureTiming::before_mutation,
+		MutationFailureTiming::after_mutation};
+	for (MutationBoundary boundary : boundaries) {
+		for (MutationFailureTiming timing : timings) {
+			TestClock clock(10);
+			HardwareBroker broker(clock);
+			PlatformGenerationId generation = 0;
+			Enter(broker, clock, &generation);
+			std::unique_ptr<OperationLease> lease =
+				Begin(broker, generation, OperationKind::input);
+			FakeIo io;
+			io.mutation_boundary = boundary;
+			io.mutation_failure = true;
+			io.mutation_failure_timing = timing;
+			io.ack_reads = {true, false};
+			NativeSpiBus bus(clock, io);
+			SpiReceipt receipt = {};
+			assert(Exchange(bus, *lease, transaction, &receipt) ==
+				MISTER_RESULT_PLATFORM);
+			assert(receipt.result == MISTER_RESULT_PLATFORM);
+			assert(receipt.select_attempted);
+			assert(receipt.deselect_attempted);
+			if (boundary == MutationBoundary::deselect) {
+				assert(!receipt.deselected);
+				assert(receipt.target_may_be_selected);
+			} else {
+				assert(receipt.deselected);
+				assert(!receipt.target_may_be_selected);
+			}
+			if (boundary == MutationBoundary::select) {
+				assert(!receipt.selected);
+				assert(receipt.target_may_be_selected || receipt.deselected);
+			} else {
+				assert(receipt.selected);
+			}
+			if (boundary == MutationBoundary::strobe_high ||
+				boundary == MutationBoundary::strobe_low) {
+				assert(receipt.strobe_low_observed);
+				assert(!receipt.strobe_may_be_high);
+				assert(std::count(io.events.begin(), io.events.end(),
+					"strobe:low") >= 1);
+			}
+		}
+	}
+}
+
+void TestInitialDataWriteFailureForcesLowBeforeDeselect()
+{
+	const uint16_t word = 0x0042;
+	const SpiWords transaction = {&word, nullptr, 1, 0};
+	const MutationFailureTiming timings[] = {
+		MutationFailureTiming::before_mutation,
+		MutationFailureTiming::after_mutation};
+	for (MutationFailureTiming timing : timings) {
+		TestClock clock(10);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		Enter(broker, clock, &generation);
+		std::unique_ptr<OperationLease> lease =
+			Begin(broker, generation, OperationKind::input);
+		FakeIo io;
+		io.now = &clock.now_for_test();
+		io.mutation_boundary = MutationBoundary::word;
+		io.mutation_failure = true;
+		io.mutation_failure_timing = timing;
+		// Verify the initial write error remains primary even when the
+		// bounded deselect later reports a deadline.
+		io.force_deselect_deadline = true;
+		NativeSpiBus bus(clock, io);
+		SpiReceipt receipt = {};
+		assert(Exchange(bus, *lease, transaction, &receipt) ==
+			MISTER_RESULT_PLATFORM);
+		assert(receipt.result == MISTER_RESULT_PLATFORM);
+		assert(receipt.selected);
+		assert(receipt.completed_words == 0);
+		assert(receipt.strobe_low_observed);
+		assert(!receipt.strobe_may_be_high);
+		assert(receipt.force_strobe_low_attempted);
+		assert(receipt.force_strobe_low_applied);
+		assert(receipt.force_strobe_low_observed);
+		assert(receipt.deselect_attempted);
+		assert(!receipt.deselected);
+		assert(receipt.target_may_be_selected);
+		assert((io.events == std::vector<std::string>{
+			"select:user_io", "word:66", "strobe:low", "deselect:user_io"}));
+		assert(receipt.mutation_sequence ==
+			(timing == MutationFailureTiming::after_mutation ? 3u : 2u));
+	}
+}
+
+void TestInitialDataWriteFailureRetainsUnobservedForceLowResidue()
+{
+	const uint16_t word = 0x0042;
+	const SpiWords transaction = {&word, nullptr, 1, 0};
+	const MutationFailureTiming timings[] = {
+		MutationFailureTiming::before_mutation,
+		MutationFailureTiming::after_mutation};
+	for (MutationFailureTiming timing : timings) {
+		TestClock clock(10);
+		HardwareBroker broker(clock);
+		PlatformGenerationId generation = 0;
+		Enter(broker, clock, &generation);
+		std::unique_ptr<OperationLease> lease =
+			Begin(broker, generation, OperationKind::input);
+		FakeIo io;
+		io.now = &clock.now_for_test();
+		io.fail_word_at = 0;
+		io.force_strobe_low_failure = true;
+		io.force_strobe_low_failure_timing = timing;
+		io.force_deselect_deadline = true;
+		NativeSpiBus bus(clock, io);
+		SpiReceipt receipt = {};
+		assert(Exchange(bus, *lease, transaction, &receipt) ==
+			MISTER_RESULT_PLATFORM);
+		assert(receipt.result == MISTER_RESULT_PLATFORM);
+		assert(receipt.force_strobe_low_attempted);
+		assert(receipt.force_strobe_low_applied ==
+			(timing == MutationFailureTiming::after_mutation));
+		assert(!receipt.force_strobe_low_observed);
+		assert(receipt.strobe_may_be_high);
+		assert(receipt.deselect_attempted);
+		assert(!receipt.deselected);
+		assert(receipt.target_may_be_selected);
+		assert((io.events == std::vector<std::string>{
+			"select:user_io", "word:66", "strobe:low", "deselect:user_io"}));
+	}
+}
+
+void TestForceLowReceiptRetainsLowLevelAttemptResidue()
+{
+	TestClock clock(10);
+	HardwareBroker broker(clock);
+	PlatformGenerationId generation = 0;
+	Enter(broker, clock, &generation);
+	std::unique_ptr<OperationLease> lease =
+		Begin(broker, generation, OperationKind::input);
+	FakeIo io;
+	io.fail_word_at = 0;
+	io.force_strobe_low_not_attempted = true;
+	NativeSpiBus bus(clock, io);
+	const uint16_t word = 0x0042;
+	const SpiWords transaction = {&word, nullptr, 1, 0};
+	SpiReceipt receipt = {};
+	assert(Exchange(bus, *lease, transaction, &receipt) ==
+		MISTER_RESULT_PLATFORM);
+	assert(!receipt.force_strobe_low_attempted);
+	assert(!receipt.force_strobe_low_applied);
+	assert(!receipt.force_strobe_low_observed);
+	assert(receipt.strobe_may_be_high);
+	assert(receipt.deselect_attempted);
+	assert(receipt.deselected);
+}
+
 void TestDeselectFailureIsDistinctFromDeadline()
 {
 	TestClock clock(10);
@@ -261,9 +505,9 @@ void TestDeselectFailureIsDistinctFromDeadline()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 3;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
-	assert(bus.Execute(*lease, transaction, &receipt) == MISTER_RESULT_PLATFORM);
+	assert(Exchange(bus, *lease, transaction, &receipt) == MISTER_RESULT_PLATFORM);
 	assert(receipt.selected);
 	assert(receipt.completed_words == 1);
 	assert(receipt.ack_low_observed);
@@ -281,9 +525,9 @@ void TestZeroWordTransactionIsRejectedBeforeSelect()
 		Begin(broker, generation, OperationKind::input);
 	FakeIo io;
 	NativeSpiBus bus(clock, io);
-	SpiTransaction empty = {1, nullptr, 0, AckPolicy::required, 1};
+	const SpiWords empty = {nullptr, nullptr, 0, 0};
 	SpiReceipt rejected = {};
-	assert(bus.Execute(*lease, empty, &rejected) ==
+	assert(Exchange(bus, *lease, empty, &rejected) ==
 		MISTER_RESULT_INVALID_ARGUMENT);
 	assert(rejected.result == MISTER_RESULT_INVALID_ARGUMENT);
 	assert(!rejected.selected);
@@ -293,10 +537,10 @@ void TestZeroWordTransactionIsRejectedBeforeSelect()
 
 	const uint16_t word = 0x0102;
 	io.ack_reads = std::vector<bool>{true, false};
-	SpiTransaction probe = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords probe = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
-	assert(bus.Execute(*lease, probe, &receipt) == MISTER_RESULT_OK);
-	assert(receipt.mutation_sequence == 3);
+	assert(Exchange(bus, *lease, probe, &receipt) == MISTER_RESULT_OK);
+	assert(receipt.mutation_sequence == 5);
 }
 
 void TestQuiesceCannotBisectDeselectOrReceipt()
@@ -312,11 +556,11 @@ void TestQuiesceCannotBisectDeselectOrReceipt()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 0x55aa;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
 	Result execute_result = MISTER_RESULT_PLATFORM;
 	std::thread execute_thread([&] {
-		execute_result = bus.Execute(*lease, transaction, &receipt);
+		execute_result = Exchange(bus, *lease, transaction, &receipt);
 	});
 	io.WaitForDeselect();
 	Result quiesce_result = MISTER_RESULT_PLATFORM;
@@ -348,24 +592,25 @@ void TestHardwareFenceSerializesCompetingLeases()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 0x0102;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt first_receipt = {};
 	SpiReceipt second_receipt = {};
 	Result first_result = MISTER_RESULT_PLATFORM;
 	Result second_result = MISTER_RESULT_PLATFORM;
 	std::thread first_thread([&] {
-		first_result = bus.Execute(*first, transaction, &first_receipt);
+		first_result = Exchange(bus, *first, transaction, &first_receipt);
 	});
 	io.WaitForDeselect();
 	std::thread second_thread([&] {
-		second_result = bus.Execute(*second, transaction, &second_receipt);
+		second_result = Exchange(bus, *second, transaction, &second_receipt);
 	});
 	second_thread.join();
 	assert(second_result == MISTER_RESULT_INVALID_STATE);
 	assert(!second_receipt.selected);
 	assert(second_receipt.mutation_sequence == 0);
 	const std::vector<std::string> expected_events = {
-		"select:1", "word:258", "ack", "ack", "deselect:1"};
+		"select:user_io", "word:258", "strobe:high", "ack",
+		"strobe:low", "ack", "deselect:user_io"};
 	assert(io.events == expected_events);
 	io.AllowDeselect();
 	first_thread.join();
@@ -391,9 +636,9 @@ void TestRecoveryEpochDestructionDrainsConservatively()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 1;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
-	assert(bus.Execute(*lease, transaction, &receipt) == MISTER_RESULT_OK);
+	assert(Exchange(bus, *lease, transaction, &receipt) == MISTER_RESULT_OK);
 	assert(receipt.mutation_sequence != 0);
 	lease.reset();
 	std::unique_ptr<RecoveryEpoch> replacement;
@@ -422,10 +667,10 @@ void ExecuteMatrixCell(OperationLease &lease, OperationKind kind,
 	FakeIo io;
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = static_cast<uint16_t>(kind);
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
 	if (IsSpiHardwareKind(kind)) io.ack_reads = std::vector<bool>{true, false};
-	const Result result = bus.Execute(lease, transaction, &receipt);
+	const Result result = Exchange(bus, lease, transaction, &receipt);
 	if (IsSpiHardwareKind(kind)) {
 		assert(result == MISTER_RESULT_OK);
 		assert(receipt.selected);
@@ -456,18 +701,18 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.Begin(generation, OperationKind::core_protocol, 100,
 				&probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 3);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
 			continue;
 		}
 		assert(begin_result == MISTER_RESULT_OK);
 		ExecuteMatrixCell(*lease, kAllKinds[index], clock,
-			IsSpiHardwareKind(kAllKinds[index]) ? 3 : 0);
+			IsSpiHardwareKind(kAllKinds[index]) ? 5 : 0);
 		if (!IsSpiHardwareKind(kAllKinds[index])) {
 			lease.reset();
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.Begin(generation, OperationKind::core_protocol, 100,
 				&probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 3);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
 		}
 	}
 
@@ -493,7 +738,7 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginCleanupOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 3);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
 			continue;
 		}
 		assert(begin_result == MISTER_RESULT_OK);
@@ -501,19 +746,19 @@ void TestExhaustiveAuthorityKindMatrix()
 			// The terminal operation is admitted by cleanup authority but the
 			// Task 1 broker deliberately cannot mint containment evidence yet.
 			ExecuteMatrixCell(*lease, kAllKinds[index], clock,
-				IsSpiHardwareKind(kAllKinds[index]) ? 3 : 0);
+				IsSpiHardwareKind(kAllKinds[index]) ? 5 : 0);
 			assert(broker.ObserveContainment(*epoch, *lease) ==
 				MISTER_RESULT_UNSUPPORTED);
 		} else {
 			ExecuteMatrixCell(*lease, kAllKinds[index], clock,
-				IsSpiHardwareKind(kAllKinds[index]) ? 3 : 0);
+				IsSpiHardwareKind(kAllKinds[index]) ? 5 : 0);
 		}
 		if (!IsSpiHardwareKind(kAllKinds[index])) {
 			lease.reset();
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginCleanupOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 3);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
 		}
 	}
 
@@ -545,18 +790,18 @@ void TestExhaustiveAuthorityKindMatrix()
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginRecoveryOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 3);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
 			continue;
 		}
 		assert(begin_result == MISTER_RESULT_OK);
 		ExecuteMatrixCell(*lease, kAllKinds[index], clock,
-			IsSpiHardwareKind(kAllKinds[index]) ? 3 : 0);
+			IsSpiHardwareKind(kAllKinds[index]) ? 5 : 0);
 		if (!IsSpiHardwareKind(kAllKinds[index])) {
 			lease.reset();
 			std::unique_ptr<OperationLease> probe;
 			assert(broker.BeginRecoveryOperation(*epoch,
 				OperationKind::core_protocol, &probe) == MISTER_RESULT_OK);
-			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 3);
+			ExecuteMatrixCell(*probe, OperationKind::core_protocol, clock, 5);
 		}
 	}
 }
@@ -607,7 +852,7 @@ void TestRecoveryMissingBitsAndTerminalClosure()
 				std::unique_ptr<OperationLease> probe;
 				assert(broker.BeginRecoveryOperation(*epoch,
 					probe_kind, &probe) == MISTER_RESULT_OK);
-				ExecuteMatrixCell(*probe, probe_kind, clock, 3);
+				ExecuteMatrixCell(*probe, probe_kind, clock, 5);
 				continue;
 			}
 			// Only single-resource operations can be admitted by a single-bit
@@ -616,7 +861,7 @@ void TestRecoveryMissingBitsAndTerminalClosure()
 				OperationKind::terminal_fpga_cleanup);
 			assert(result == MISTER_RESULT_OK);
 			ExecuteMatrixCell(*lease, requirements[req].kind, clock,
-			IsSpiHardwareKind(requirements[req].kind) ? 3 : 0);
+			IsSpiHardwareKind(requirements[req].kind) ? 5 : 0);
 		}
 	}
 
@@ -637,7 +882,7 @@ void TestRecoveryMissingBitsAndTerminalClosure()
 		std::unique_ptr<OperationLease> audio;
 		assert(broker.BeginRecoveryOperation(*epoch,
 			OperationKind::audio, &audio) == MISTER_RESULT_OK);
-		ExecuteMatrixCell(*audio, OperationKind::audio, clock, 3);
+		ExecuteMatrixCell(*audio, OperationKind::audio, clock, 5);
 		audio.reset();
 		std::unique_ptr<OperationLease> core;
 		const bool core_present = (missing != MISTER_RESOURCE_CORE_PROTOCOL);
@@ -646,7 +891,7 @@ void TestRecoveryMissingBitsAndTerminalClosure()
 		assert(core_result == (core_present ? MISTER_RESULT_OK :
 			MISTER_RESULT_INVALID_STATE));
 		if (core_present) ExecuteMatrixCell(*core,
-			OperationKind::core_protocol, clock, 6);
+			OperationKind::core_protocol, clock, 10);
 	}
 }
 
@@ -663,11 +908,11 @@ void TestLifecycleTransitionsRejectLiveTransaction()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 7;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
 	Result execute_result = MISTER_RESULT_PLATFORM;
 	std::thread execute_thread([&] {
-		execute_result = bus.Execute(*lease, transaction, &receipt);
+		execute_result = Exchange(bus, *lease, transaction, &receipt);
 	});
 	io.WaitForDeselect();
 	Result quiesce_result = MISTER_RESULT_PLATFORM;
@@ -710,11 +955,11 @@ void TestFailureLatchCannotBisectTransaction()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 9;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
 	Result execute_result = MISTER_RESULT_PLATFORM;
 	std::thread execute_thread([&] {
-		execute_result = bus.Execute(*lease, transaction, &receipt);
+		execute_result = Exchange(bus, *lease, transaction, &receipt);
 	});
 	io.WaitForDeselect();
 	assert(broker.LatchFailure(generation) == MISTER_RESULT_OK);
@@ -744,8 +989,8 @@ void TestAuthorityMatrixAndRecoveryClosure()
 		NativeSpiBus bus(clock, io);
 		const uint16_t word = 1;
 		SpiReceipt receipt = {};
-		SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
-		assert(bus.Execute(*lease, transaction, &receipt) == MISTER_RESULT_INVALID_STATE);
+		const SpiWords transaction = {&word, nullptr, 1, 0};
+		assert(Exchange(bus, *lease, transaction, &receipt) == MISTER_RESULT_INVALID_STATE);
 		assert(io.events.empty());
 	}
 	std::unique_ptr<OperationLease> terminal;
@@ -803,10 +1048,10 @@ void TestDeadlineAndStaleAuthorityProduceNoMmio()
 	FakeIo io;
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 1;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
 	clock.SetNow(100);
-	assert(bus.Execute(*lease, transaction, &receipt) == MISTER_RESULT_DEADLINE);
+	assert(Exchange(bus, *lease, transaction, &receipt) == MISTER_RESULT_DEADLINE);
 	assert(io.events.empty());
 
 	std::unique_ptr<OperationLease> stale;
@@ -817,7 +1062,7 @@ void TestDeadlineAndStaleAuthorityProduceNoMmio()
 		MISTER_RESULT_OK);
 	delete owned;
 	io.events.clear();
-	assert(bus.Execute(*stale, transaction, &receipt) ==
+	assert(Exchange(bus, *stale, transaction, &receipt) ==
 		MISTER_RESULT_INVALID_STATE);
 	assert(io.events.empty());
 }
@@ -835,11 +1080,11 @@ void TestBrokerDestructionDuringDeselectPreservesLastRecordedSequence()
 	io.ack_reads = std::vector<bool>{true, false};
 	NativeSpiBus bus(clock, io);
 	const uint16_t word = 0x55aa;
-	SpiTransaction transaction = {1, &word, 1, AckPolicy::required, 1};
+	const SpiWords transaction = {&word, nullptr, 1, 0};
 	SpiReceipt receipt = {};
 	Result execute_result = MISTER_RESULT_OK;
 	std::thread execute_thread([&] {
-		execute_result = bus.Execute(*lease, transaction, &receipt);
+		execute_result = Exchange(bus, *lease, transaction, &receipt);
 	});
 	io.WaitForDeselect();
 	delete broker;
@@ -852,7 +1097,7 @@ void TestBrokerDestructionDuringDeselectPreservesLastRecordedSequence()
 	assert(receipt.completed_words == 1);
 	assert(receipt.ack_low_observed);
 	assert(receipt.deselected);
-	assert(receipt.mutation_sequence == 2);
+	assert(receipt.mutation_sequence == 4);
 	lease.reset();
 }
 
@@ -867,6 +1112,10 @@ int main()
 	TestCompleteTransactionAndReceipt();
 	TestFailureResidueAndNoOutputWithoutLease();
 	TestEveryBoundaryReportsObservedResidue();
+	TestPostMutationFailuresRetainTruthfulResidueAndForceLow();
+	TestInitialDataWriteFailureForcesLowBeforeDeselect();
+	TestInitialDataWriteFailureRetainsUnobservedForceLowResidue();
+	TestForceLowReceiptRetainsLowLevelAttemptResidue();
 	TestDeselectFailureIsDistinctFromDeadline();
 	TestZeroWordTransactionIsRejectedBeforeSelect();
 	TestQuiesceCannotBisectDeselectOrReceipt();
