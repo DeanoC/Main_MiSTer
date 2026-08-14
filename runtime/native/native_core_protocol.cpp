@@ -145,6 +145,151 @@ void BuildStatusWords(const uint8_t status[16], uint16_t words[9])
 			static_cast<uint16_t>(status[index * 2 + 1]) << 8;
 }
 
+struct PreparedNativeCoreActivation {
+	uint64_t source_size;
+	uint16_t extension_first;
+	uint16_t extension_second;
+	NativeContentTransform transform;
+	NativeSnesContentPlan snes_plan;
+};
+
+MisterResult PrepareNativeCoreActivation(NativeClock &clock,
+	const NativeCoreProfile &profile, NativeCoreProtocolContent &content,
+	uint64_t absolute_deadline_ms, PreparedNativeCoreActivation *prepared)
+{
+	if (prepared == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	if (!BeforeDeadline(clock, absolute_deadline_ms)) return MISTER_RESULT_DEADLINE;
+	NativeCoreProtocolContentDescription description = {};
+	MisterResult result = content.Describe(&description, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	if (description.extension == nullptr || description.size == 0 ||
+		description.size < profile.protocol.minimum_source_bytes ||
+		description.size > profile.protocol.maximum_source_bytes ||
+		!NativeCoreProfileAcceptsExtension(profile, description.extension))
+		return MISTER_RESULT_UNSUPPORTED;
+	uint16_t extension_first = 0;
+	uint16_t extension_second = 0;
+	if (!ExtensionWords(description.extension, &extension_first, &extension_second))
+		return MISTER_RESULT_UNSUPPORTED;
+
+	if (profile.protocol.transform ==
+		NativeContentTransform::snes_header_and_mirror) {
+		SnesContentBridge source(content);
+		result = PrepareNativeSnesContent(source, description.size,
+			profile.protocol.minimum_source_bytes,
+			profile.protocol.maximum_source_bytes,
+			profile.protocol.maximum_wire_bytes, clock, absolute_deadline_ms,
+			&prepared->snes_plan);
+		if (result != MISTER_RESULT_OK) return result;
+	}
+	prepared->source_size = description.size;
+	prepared->extension_first = extension_first;
+	prepared->extension_second = extension_second;
+	prepared->transform = profile.protocol.transform;
+	return MISTER_RESULT_OK;
+}
+
+template <typename ValidateLive, typename Exchange, typename SendStatus,
+	typename CloseSelected, typename TransferRaw, typename TransferSnes>
+struct NativeActivationRecipeOperations {
+	ValidateLive &validate_live;
+	Exchange &exchange;
+	SendStatus &send_status;
+	CloseSelected &close_selected;
+	TransferRaw &transfer_raw;
+	TransferSnes &transfer_snes;
+};
+
+template <typename RecipeOperations>
+MisterResult ExecuteNativeCoreActivation(const NativeCoreProfile &profile,
+	NativeCoreProtocolContent &content,
+	const PreparedNativeCoreActivation &prepared,
+	uint64_t absolute_deadline_ms, RecipeOperations &operations,
+	uint8_t *last_status_sequence)
+{
+	if (last_status_sequence == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	MisterResult result = operations.validate_live(profile,
+		absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	const uint16_t memory_size[] = {0x0031, profile.protocol.sdram_size_word};
+	result = operations.exchange(NativeSpiTarget::user_io, memory_size,
+		2, nullptr, 0, false, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	uint8_t current_status[16] = {};
+	memcpy(current_status, profile.protocol.initial_status,
+		sizeof(current_status));
+	current_status[0] |= 1;
+	result = operations.send_status(current_status, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	const size_t name_length = strlen(profile.core);
+	std::vector<uint16_t> name_words(name_length + 2, 0);
+	std::vector<uint16_t> name_responses(name_length + 2, 0);
+	name_words[0] = 0x0014;
+	result = operations.exchange(NativeSpiTarget::user_io, name_words.data(),
+		name_words.size(), name_responses.data(), name_responses.size(), true, true,
+		absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	for (size_t index = 0; index < name_length; ++index) {
+		if (static_cast<uint8_t>(name_responses[index + 1]) !=
+			static_cast<uint8_t>(profile.core[index])) return MISTER_RESULT_PLATFORM;
+	}
+	const uint8_t delimiter = static_cast<uint8_t>(
+		name_responses[name_length + 1]);
+	if (delimiter != ';' && delimiter != '\0') return MISTER_RESULT_PLATFORM;
+	const uint16_t index_words[] = {0x0055, 0x0000};
+	const uint16_t info_words[] = {0x0056, prepared.extension_first,
+		prepared.extension_second};
+	const uint16_t start_words[] = {0x0053, 0x00ff};
+	result = operations.exchange(NativeSpiTarget::file_io, index_words, 2,
+		nullptr, 0, false, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	result = operations.exchange(NativeSpiTarget::file_io, info_words, 3,
+		nullptr, 0, false, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	result = operations.exchange(NativeSpiTarget::file_io, start_words, 2,
+		nullptr, 0, false, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	if (prepared.transform == NativeContentTransform::snes_header_and_mirror)
+		result = operations.transfer_snes(content, prepared.snes_plan,
+			absolute_deadline_ms);
+	else
+		result = operations.transfer_raw(content, prepared.source_size, profile,
+			absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	uint16_t status_words[] = {0x0029};
+	uint16_t status_response[] = {0};
+	result = operations.exchange(NativeSpiTarget::user_io, status_words, 1,
+		status_response, 1, true, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	const uint8_t sequence = static_cast<uint8_t>(status_response[0]);
+	if ((sequence & 0xf0) == 0xa0 &&
+		(sequence & 0x0f) != *last_status_sequence) {
+		uint16_t words[8] = {};
+		uint16_t received[8] = {};
+		result = operations.exchange(NativeSpiTarget::user_io, words, 8, received,
+			8, false, true, absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		for (size_t index = 0; index < 8; ++index) {
+			current_status[index * 2] = static_cast<uint8_t>(received[index]);
+			current_status[index * 2 + 1] = static_cast<uint8_t>(received[index] >> 8);
+		}
+		current_status[0] &= ~static_cast<uint8_t>(1);
+		result = operations.send_status(current_status, absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+		*last_status_sequence = sequence & 0x0f;
+	} else {
+		result = operations.close_selected(NativeSpiTarget::user_io,
+			absolute_deadline_ms);
+		if (result != MISTER_RESULT_OK) return result;
+	}
+	const uint16_t stop_words[] = {0x0053, 0x0000};
+	result = operations.exchange(NativeSpiTarget::file_io, stop_words, 2,
+		nullptr, 0, false, false, absolute_deadline_ms);
+	if (result != MISTER_RESULT_OK) return result;
+	current_status[0] &= ~static_cast<uint8_t>(1);
+	return operations.send_status(current_status, absolute_deadline_ms);
+}
+
 } // namespace
 
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
@@ -507,107 +652,38 @@ MisterResult NativeCoreProtocol::ActivateFixtureForTest(
 {
 	if (!capabilities_available_) return MISTER_RESULT_PLATFORM;
 	if (!ValidateNativeCoreProfileRecord(profile)) return MISTER_RESULT_UNSUPPORTED;
-	NativeCoreProtocolContentDescription description = {};
-	if (!BeforeDeadline(clock_, absolute_deadline_ms)) return MISTER_RESULT_DEADLINE;
-	MisterResult result = content.Describe(&description, absolute_deadline_ms);
+	PreparedNativeCoreActivation prepared = {};
+	MisterResult result = PrepareNativeCoreActivation(clock_, profile, content,
+		absolute_deadline_ms, &prepared);
 	if (result != MISTER_RESULT_OK) return result;
-	if (description.extension == nullptr || description.size == 0 ||
-		description.size < profile.protocol.minimum_source_bytes ||
-		description.size > profile.protocol.maximum_source_bytes ||
-		!NativeCoreProfileAcceptsExtension(profile, description.extension))
-		return MISTER_RESULT_UNSUPPORTED;
-	NativeSnesContentPlan snes_plan = {};
-	if (profile.protocol.transform ==
-		NativeContentTransform::snes_header_and_mirror) {
-		SnesContentBridge source(content);
-		result = PrepareNativeSnesContent(source, description.size,
-			profile.protocol.minimum_source_bytes,
-			profile.protocol.maximum_source_bytes,
-			profile.protocol.maximum_wire_bytes, clock_, absolute_deadline_ms,
-			&snes_plan);
-		if (result != MISTER_RESULT_OK) return result;
-	}
-	uint16_t extension_first = 0;
-	uint16_t extension_second = 0;
-	if (!ExtensionWords(description.extension, &extension_first, &extension_second))
-		return MISTER_RESULT_UNSUPPORTED;
-	result = ValidateLive(profile, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	const uint16_t memory_size[] = {0x0031, profile.protocol.sdram_size_word};
-	result = Exchange(NativeSpiTarget::user_io, memory_size,
-		2, nullptr, 0, false, false, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	uint8_t current_status[16] = {};
-	memcpy(current_status, profile.protocol.initial_status,
-		sizeof(current_status));
-	current_status[0] |= 1;
-	result = SendStatus(current_status, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	const size_t name_length = strlen(profile.core);
-	std::vector<uint16_t> name_words(name_length + 2, 0);
-	std::vector<uint16_t> name_responses(name_length + 2, 0);
-	name_words[0] = 0x0014;
-	result = Exchange(NativeSpiTarget::user_io, name_words.data(),
-		name_words.size(), name_responses.data(), name_responses.size(), true, true,
-		absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	for (size_t index = 0; index < name_length; ++index) {
-		if (static_cast<uint8_t>(name_responses[index + 1]) !=
-			static_cast<uint8_t>(profile.core[index])) return MISTER_RESULT_PLATFORM;
-	}
-	const uint8_t delimiter = static_cast<uint8_t>(name_responses[name_length + 1]);
-	if (delimiter != ';' && delimiter != '\0') return MISTER_RESULT_PLATFORM;
-	const uint16_t index_words[] = {0x0055, 0x0000};
-	const uint16_t info_words[] = {0x0056, extension_first, extension_second};
-	const uint16_t start_words[] = {0x0053, 0x00ff};
-	result = Exchange(NativeSpiTarget::file_io, index_words, 2,
-		nullptr, 0, false, false, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	result = Exchange(NativeSpiTarget::file_io, info_words, 3,
-		nullptr, 0, false, false, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	result = Exchange(NativeSpiTarget::file_io, start_words, 2,
-		nullptr, 0, false, false, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	if (profile.protocol.transform ==
-		NativeContentTransform::snes_header_and_mirror)
-		result = TransferNativeSnesContent(content, snes_plan,
-			absolute_deadline_ms);
-	else
-		result = TransferRawContent(content, description.size, profile,
-			absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	uint16_t status_words[] = {0x0029};
-	uint16_t status_response[] = {0};
-	result = Exchange(NativeSpiTarget::user_io, status_words, 1,
-		status_response, 1, true, false, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	const uint8_t sequence = static_cast<uint8_t>(status_response[0]);
-	if ((sequence & 0xf0) == 0xa0 && (sequence & 0x0f) != last_status_sequence_) {
-		uint16_t words[8] = {};
-		uint16_t received[8] = {};
-		result = Exchange(NativeSpiTarget::user_io, words, 8, received,
-			8, false, true, absolute_deadline_ms);
-		if (result != MISTER_RESULT_OK) return result;
-		for (size_t index = 0; index < 8; ++index) {
-			current_status[index * 2] = static_cast<uint8_t>(received[index]);
-			current_status[index * 2 + 1] = static_cast<uint8_t>(received[index] >> 8);
-		}
-		current_status[0] &= ~static_cast<uint8_t>(1);
-		result = SendStatus(current_status, absolute_deadline_ms);
-		if (result != MISTER_RESULT_OK) return result;
-		last_status_sequence_ = sequence & 0x0f;
-	} else {
-		result = CloseSelected(NativeSpiTarget::user_io,
-			absolute_deadline_ms);
-		if (result != MISTER_RESULT_OK) return result;
-	}
-	const uint16_t stop_words[] = {0x0053, 0x0000};
-	result = Exchange(NativeSpiTarget::file_io, stop_words, 2,
-		nullptr, 0, false, false, absolute_deadline_ms);
-	if (result != MISTER_RESULT_OK) return result;
-	current_status[0] &= ~static_cast<uint8_t>(1);
-	return SendStatus(current_status, absolute_deadline_ms);
+	auto validate_live = [this](const NativeCoreProfile &exact_profile,
+		uint64_t deadline) { return ValidateLive(exact_profile, deadline); };
+	auto exchange = [this](NativeSpiTarget target, const uint16_t *words,
+		size_t count, uint16_t *responses, size_t response_capacity,
+		bool begins_selected, bool ends_selected, uint64_t deadline) {
+		return Exchange(target, words, count, responses, response_capacity,
+			begins_selected, ends_selected, deadline);
+	};
+	auto send_status = [this](const uint8_t status[16], uint64_t deadline) {
+		return SendStatus(status, deadline);
+	};
+	auto close_selected = [this](NativeSpiTarget target, uint64_t deadline) {
+		return CloseSelected(target, deadline);
+	};
+	auto transfer_raw = [this](NativeCoreProtocolContent &source, uint64_t size,
+		const NativeCoreProfile &exact_profile, uint64_t deadline) {
+		return TransferRawContent(source, size, exact_profile, deadline);
+	};
+	auto transfer_snes = [this](NativeCoreProtocolContent &source,
+		const NativeSnesContentPlan &plan, uint64_t deadline) {
+		return TransferNativeSnesContent(source, plan, deadline);
+	};
+	NativeActivationRecipeOperations<decltype(validate_live), decltype(exchange),
+		decltype(send_status), decltype(close_selected), decltype(transfer_raw),
+		decltype(transfer_snes)> operations = {validate_live, exchange, send_status,
+		close_selected, transfer_raw, transfer_snes};
+	return ExecuteNativeCoreActivation(profile, content, prepared,
+		absolute_deadline_ms, operations, &last_status_sequence_);
 }
 
 NativeCoreProtocolOutcome NativeCoreProtocol::Activate(
@@ -624,25 +700,11 @@ NativeCoreProtocolOutcome NativeCoreProtocol::Activate(
 		outcome.result = MISTER_RESULT_UNSUPPORTED;
 		return outcome;
 	}
-	// Production remains fail-closed. The fixture-only entry point above is
-	// the sole Task 6D.4 route for the bounded SNES transform.
-	if (profile.protocol.transform ==
-		NativeContentTransform::snes_header_and_mirror) {
-		outcome.result = MISTER_RESULT_UNSUPPORTED;
-		return outcome;
-	}
 	RetainedContentBridge retained(content);
-	NativeCoreProtocolContentDescription description = {};
-	outcome.result = retained.Describe(&description,
-		active_lease.absolute_deadline_ms());
+	PreparedNativeCoreActivation prepared = {};
+	outcome.result = PrepareNativeCoreActivation(clock_, profile, retained,
+		active_lease.absolute_deadline_ms(), &prepared);
 	if (outcome.result != MISTER_RESULT_OK) return outcome;
-	if (description.extension == nullptr || description.size == 0 ||
-		description.size < profile.protocol.minimum_source_bytes ||
-		description.size > profile.protocol.maximum_source_bytes ||
-		!NativeCoreProfileAcceptsExtension(profile, description.extension)) {
-		outcome.result = MISTER_RESULT_UNSUPPORTED;
-		return outcome;
-	}
 
 	std::unique_ptr<ActiveCoreProtocolSession> session;
 	outcome.result = active_lease.AcquireActiveCoreProtocolSession(*broker_,
@@ -651,9 +713,39 @@ NativeCoreProtocolOutcome NativeCoreProtocol::Activate(
 	outcome.acquired = true;
 	outcome.result = active_io_->BeginActive(*session,
 		active_lease.absolute_deadline_ms());
-	if (outcome.result == MISTER_RESULT_OK)
-		outcome.result = ActivateFixtureForTest(profile, retained,
-			active_lease.absolute_deadline_ms());
+	if (outcome.result == MISTER_RESULT_OK) {
+		auto validate_live = [this](const NativeCoreProfile &exact_profile,
+			uint64_t deadline) { return ValidateLive(exact_profile, deadline); };
+		auto exchange = [this](NativeSpiTarget target, const uint16_t *words,
+			size_t count, uint16_t *responses, size_t response_capacity,
+			bool begins_selected, bool ends_selected, uint64_t deadline) {
+			return Exchange(target, words, count, responses, response_capacity,
+				begins_selected, ends_selected, deadline);
+		};
+		auto send_status = [this](const uint8_t status[16], uint64_t deadline) {
+			return SendStatus(status, deadline);
+		};
+		auto close_selected = [this](NativeSpiTarget target, uint64_t deadline) {
+			return CloseSelected(target, deadline);
+		};
+		auto transfer_raw = [this](NativeCoreProtocolContent &source,
+			uint64_t size, const NativeCoreProfile &exact_profile,
+			uint64_t deadline) {
+			return TransferRawContent(source, size, exact_profile, deadline);
+		};
+		auto transfer_snes = [this](NativeCoreProtocolContent &source,
+			const NativeSnesContentPlan &plan, uint64_t deadline) {
+			return TransferNativeSnesContent(source, plan, deadline);
+		};
+		NativeActivationRecipeOperations<decltype(validate_live),
+			decltype(exchange), decltype(send_status), decltype(close_selected),
+			decltype(transfer_raw), decltype(transfer_snes)> operations = {
+			validate_live, exchange, send_status, close_selected, transfer_raw,
+			transfer_snes};
+		outcome.result = ExecuteNativeCoreActivation(profile, retained, prepared,
+			active_lease.absolute_deadline_ms(), operations,
+			&last_status_sequence_);
+	}
 	if (outcome.result == MISTER_RESULT_OK) {
 		ProtocolMappingReleaseReceipt release = {};
 		outcome.result = active_io_->FinishActive(*session, &release);
