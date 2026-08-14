@@ -274,9 +274,11 @@ class FakeResources final : public NativePreflight,
 public:
 	FakeResources(FakeClock &clock, HardwareBroker &broker)
 		: clock_(clock), broker_(broker),
+		  lifecycle_(nullptr),
 		  peripheral_backend_(PeripheralAuthorityTestPeer::Backend(broker_, this)),
 		  failed_event_(Event::preflight),
-		  fail_enabled_(false),
+		  fail_enabled_(false), secondary_failed_event_(Event::preflight),
+		  secondary_fail_enabled_(false),
 		  activation_delay_event_(Event::preflight), activation_delay_ms_(0),
 		  expected_deadline_ms_(0), saw_wrong_deadline_(false),
 		  content_saw_live_generation_(false), failure_after_acquire_(true),
@@ -287,6 +289,11 @@ public:
 		  expire_checkout_kind_(OperationKind::program_fpga),
 		  expire_checkout_at_ms_(0)
 	{
+	}
+
+	void ObserveLifecycle(NativeLifecycle *lifecycle)
+	{
+		lifecycle_ = lifecycle;
 	}
 
 	void HoldConcurrentProtocolPeer()
@@ -322,9 +329,16 @@ public:
 		failure_after_acquire_ = false;
 	}
 
+	void FailAlso(Event event)
+	{
+		secondary_failed_event_ = event;
+		secondary_fail_enabled_ = true;
+	}
+
 	void ClearFailure()
 	{
 		fail_enabled_ = false;
+		secondary_fail_enabled_ = false;
 		failure_after_acquire_ = true;
 	}
 
@@ -380,7 +394,10 @@ public:
 	NativeAcquisitionOutcome AcquireContainmentMappings(
 		const OperationLease &lease) override
 	{
-		return AcquireHardware(Event::acquire_containment_mappings, lease);
+		const NativeAcquisitionOutcome outcome =
+			AcquireHardware(Event::acquire_containment_mappings, lease);
+		if (outcome.acquired) ++mapping_count_;
+		return outcome;
 	}
 
 	NativeAcquisitionOutcome EnableBridges(const OperationLease &lease) override
@@ -475,6 +492,11 @@ public:
 	NativePeripheralReleaseOutcome StopAudio(
 		std::unique_ptr<CleanupAudioSessionBundle> &&session) override
 	{
+		if (lifecycle_ != nullptr) {
+			audio_cleanup_snapshots.push_back(
+				lifecycle_->cleanup_broker_callback_snapshot_for_test(
+					PeripheralSessionKind::audio));
+		}
 		const NativePeripheralReleaseOutcome outcome =
 			StopPeripheral(Event::stop_audio, std::move(session));
 		ArmCleanupCheckout(OperationKind::audio_video);
@@ -530,9 +552,24 @@ public:
 	{
 		if (!session) return {MISTER_RESULT_INVALID_ARGUMENT, 0, 0, 0, false,
 			false, 0};
+		if (lifecycle_ != nullptr) {
+			coupled_cleanup_snapshots.push_back(
+				lifecycle_->cleanup_broker_callback_snapshot_for_test(
+					PeripheralSessionKind::audio_video));
+		}
+		hardware_events.push_back(Event::stop_audio_video);
+		hardware_deadlines.push_back(PeripheralAuthorityTestPeer::Deadline(*session));
 		const Result primary = Run(Event::stop_audio_video);
 		const uint32_t affected = MISTER_RESOURCE_NATIVE_AUDIO |
 			MISTER_RESOURCE_NATIVE_VIDEO;
+		if (primary != MISTER_RESULT_OK) {
+			// Dropping this exact pre-mutation typed session truthfully leaves it
+			// abandoned and recheckout-safe: no action began, the transaction is
+			// closed, local resources are absent, and closure is known.
+			session.reset();
+			return {primary, affected, 0, 0, true, false,
+				broker_.mutation_sequence_for_test()};
+		}
 		const CoupledCompletionReceipt receipt = {MISTER_RESULT_OK, affected, 0,
 			MISTER_RESOURCE_NATIVE_VIDEO, true, false,
 			broker_.mutation_sequence_for_test(), true, 0xa55a};
@@ -577,7 +614,9 @@ public:
 
 	Result TerminalFpgaCleanup(const OperationLease &lease) override
 	{
-		return RunHardware(Event::terminal_fpga_cleanup, lease);
+		const Result result = RunHardware(Event::terminal_fpga_cleanup, lease);
+		if (result == MISTER_RESULT_OK) mapping_count_ = 0;
+		return result;
 	}
 	void CloseVideoForProcessExit() override { Record(Event::destruct_video); }
 	void CloseAudioForProcessExit() override { Record(Event::destruct_audio); }
@@ -593,21 +632,32 @@ public:
 
 	NativeAcquisitionOutcome StartScheduler(const OperationLease &lease) override
 	{
-		return Acquire(Event::start_scheduler, lease.absolute_deadline_ms());
+		const NativeAcquisitionOutcome outcome =
+			Acquire(Event::start_scheduler, lease.absolute_deadline_ms());
+		if (outcome.acquired) ++worker_count_;
+		return outcome;
 	}
 	Result StopScheduler(const OperationLease &lease) override
 	{
-		return RunBounded(Event::stop_scheduler, lease.absolute_deadline_ms());
+		const Result result = RunBounded(Event::stop_scheduler,
+			lease.absolute_deadline_ms());
+		if (result == MISTER_RESULT_OK && worker_count_ != 0) --worker_count_;
+		return result;
 	}
 	void CloseSchedulerForProcessExit() override { Record(Event::destruct_scheduler); }
 	NativeAcquisitionOutcome StartOffload(const OperationLease &lease) override
 	{
-		return Acquire(Event::start_offload, lease.absolute_deadline_ms());
+		const NativeAcquisitionOutcome outcome =
+			Acquire(Event::start_offload, lease.absolute_deadline_ms());
+		if (outcome.acquired) ++worker_count_;
+		return outcome;
 	}
 	Result RejectAndJoinOffload(const OperationLease &lease) override
 	{
-		return RunBounded(Event::reject_join_offload,
+		const Result result = RunBounded(Event::reject_join_offload,
 			lease.absolute_deadline_ms());
+		if (result == MISTER_RESULT_OK && worker_count_ != 0) --worker_count_;
+		return result;
 	}
 	void CloseOffloadForProcessExit() override { Record(Event::destruct_offload); }
 	NativeSaveOpenOutcome OpenSave(const OperationLease &lease,
@@ -684,13 +734,17 @@ public:
 	NativeAcquisitionOutcome OpenInputDescriptors(
 		const OperationLease &lease) override
 	{
-		return Acquire(Event::open_input_descriptors,
-			lease.absolute_deadline_ms());
+		const NativeAcquisitionOutcome outcome = Acquire(
+			Event::open_input_descriptors, lease.absolute_deadline_ms());
+		if (outcome.acquired) ++descriptor_count_;
+		return outcome;
 	}
 	Result CloseInputDescriptors(const OperationLease &lease) override
 	{
 		const Result result = RunBounded(Event::close_input_descriptors,
 			lease.absolute_deadline_ms());
+		if (result == MISTER_RESULT_OK && descriptor_count_ != 0)
+			--descriptor_count_;
 		ArmCleanupCheckout(OperationKind::video);
 		return result;
 	}
@@ -718,6 +772,10 @@ public:
 		return static_cast<size_t>(std::count(events.begin(), events.end(), event));
 	}
 
+	size_t mapping_count() const { return mapping_count_; }
+	size_t descriptor_count() const { return descriptor_count_; }
+	size_t worker_count() const { return worker_count_; }
+
 	uint64_t LastHardwareDeadline(Event event) const
 	{
 		for (size_t index = hardware_events.size(); index != 0; --index) {
@@ -738,6 +796,7 @@ public:
 
 	FakeClock &clock_;
 	HardwareBroker &broker_;
+	NativeLifecycle *lifecycle_;
 	PeripheralBackendIdentity peripheral_backend_;
 	std::vector<Event> events;
 	std::vector<Event> hardware_events;
@@ -746,6 +805,8 @@ public:
 	std::vector<uint64_t> bounded_deadlines;
 	Event failed_event_;
 	bool fail_enabled_;
+	Event secondary_failed_event_;
+	bool secondary_fail_enabled_;
 	Event activation_delay_event_;
 	uint64_t activation_delay_ms_;
 	uint64_t advance_broker_clock_after_save_cleanup_ms_ = 0;
@@ -769,6 +830,11 @@ public:
 	std::unique_ptr<OperationLease> concurrent_protocol_peer_;
 	OperationKind expire_checkout_kind_;
 	uint64_t expire_checkout_at_ms_;
+	size_t mapping_count_ = 0;
+	size_t descriptor_count_ = 0;
+	size_t worker_count_ = 0;
+	std::vector<NativeCleanupBrokerSnapshot> audio_cleanup_snapshots;
+	std::vector<NativeCleanupBrokerSnapshot> coupled_cleanup_snapshots;
 
 private:
 	void ArmCleanupCheckout(OperationKind kind)
@@ -892,7 +958,8 @@ private:
 	{
 		Record(event);
 		if (event == activation_delay_event_) clock_.Advance(activation_delay_ms_);
-		return fail_enabled_ && event == failed_event_ ?
+		return (fail_enabled_ && event == failed_event_) ||
+			(secondary_fail_enabled_ && event == secondary_failed_event_) ?
 			MISTER_RESULT_PLATFORM : MISTER_RESULT_OK;
 	}
 
@@ -987,7 +1054,11 @@ public:
 	Result ShutdownCoreProtocol(const OperationLease &lease) override
 	{ return delegate_.ShutdownCoreProtocol(lease); }
 	Result TerminalFpgaCleanup(const OperationLease &lease) override
-	{ return containment_.ResetAndContain(lease); }
+	{
+		const Result recorded = delegate_.TerminalFpgaCleanup(lease);
+		return recorded == MISTER_RESULT_OK ? containment_.ResetAndContain(lease) :
+			recorded;
+	}
 	void CloseCoreProtocolForProcessExit() override
 	{ delegate_.CloseCoreProtocolForProcessExit(); }
 	void CloseFpgaMappingsForProcessExit() override
@@ -1035,11 +1106,35 @@ struct Fixture {
 		  lifecycle(clock, broker, set),
 		  profile(*FixtureNativeCoreProfile("snes"))
 	{
+		resources.ObserveLifecycle(&lifecycle);
 	}
 
 	FakeClock clock;
 	HardwareBroker broker;
 	FakeResources resources;
+	NativeResourceSet set;
+	NativeLifecycle lifecycle;
+	const NativeCoreProfile &profile;
+};
+
+struct ContainedFixture {
+	explicit ContainedFixture(uint64_t now_ms)
+		: clock(now_ms), broker(clock), resources(clock, broker), containment_io(),
+		  containment(broker, containment_io), hardware(resources, containment),
+		  set{resources, hardware, resources, resources, resources, resources,
+			resources, resources, resources, resources},
+		  lifecycle(clock, broker, set),
+		  profile(*FixtureNativeCoreProfile("megadrive"))
+	{
+		resources.ObserveLifecycle(&lifecycle);
+	}
+
+	FakeClock clock;
+	HardwareBroker broker;
+	FakeResources resources;
+	LifecycleContainmentIo containment_io;
+	NativeContainment containment;
+	LifecycleHardwareWithContainment hardware;
 	NativeResourceSet set;
 	NativeLifecycle lifecycle;
 	const NativeCoreProfile &profile;
@@ -1805,6 +1900,433 @@ void TestSaveCleanupChecksTheBrokerClockAtLedgerCommit()
 	}
 }
 
+void AssertRetainedSessionLedger(const NativeCleanupBrokerSnapshot &snapshot,
+	PeripheralSessionKind kind, uint64_t epoch)
+{
+	assert(snapshot.lease_identity != 0);
+	assert(snapshot.registration_identity != 0);
+	assert(snapshot.session_identity != 0);
+	assert(snapshot.cleanup_identity == epoch);
+	assert(snapshot.cleanup_non_fpga_deadline_ms == 2100);
+	assert(snapshot.cleanup_fpga_deadline_ms == 5100);
+	assert(snapshot.session_kind == kind);
+	assert(snapshot.session_action == PeripheralSessionAction::none);
+	assert(snapshot.action_word_count == 0);
+	assert(snapshot.action_next_word_index == 0);
+	assert(snapshot.action_transaction_closed);
+	assert(!snapshot.action_progress_unknown);
+	assert(snapshot.recheckout_allowed);
+	assert(snapshot.backend_matches_expected);
+	assert(snapshot.session_initial_mutation_sequence ==
+		snapshot.session_last_mutation_sequence);
+	assert(snapshot.session_last_mutation_sequence ==
+		snapshot.broker_mutation_sequence);
+	assert(snapshot.active_lease_count == 1);
+	assert(snapshot.terminal_lease_count == 0);
+	assert(snapshot.cleanup_registered);
+	assert(snapshot.hardware_transaction_active);
+}
+
+void AssertSuspendedSession(const NativeCleanupBrokerSnapshot &snapshot,
+	PeripheralSessionKind kind, uint64_t epoch)
+{
+	AssertRetainedSessionLedger(snapshot, kind, epoch);
+	assert(snapshot.session_phase == PeripheralSessionPhase::abandoned);
+	assert(snapshot.session_effective_deadline_ms == 0);
+	assert(snapshot.invocation_identity == 0);
+	assert(snapshot.invocation_callback_deadline_ms == 0);
+	assert(!snapshot.invocation_registered);
+	assert(!snapshot.invocation_outcome_missing);
+	assert(snapshot.registration_is_suspended);
+	assert(!snapshot.registration_is_invoked);
+}
+
+void AssertReboundSession(const NativeCleanupBrokerSnapshot &snapshot,
+	const NativeCleanupBrokerSnapshot &suspended,
+	PeripheralSessionKind kind, uint64_t epoch, uint64_t callback_deadline_ms)
+{
+	AssertRetainedSessionLedger(snapshot, kind, epoch);
+	assert(snapshot.lease_identity == suspended.lease_identity);
+	assert(snapshot.registration_identity == suspended.registration_identity);
+	assert(snapshot.session_identity == suspended.session_identity);
+	assert(snapshot.session_phase == PeripheralSessionPhase::live);
+	assert(snapshot.session_effective_deadline_ms == callback_deadline_ms);
+	assert(snapshot.invocation_identity != 0);
+	assert(snapshot.invocation_callback_deadline_ms == callback_deadline_ms);
+	assert(snapshot.invocation_registered);
+	assert(!snapshot.invocation_outcome_missing);
+	assert(!snapshot.registration_is_suspended);
+	assert(snapshot.registration_is_invoked);
+	assert(snapshot.broker_mutation_sequence ==
+		suspended.broker_mutation_sequence);
+}
+
+void TestRetainedCoupledCleanupSkipsCompletedVideoAndAudioPrefixes()
+{
+	ContainedFixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	fixture.resources.Fail(Event::stop_audio_video);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) ==
+		MISTER_RESULT_CLEANUP_INCOMPLETE);
+
+	const PlatformGenerationId generation = fixture.lifecycle.generation();
+	const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
+	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+	const NativeResourceLedger retained = fixture.lifecycle.ledger();
+	assert(generation != 0 && epoch != 0);
+	assert(retained.resource_flags == 0xbfu);
+	assert(retained.video_shutdown_complete);
+	assert(retained.audio_shutdown_complete);
+	assert(retained.coupled_audio_video_active);
+	assert(!retained.scheduler && !retained.offload &&
+		!retained.input_descriptors);
+	assert(fixture.resources.Count(Event::stop_video) == 1);
+	assert(fixture.resources.Count(Event::stop_audio) == 1);
+	assert(fixture.resources.Count(Event::stop_audio_video) == 1);
+	assert(fixture.resources.Count(Event::close_content) == 0);
+	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 0);
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
+	assert(fixture.resources.coupled_cleanup_snapshots.size() == 1);
+	const NativeCleanupBrokerSnapshot first_callback =
+		fixture.resources.coupled_cleanup_snapshots[0];
+	const NativeCleanupBrokerSnapshot suspended =
+		fixture.lifecycle.cleanup_broker_snapshot_for_test(
+			PeripheralSessionKind::audio_video);
+	AssertRetainedSessionLedger(first_callback,
+		PeripheralSessionKind::audio_video, epoch);
+	assert(first_callback.session_phase == PeripheralSessionPhase::live);
+	assert(first_callback.session_effective_deadline_ms == 2100);
+	assert(first_callback.invocation_registered);
+	assert(first_callback.registration_is_invoked);
+	assert(!first_callback.registration_is_suspended);
+	AssertSuspendedSession(suspended, PeripheralSessionKind::audio_video, epoch);
+	assert(first_callback.lease_identity == suspended.lease_identity);
+	assert(first_callback.registration_identity == suspended.registration_identity);
+	assert(first_callback.session_identity == suspended.session_identity);
+	assert(first_callback.broker_mutation_sequence ==
+		suspended.broker_mutation_sequence);
+
+	fixture.resources.ClearFailure();
+	fixture.clock.SetNow(200);
+	const size_t retry_start = fixture.resources.events.size();
+	const Result retry = fixture.lifecycle.Stop(1000);
+	assert(retry == MISTER_RESULT_OK);
+	assert(retry_start < fixture.resources.events.size());
+	assert(fixture.resources.events[retry_start] == Event::stop_audio_video);
+	assert(fixture.resources.Count(Event::stop_video) == 1);
+	assert(fixture.resources.Count(Event::stop_audio) == 1);
+	assert(fixture.resources.Count(Event::stop_audio_video) == 2);
+	assert(fixture.resources.coupled_cleanup_snapshots.size() == 2);
+	AssertReboundSession(fixture.resources.coupled_cleanup_snapshots[1], suspended,
+		PeripheralSessionKind::audio_video, epoch, 1000);
+	assert(fixture.resources.LastHardwareDeadline(Event::stop_audio_video) ==
+		1000);
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
+	assert(fixture.lifecycle.state() == NativeLifecycleState::idle);
+	assert(fixture.lifecycle.generation() == 0);
+	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
+	assert(fixture.lifecycle.ledger().resource_flags == 0);
+	assert(!fixture.lifecycle.ledger().video_shutdown_complete);
+	assert(!fixture.lifecycle.ledger().audio_shutdown_complete);
+	assert(timing.non_fpga_deadline_ms == 2100);
+	assert(timing.fpga_deadline_ms == 5100);
+}
+
+void TestRetainedAudioCleanupSkipsCompletedVideoPrefix()
+{
+	ContainedFixture fixture(100);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_OK);
+	fixture.resources.Fail(Event::stop_audio);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) ==
+		MISTER_RESULT_CLEANUP_INCOMPLETE);
+
+	const PlatformGenerationId generation = fixture.lifecycle.generation();
+	const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
+	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+	const NativeResourceLedger retained = fixture.lifecycle.ledger();
+	assert(generation != 0 && epoch != 0);
+	assert(retained.video_shutdown_complete);
+	assert(!retained.audio_shutdown_complete);
+	assert(retained.coupled_audio_video_active);
+	assert(fixture.resources.Count(Event::stop_video) == 1);
+	assert(fixture.resources.Count(Event::stop_audio) == 1);
+	assert(fixture.resources.Count(Event::stop_audio_video) == 0);
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
+	assert(fixture.resources.audio_cleanup_snapshots.size() == 1);
+	const NativeCleanupBrokerSnapshot first_callback =
+		fixture.resources.audio_cleanup_snapshots[0];
+	const NativeCleanupBrokerSnapshot suspended =
+		fixture.lifecycle.cleanup_broker_snapshot_for_test(
+			PeripheralSessionKind::audio);
+	AssertRetainedSessionLedger(first_callback, PeripheralSessionKind::audio,
+		epoch);
+	assert(first_callback.session_phase == PeripheralSessionPhase::live);
+	assert(first_callback.session_effective_deadline_ms == 2100);
+	assert(first_callback.invocation_registered);
+	assert(first_callback.registration_is_invoked);
+	assert(!first_callback.registration_is_suspended);
+	AssertSuspendedSession(suspended, PeripheralSessionKind::audio, epoch);
+	assert(first_callback.lease_identity == suspended.lease_identity);
+	assert(first_callback.registration_identity == suspended.registration_identity);
+	assert(first_callback.session_identity == suspended.session_identity);
+
+	fixture.resources.ClearFailure();
+	fixture.clock.SetNow(200);
+	const size_t retry_start = fixture.resources.events.size();
+	assert(fixture.lifecycle.Stop(1000) == MISTER_RESULT_OK);
+	assert(retry_start < fixture.resources.events.size());
+	assert(fixture.resources.events[retry_start] == Event::stop_audio);
+	assert(fixture.resources.Count(Event::stop_video) == 1);
+	assert(fixture.resources.Count(Event::stop_audio) == 2);
+	assert(fixture.resources.audio_cleanup_snapshots.size() == 2);
+	AssertReboundSession(fixture.resources.audio_cleanup_snapshots[1], suspended,
+		PeripheralSessionKind::audio, epoch, 1000);
+	assert(fixture.resources.Count(Event::stop_audio_video) == 1);
+	assert(fixture.resources.LastHardwareDeadline(Event::stop_audio) == 1000);
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
+	assert(fixture.lifecycle.state() == NativeLifecycleState::idle);
+	assert(fixture.lifecycle.generation() == 0);
+	assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
+	assert(fixture.lifecycle.ledger().resource_flags == 0);
+	assert(timing.non_fpga_deadline_ms == 2100);
+	assert(timing.fpga_deadline_ms == 5100);
+}
+
+void TestRetainedAudioVideoCleanupRebindsExactDeadlineBoundaries()
+{
+	struct Boundary {
+		uint64_t now_ms;
+		uint64_t callback_deadline_ms;
+		bool resumes;
+		uint64_t effective_deadline_ms;
+	};
+	const Boundary boundaries[] = {
+		{999, 1000, true, 1000},
+		{1000, 1000, false, 0},
+		{1001, 1000, false, 0},
+		{2099, UINT64_MAX, true, 2100},
+		{2100, UINT64_MAX, false, 0},
+		{2101, UINT64_MAX, false, 0}
+	};
+	const Event retained_events[] = {Event::stop_audio,
+		Event::stop_audio_video};
+	for (Event retained_event : retained_events) {
+		for (const Boundary &boundary : boundaries) {
+			ContainedFixture fixture(100);
+			assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+				MISTER_RESULT_OK);
+			fixture.resources.Fail(retained_event);
+			assert(fixture.lifecycle.Stop(UINT64_MAX) ==
+				MISTER_RESULT_CLEANUP_INCOMPLETE);
+			fixture.resources.ClearFailure();
+			const uint64_t epoch =
+				fixture.lifecycle.cleanup_epoch_identity_for_test();
+			const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+			const PlatformGenerationId generation = fixture.lifecycle.generation();
+			const size_t retained_count = fixture.resources.Count(retained_event);
+			fixture.clock.SetNow(boundary.now_ms);
+			const Result result = fixture.lifecycle.Stop(
+				boundary.callback_deadline_ms);
+			if (boundary.resumes) {
+				assert(result == MISTER_RESULT_OK);
+				assert(fixture.resources.Count(retained_event) ==
+					retained_count + 1);
+				assert(fixture.resources.LastHardwareDeadline(retained_event) ==
+					boundary.effective_deadline_ms);
+				assert(fixture.lifecycle.state() == NativeLifecycleState::idle);
+				continue;
+			}
+			assert(result == MISTER_RESULT_DEADLINE);
+			assert(fixture.resources.Count(retained_event) == retained_count);
+			assert(fixture.lifecycle.generation() == generation);
+			assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
+			assert(fixture.lifecycle.cleanup_timing().cleanup_start_ms ==
+				timing.cleanup_start_ms);
+			assert(fixture.lifecycle.cleanup_timing().non_fpga_deadline_ms ==
+				timing.non_fpga_deadline_ms);
+			assert(fixture.lifecycle.cleanup_timing().fpga_deadline_ms ==
+				timing.fpga_deadline_ms);
+			assert(fixture.lifecycle.ledger().video_shutdown_complete);
+			assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
+
+			fixture.clock.SetNow(200);
+			assert(fixture.lifecycle.Stop(1000) == MISTER_RESULT_OK);
+			assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
+		}
+	}
+}
+
+void TestActivationUnwindResumesRetainedAudioVideoWithoutPrefixReplay()
+{
+	const Event retained_events[] = {Event::stop_audio,
+		Event::stop_audio_video};
+	for (Event retained_event : retained_events) {
+		ContainedFixture fixture(100);
+		fixture.resources.Fail(Event::start_scheduler);
+		fixture.resources.FailAlso(retained_event);
+		assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+			MISTER_RESULT_PLATFORM);
+		assert(fixture.lifecycle.latched_activation_result() ==
+			MISTER_RESULT_PLATFORM);
+		assert(fixture.lifecycle.state() == NativeLifecycleState::cleanup);
+		assert(fixture.lifecycle.ledger().video_shutdown_complete);
+		assert(fixture.resources.Count(Event::stop_video) == 1);
+		assert(fixture.resources.Count(Event::stop_audio) == 1);
+		assert(fixture.resources.Count(Event::stop_audio_video) ==
+			(retained_event == Event::stop_audio_video ? 1u : 0u));
+		const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
+		const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+
+		fixture.resources.ClearFailure();
+		fixture.clock.SetNow(200);
+		assert(fixture.lifecycle.Stop(1000) == MISTER_RESULT_OK);
+		assert(fixture.resources.Count(Event::stop_video) == 1);
+		assert(fixture.resources.Count(Event::stop_audio) ==
+			(retained_event == Event::stop_audio ? 2u : 1u));
+		assert(fixture.resources.Count(Event::stop_audio_video) ==
+			(retained_event == Event::stop_audio_video ? 2u : 1u));
+		assert(epoch != 0 && timing.cleanup_start_ms == 100);
+		assert(timing.non_fpga_deadline_ms == 2100);
+		assert(timing.fpga_deadline_ms == 5100);
+	}
+}
+
+void TestVideoCompletionFactRequiresSuccessAndResetsAtContainment()
+{
+	ContainedFixture retained(100);
+	assert(retained.lifecycle.ActivateFixtureForTest(retained.profile, 1000) ==
+		MISTER_RESULT_OK);
+	retained.resources.Fail(Event::stop_video);
+	assert(retained.lifecycle.Stop(UINT64_MAX) ==
+		MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(!retained.lifecycle.ledger().video_shutdown_complete);
+	assert(retained.resources.Count(Event::stop_video) == 1);
+
+	retained.resources.ClearFailure();
+	retained.resources.Fail(Event::terminal_fpga_cleanup);
+	retained.clock.SetNow(200);
+	assert(retained.lifecycle.Stop(UINT64_MAX) ==
+		MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(retained.lifecycle.ledger().video_shutdown_complete);
+	assert(retained.resources.Count(Event::stop_video) == 2);
+	retained.resources.ClearFailure();
+	assert(retained.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
+	assert(!retained.lifecycle.ledger().video_shutdown_complete);
+
+	ContainedFixture no_session(100);
+	assert(no_session.lifecycle.ActivateFixtureForTest(no_session.profile, 1000) ==
+		MISTER_RESULT_OK);
+	no_session.resources.ExpireCleanupCheckout(OperationKind::video, 2100);
+	assert(no_session.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
+	assert(!no_session.lifecycle.ledger().video_shutdown_complete);
+	assert(no_session.resources.Count(Event::stop_video) == 0);
+	no_session.clock.SetNow(200);
+	no_session.resources.Fail(Event::terminal_fpga_cleanup);
+	assert(no_session.lifecycle.Stop(UINT64_MAX) ==
+		MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(no_session.lifecycle.ledger().video_shutdown_complete);
+	assert(no_session.resources.Count(Event::stop_video) == 1);
+	no_session.resources.ClearFailure();
+	assert(no_session.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
+
+	ContainedFixture uncoupled(100);
+	uncoupled.resources.FailBeforeAcquisition(Event::start_audio_video);
+	uncoupled.resources.FailAlso(Event::terminal_fpga_cleanup);
+	assert(uncoupled.lifecycle.ActivateFixtureForTest(uncoupled.profile, 1000) ==
+		MISTER_RESULT_PLATFORM);
+	assert(!uncoupled.lifecycle.ledger().coupled_audio_video_active);
+	assert((uncoupled.lifecycle.ledger().resource_flags &
+		MISTER_RESOURCE_NATIVE_VIDEO) == 0);
+	assert(uncoupled.lifecycle.ledger().video_shutdown_complete);
+	assert(uncoupled.resources.Count(Event::stop_audio_video) == 0);
+	uncoupled.resources.ClearFailure();
+	assert(uncoupled.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
+	assert(!uncoupled.lifecycle.ledger().video_shutdown_complete);
+}
+
+void TestTwoHundredLifecycleCyclesReturnToTheEmptyBaseline()
+{
+	ContainedFixture fixture(100);
+	const NativeCleanupBrokerSnapshot baseline =
+		fixture.lifecycle.cleanup_broker_snapshot_for_test(
+			PeripheralSessionKind::audio_video);
+	assert(baseline.lease_identity == 0);
+	assert(baseline.registration_identity == 0);
+	assert(baseline.session_identity == 0);
+	assert(baseline.broker_generation == 0);
+	assert(baseline.active_lease_count == 0);
+	assert(baseline.terminal_lease_count == 0);
+	assert(!baseline.invocation_registered);
+	assert(!baseline.cleanup_registered);
+	assert(!baseline.hardware_transaction_active);
+	assert(baseline.broker_idle);
+	const size_t mapping_baseline = fixture.resources.mapping_count();
+	const size_t descriptor_baseline = fixture.resources.descriptor_count();
+	const size_t worker_baseline = fixture.resources.worker_count();
+	assert(mapping_baseline == 0);
+	assert(descriptor_baseline == 0);
+	assert(worker_baseline == 0);
+	for (size_t cycle = 0; cycle < 200; ++cycle) {
+		fixture.clock.SetNow(100 + cycle * 10);
+		if ((cycle & 1u) != 0) {
+			fixture.resources.Fail(Event::start_scheduler);
+			fixture.resources.FailAlso(Event::stop_audio);
+			assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile,
+				1000 + cycle * 10) == MISTER_RESULT_PLATFORM);
+			fixture.resources.ClearFailure();
+			fixture.clock.SetNow(101 + cycle * 10);
+			assert(fixture.lifecycle.Stop(1000 + cycle * 10) == MISTER_RESULT_OK);
+		} else {
+			assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile,
+				1000 + cycle * 10) == MISTER_RESULT_OK);
+			assert(fixture.lifecycle.Stop(1000 + cycle * 10) == MISTER_RESULT_OK);
+		}
+		assert(fixture.lifecycle.state() == NativeLifecycleState::idle);
+		assert(fixture.lifecycle.generation() == 0);
+		assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == 0);
+		const NativeResourceLedger final_ledger = fixture.lifecycle.ledger();
+		assert(final_ledger.resource_flags == 0);
+		assert(!final_ledger.generation);
+		assert(!final_ledger.containment_mappings);
+		assert(!final_ledger.scheduler);
+		assert(!final_ledger.offload);
+		assert(!final_ledger.input_descriptors);
+		assert(!final_ledger.core_protocol_shutdown_complete);
+		assert(!final_ledger.video_shutdown_complete);
+		assert(!final_ledger.audio_shutdown_complete);
+		assert(!final_ledger.coupled_audio_video_active);
+		assert(!final_ledger.digital_neutral_captured);
+		for (size_t player = 0; player < kNativePlayerCount; ++player) {
+			assert(!final_ledger.digital_neutral_valid[player]);
+			assert(final_ledger.digital_neutral[player].player == 0);
+			assert(final_ledger.digital_neutral[player].words[0] == 0);
+			assert(final_ledger.digital_neutral[player].words[1] == 0);
+		}
+		assert(!fixture.broker.has_live_generation_for_test());
+		const NativeCleanupBrokerSnapshot final =
+			fixture.lifecycle.cleanup_broker_snapshot_for_test(
+				PeripheralSessionKind::audio_video);
+		assert(final.lease_identity == baseline.lease_identity);
+		assert(final.registration_identity == baseline.registration_identity);
+		assert(final.session_identity == baseline.session_identity);
+		assert(final.broker_generation == baseline.broker_generation);
+		assert(final.active_lease_count == baseline.active_lease_count);
+		assert(final.terminal_lease_count == baseline.terminal_lease_count);
+		assert(final.invocation_registered == baseline.invocation_registered);
+		assert(final.cleanup_registered == baseline.cleanup_registered);
+		assert(final.hardware_transaction_active ==
+			baseline.hardware_transaction_active);
+		assert(final.broker_idle == baseline.broker_idle);
+		assert(fixture.resources.mapping_count() == mapping_baseline);
+		assert(fixture.resources.descriptor_count() == descriptor_baseline);
+		assert(fixture.resources.worker_count() == worker_baseline);
+		assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == cycle + 1);
+	}
+	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 200);
+}
+
 void TestNormalStopUsesTheNormativeOrder()
 {
 	Fixture fixture(100);
@@ -2048,6 +2570,12 @@ int main()
 	mister::native::TestTypedCheckoutDeadlineDropsNonresumableRegistration();
 	mister::native::TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline();
 	mister::native::TestSaveCleanupChecksTheBrokerClockAtLedgerCommit();
+	mister::native::TestRetainedAudioCleanupSkipsCompletedVideoPrefix();
+	mister::native::TestRetainedCoupledCleanupSkipsCompletedVideoAndAudioPrefixes();
+	mister::native::TestRetainedAudioVideoCleanupRebindsExactDeadlineBoundaries();
+	mister::native::TestActivationUnwindResumesRetainedAudioVideoWithoutPrefixReplay();
+	mister::native::TestVideoCompletionFactRequiresSuccessAndResetsAtContainment();
+	mister::native::TestTwoHundredLifecycleCyclesReturnToTheEmptyBaseline();
 	mister::native::TestNormalStopUsesTheNormativeOrder();
 	mister::native::TestCleanupFailureRetainsTheFailedResourceLedger();
 	mister::native::TestCleanupSuccessAtDeadlineDoesNotClearTheLedger();

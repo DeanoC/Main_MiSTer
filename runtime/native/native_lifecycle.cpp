@@ -14,7 +14,7 @@ NativeResourceLedger EmptyLedger()
 {
 	const NativeDigitalNeutral empty = {0, {0, 0}};
 	const NativeResourceLedger ledger = {
-		0, false, false, false, false, false, false, false, false, false,
+		0, false, false, false, false, false, false, false, false, false, false,
 		{false, false}, {empty, empty}
 	};
 	return ledger;
@@ -119,6 +119,81 @@ NativeFailureDrainTiming NativeLifecycle::failure_drain_timing_for_test() const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return failure_drain_timing_;
+}
+
+NativeCleanupBrokerSnapshot NativeLifecycle::cleanup_broker_snapshot_for_test(
+	PeripheralSessionKind kind) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return cleanup_broker_callback_snapshot_for_test(kind);
+}
+
+NativeCleanupBrokerSnapshot
+NativeLifecycle::cleanup_broker_callback_snapshot_for_test(
+	PeripheralSessionKind kind) const
+{
+	NativeCleanupBrokerSnapshot snapshot = {};
+	const OperationLease *lease = kind == PeripheralSessionKind::audio ?
+		audio_cleanup_lease_.get() : kind == PeripheralSessionKind::video ?
+		video_cleanup_lease_.get() : coupled_audio_video_cleanup_lease_.get();
+	const PeripheralBackendIdentity expected_backend =
+		kind == PeripheralSessionKind::audio ?
+		resources_.audio.BackendIdentity() :
+		kind == PeripheralSessionKind::video ?
+		resources_.video.BackendIdentity() :
+		resources_.audio_video.BackendIdentity();
+
+	std::lock_guard<std::mutex> broker_lock(broker_.mutex_);
+	const std::shared_ptr<OperationRegistration> invoked =
+		broker_.invocation_registration_.lock();
+	const std::shared_ptr<OperationRegistration> suspended =
+		broker_.suspended_registration_.lock();
+	const std::shared_ptr<PeripheralSessionState> session =
+		broker_.peripheral_session_state_.lock();
+	const std::shared_ptr<OperationRegistration> session_owner = session ?
+		session->owner_registration.lock() : std::shared_ptr<OperationRegistration>();
+	const OperationRegistration *const registration = session_owner ?
+		session_owner.get() : invoked ? invoked.get() : suspended.get();
+
+	snapshot.lease_identity = reinterpret_cast<uintptr_t>(lease);
+	snapshot.registration_identity = reinterpret_cast<uintptr_t>(registration);
+	snapshot.session_identity = reinterpret_cast<uintptr_t>(session.get());
+	snapshot.broker_generation = broker_.generation_;
+	snapshot.cleanup_identity = broker_.cleanup_identity_;
+	snapshot.cleanup_non_fpga_deadline_ms =
+		broker_.cleanup_non_fpga_deadline_ms_;
+	snapshot.cleanup_fpga_deadline_ms = broker_.cleanup_fpga_deadline_ms_;
+	snapshot.invocation_identity = broker_.invocation_identity_;
+	snapshot.invocation_callback_deadline_ms =
+		broker_.invocation_callback_deadline_ms_;
+	snapshot.broker_mutation_sequence = broker_.mutation_sequence_;
+	snapshot.active_lease_count = broker_.active_lease_count_;
+	snapshot.terminal_lease_count = broker_.terminal_lease_count_;
+	snapshot.invocation_registered = broker_.invocation_registered_;
+	snapshot.invocation_outcome_missing = broker_.invocation_outcome_missing_;
+	snapshot.registration_is_suspended = registration != nullptr &&
+		suspended.get() == registration;
+	snapshot.registration_is_invoked = registration != nullptr &&
+		invoked.get() == registration;
+	snapshot.cleanup_registered = broker_.cleanup_registered_;
+	snapshot.hardware_transaction_active = broker_.hardware_transaction_active_;
+	snapshot.broker_idle = broker_.state_ == HardwareBroker::State::idle;
+	if (!session || session->kind != kind) return snapshot;
+
+	snapshot.session_effective_deadline_ms = session->absolute_deadline_ms;
+	snapshot.session_initial_mutation_sequence =
+		session->initial_mutation_sequence;
+	snapshot.session_last_mutation_sequence = session->last_mutation_sequence;
+	snapshot.session_kind = session->kind;
+	snapshot.session_action = session->action;
+	snapshot.session_phase = session->phase.load();
+	snapshot.action_word_count = session->action_word_count;
+	snapshot.action_next_word_index = session->action_next_word_index;
+	snapshot.action_transaction_closed = session->action_transaction_closed;
+	snapshot.action_progress_unknown = session->action_progress_unknown;
+	snapshot.recheckout_allowed = session->recheckout_allowed;
+	snapshot.backend_matches_expected = session->backend.Matches(expected_backend);
+	return snapshot;
 }
 #endif
 
@@ -765,7 +840,8 @@ Result NativeLifecycle::RunCleanupLocked(uint64_t callback_deadline_ms)
 		if (result != MISTER_RESULT_OK) return result;
 		ledger_.input_descriptors = false;
 	}
-	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_VIDEO) != 0) {
+	if ((ledger_.resource_flags & MISTER_RESOURCE_NATIVE_VIDEO) != 0 &&
+		!ledger_.video_shutdown_complete) {
 		result = BeginCleanupOperationLocked(OperationKind::video,
 			&video_cleanup_lease_);
 		if (result != MISTER_RESULT_OK) return result;
@@ -790,6 +866,7 @@ Result NativeLifecycle::RunCleanupLocked(uint64_t callback_deadline_ms)
 			return result;
 		}
 		video_cleanup_lease_.reset();
+		ledger_.video_shutdown_complete = true;
 		if (!ledger_.coupled_audio_video_active)
 			ledger_.resource_flags &= ~MISTER_RESOURCE_NATIVE_VIDEO;
 	}
@@ -926,6 +1003,8 @@ Result NativeLifecycle::RunCleanupLocked(uint64_t callback_deadline_ms)
 	ledger_.resource_flags &= ~(MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
 		MISTER_RESOURCE_CORE_PROTOCOL | MISTER_RESOURCE_CORE_INPUT);
 	ledger_.core_protocol_shutdown_complete = false;
+	ledger_.video_shutdown_complete = false;
+	ledger_.audio_shutdown_complete = false;
 	for (size_t player = 0; player < kNativePlayerCount; ++player)
 		ledger_.digital_neutral_valid[player] = false;
 	state_ = NativeLifecycleState::neutral;

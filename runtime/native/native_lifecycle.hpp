@@ -32,6 +32,10 @@ struct NativeResourceLedger {
 	bool offload;
 	bool input_descriptors;
 	bool core_protocol_shutdown_complete;
+	// Standalone video teardown completed locally through a broker-accepted
+	// typed completion. VIDEO can remain set while coupled A/V or containment
+	// remains.
+	bool video_shutdown_complete;
 	// Mute/close completed locally. This is deliberately distinct from
 	// neutral: AUDIO remains represented by resource_flags until containment.
 	bool audio_shutdown_complete;
@@ -54,6 +58,42 @@ struct NativeFailureDrainTiming {
 	uint64_t drain_deadline_ms;
 };
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+struct NativeCleanupBrokerSnapshot {
+	uintptr_t lease_identity;
+	uintptr_t registration_identity;
+	uintptr_t session_identity;
+	PlatformGenerationId broker_generation;
+	uint64_t cleanup_identity;
+	uint64_t cleanup_non_fpga_deadline_ms;
+	uint64_t cleanup_fpga_deadline_ms;
+	uint64_t invocation_identity;
+	uint64_t invocation_callback_deadline_ms;
+	uint64_t session_effective_deadline_ms;
+	uint64_t session_initial_mutation_sequence;
+	uint64_t session_last_mutation_sequence;
+	uint64_t broker_mutation_sequence;
+	size_t active_lease_count;
+	size_t terminal_lease_count;
+	PeripheralSessionKind session_kind;
+	PeripheralSessionAction session_action;
+	PeripheralSessionPhase session_phase;
+	uint8_t action_word_count;
+	uint8_t action_next_word_index;
+	bool action_transaction_closed;
+	bool action_progress_unknown;
+	bool recheckout_allowed;
+	bool backend_matches_expected;
+	bool invocation_registered;
+	bool invocation_outcome_missing;
+	bool registration_is_suspended;
+	bool registration_is_invoked;
+	bool cleanup_registered;
+	bool hardware_transaction_active;
+	bool broker_idle;
+};
+#endif
+
 class NativeLifecycle final {
 public:
 	NativeLifecycle(NativeClock &clock, HardwareBroker &broker,
@@ -69,6 +109,10 @@ public:
 		uint64_t activation_deadline_ms);
 	uint64_t cleanup_epoch_identity_for_test() const;
 	NativeFailureDrainTiming failure_drain_timing_for_test() const;
+	NativeCleanupBrokerSnapshot cleanup_broker_snapshot_for_test(
+		PeripheralSessionKind kind) const;
+	NativeCleanupBrokerSnapshot cleanup_broker_callback_snapshot_for_test(
+		PeripheralSessionKind kind) const;
 #endif
 	Result Stop(uint64_t callback_deadline_ms);
 
