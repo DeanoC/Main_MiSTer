@@ -84,6 +84,7 @@ class ActiveAudioVideoSession;
 class CleanupAudioVideoSession;
 class RecoveryAudioVideoSession;
 class NativeBridgeActivationAuthority;
+class CleanupInputReplayView;
 class ContainmentResumeKey;
 enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
@@ -160,6 +161,35 @@ private:
 	PlatformGenerationId generation_;
 	const NativeCoreProfile *profile_;
 	uint64_t bridge_mutation_sequence_;
+};
+
+class CleanupInputReplayView final {
+public:
+	~CleanupInputReplayView();
+	CleanupInputReplayView(const CleanupInputReplayView &) = delete;
+	CleanupInputReplayView &operator=(const CleanupInputReplayView &) = delete;
+	CleanupInputReplayView(CleanupInputReplayView &&) = delete;
+	CleanupInputReplayView &operator=(CleanupInputReplayView &&) = delete;
+
+private:
+	friend class HardwareBroker;
+	friend class NativeSpiBus;
+	friend class linux_native::NativeLinuxMmioAdapter;
+	explicit CleanupInputReplayView(
+		const std::shared_ptr<OperationRegistration> &registration,
+		PlatformGenerationId originating_generation, uint8_t player,
+		uint16_t command_word, uint16_t neutral_word);
+	uint64_t RecordMutation();
+	uint64_t CurrentMutationSequence() const;
+	Result ValidateBridgeActivationAuthority(
+		const NativeBridgeActivationAuthority &authority) const;
+	Result AuthorizedWord(uint8_t index, uint16_t *word) const;
+	uint64_t absolute_deadline_ms() const;
+
+	std::shared_ptr<OperationRegistration> registration_;
+	PlatformGenerationId originating_generation_;
+	uint8_t player_;
+	uint16_t words_[2];
 };
 
 class HardwareLeaseView final {
@@ -263,6 +293,9 @@ private:
 	Result AcquireInputHardwareLeaseView(HardwareBroker &owner,
 		const NativeCoreProfile &profile,
 		std::unique_ptr<HardwareLeaseView> *view) const;
+	Result AcquireCleanupInputReplayView(const NativeCoreProfile &profile,
+		uint8_t player, const uint16_t (&words)[2],
+		std::unique_ptr<CleanupInputReplayView> *view) const;
 	Result AcquireActiveCoreProtocolSession(HardwareBroker &owner,
 		const NativeCoreProfile &profile,
 		std::unique_ptr<ActiveCoreProtocolSession> *session) const;
@@ -538,6 +571,7 @@ private:
 	friend class RecoveryEpoch;
 	friend class HardwareLeaseView;
 	friend class ProcessOperationGuard;
+	friend class CleanupInputReplayView;
 	friend class NativeSpiBus;
 	friend class NativeContainment;
 	friend class NativeRecovery;
@@ -563,6 +597,7 @@ private:
 	void ReleaseOperation(OperationRegistration &registration);
 	void UnregisterInvocation(OperationInvocation &invocation);
 	void ReleaseHardwareLeaseView(HardwareLeaseView &view);
+	void ReleaseCleanupInputReplayView(CleanupInputReplayView &view);
 	void ReleaseProcessOperationGuard(ProcessOperationGuard &guard);
 	void UnregisterCleanup(CleanupEpoch &epoch);
 	void UnregisterRecovery(RecoveryEpoch &epoch);
@@ -592,6 +627,10 @@ private:
 		OperationKind required_operation_kind,
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<HardwareLeaseView> *view);
+	Result AcquireCleanupInputReplayViewFor(const OperationLease &lease,
+		const NativeCoreProfile &profile, uint8_t player,
+		const uint16_t (&words)[2],
+		std::unique_ptr<CleanupInputReplayView> *view);
 	Result AcquireActiveCoreProtocolSessionFor(const OperationLease &lease,
 		const NativeCoreProfile &profile,
 		std::unique_ptr<ActiveCoreProtocolSession> *session);
@@ -734,6 +773,11 @@ private:
 		std::unique_ptr<NativeBridgeActivationAuthority> *authority);
 	Result ValidateBridgeActivationAuthority(const HardwareLeaseView &view,
 		const NativeBridgeActivationAuthority &authority);
+	Result ValidateCleanupInputReplayAuthority(
+		const CleanupInputReplayView &view,
+		const NativeBridgeActivationAuthority &authority);
+	uint64_t RecordMutation(const CleanupInputReplayView &view);
+	uint64_t CurrentMutationSequence(const CleanupInputReplayView &view);
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	void SetBridgeMutationSequenceForTest(uint64_t sequence);
 #endif

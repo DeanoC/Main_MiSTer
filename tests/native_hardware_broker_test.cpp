@@ -31,6 +31,13 @@ public:
 		return broker.MintBridgeActivationAuthority(*view, receipt_sequence,
 			authority);
 	}
+	static Result AcquireCleanup(const OperationLease &lease,
+		const NativeCoreProfile &profile, uint8_t player,
+		const uint16_t (&words)[2],
+		std::unique_ptr<CleanupInputReplayView> *view)
+	{
+		return lease.AcquireCleanupInputReplayView(profile, player, words, view);
+	}
 };
 
 namespace {
@@ -1268,6 +1275,35 @@ void TestForeignNullDuplicateAndDestructionRejection()
 	assert(second_epoch.get() != nullptr);
 }
 
+void TestCleanupInputViewRequiresExactCurrentCleanupAndFencesTerminal()
+{
+	FakeClock clock(100);
+	HardwareBroker broker(clock);
+	const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+	PlatformGenerationId generation = 0;
+	std::unique_ptr<CleanupEpoch> epoch;
+	PrepareCleanup(broker, clock, profile, &generation, &epoch);
+	std::unique_ptr<OperationLease> input;
+	assert(broker.BeginCleanupOperation(*epoch, OperationKind::input, &input) ==
+		MISTER_RESULT_OK);
+	const uint16_t exact[2] = {profile.input.player_command[0], 0};
+	const uint16_t altered[2] = {profile.input.player_command[0], 1};
+	std::unique_ptr<CleanupInputReplayView> view;
+	assert(BridgeActivationAuthorityTestPeer::AcquireCleanup(*input, profile, 0,
+		altered, &view) == MISTER_RESULT_UNSUPPORTED);
+	assert(view == nullptr);
+	assert(BridgeActivationAuthorityTestPeer::AcquireCleanup(*input, profile, 0,
+		exact, &view) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> terminal;
+	assert(broker.BeginCleanupOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) ==
+		MISTER_RESULT_INVALID_STATE);
+	view.reset();
+	input.reset();
+	assert(broker.BeginCleanupOperation(*epoch,
+		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
+}
+
 } // namespace
 } // namespace native
 } // namespace mister
@@ -1296,5 +1332,6 @@ int main()
 	mister::native::TestCleanupCannotOvertakeQuiesceReturn();
 	mister::native::TestOwningTokenMayOutliveBrokerSafely();
 	mister::native::TestForeignNullDuplicateAndDestructionRejection();
+	mister::native::TestCleanupInputViewRequiresExactCurrentCleanupAndFencesTerminal();
 	return 0;
 }

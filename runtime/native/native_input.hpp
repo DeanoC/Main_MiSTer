@@ -15,6 +15,20 @@
 namespace mister {
 namespace native {
 
+struct NativeDigitalNeutral;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+class NativeInputTestPeer;
+#endif
+
+struct CleanupInputReplayResidue {
+	bool retained;
+	const NativeCoreProfile *profile;
+	uint8_t player;
+	bool target_may_be_selected;
+	bool strobe_may_be_high;
+	uint64_t last_mutation_sequence;
+};
+
 enum class NativeInputKind : uint8_t {
 	digital,
 	keyboard,
@@ -58,6 +72,9 @@ public:
 	Result Deliver(const NativeCoreProfile *profile,
 		const OperationLease &lease, const NativeInputEvent &event,
 		SpiReceipt *receipt);
+	Result ReplayDigitalNeutral(const NativeCoreProfile *profile,
+		const OperationLease &lease, const NativeDigitalNeutral &neutral,
+		SpiReceipt *receipt);
 
 	size_t ledger_size() const;
 	bool GetDeliveredInput(size_t index, DeliveredInput *snapshot) const;
@@ -69,6 +86,9 @@ public:
 #endif
 
 private:
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	friend class NativeInputTestPeer;
+#endif
 	struct PendingCommit {
 		bool active;
 		uint8_t player;
@@ -76,10 +96,25 @@ private:
 		uint16_t command;
 		InputIdentity identity;
 	};
+	struct PendingCleanupNeutralCommit {
+		bool active;
+		uint8_t player;
+		const NativeCoreProfile *profile;
+		bool ledger_valid;
+		DeliveredInput ledger;
+		bool uncertain;
+		uint16_t uncertain_map;
+		InputIdentity uncertain_identity;
+		uint64_t last_sequence;
+		uint16_t last_map;
+	};
 	static void ClearReceipt(SpiReceipt *receipt);
 	static void CommitReceipt(void *context,
 		const SpiReceipt &receipt) noexcept;
 	void CommitDelivered(const SpiReceipt &receipt) noexcept;
+	static void CommitCleanupReceipt(void *context,
+		const SpiReceipt &receipt) noexcept;
+	void CommitCleanupNeutral(const SpiReceipt &receipt) noexcept;
 	NativeInputSpiPort &port_;
 	const NativeCoreProfile *profile_;
 	DeliveredInput ledger_[kNativePlayerCount];
@@ -90,6 +125,10 @@ private:
 	uint64_t last_sequence_[kNativePlayerCount];
 	uint16_t last_map_[kNativePlayerCount];
 	PendingCommit pending_;
+	PendingCleanupNeutralCommit cleanup_pending_;
+	bool cleanup_neutral_completed_[kNativePlayerCount];
+	const NativeCoreProfile *cleanup_neutral_profile_[kNativePlayerCount];
+	CleanupInputReplayResidue cleanup_residue_[kNativePlayerCount];
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	bool fail_next_commit_for_test_;
 #endif

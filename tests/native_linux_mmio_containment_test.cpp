@@ -57,9 +57,28 @@ int main()
 	mister::native::linux_native::NativeLinuxMmioAdapter adapter;
 	return static_cast<mister::native::NativeHardwareIo *>(&adapter) == nullptr;
 }
+#elif defined(MISTER_NATIVE_CLEANUP_INPUT_VIEW_CONSTRUCT_REACHABILITY_PROBE)
+int main()
+{
+	mister::native::CleanupInputReplayView view;
+	return sizeof(view) == 0;
+}
+#elif defined(MISTER_NATIVE_CLEANUP_INPUT_VIEW_MINT_REACHABILITY_PROBE)
+int main()
+{
+	return sizeof(&mister::native::OperationLease::
+		AcquireCleanupInputReplayView) == 0;
+}
+#elif defined(MISTER_NATIVE_CLEANUP_INPUT_RAW_ROUTE_REACHABILITY_PROBE)
+int main()
+{
+	return sizeof(&mister::native::linux_native::NativeLinuxMmioAdapter::
+		CleanupSelectUserIo) == 0;
+}
 #else
 #include "runtime/native/native_core_profile.hpp"
 #include "runtime/native/native_input.hpp"
+#include "runtime/native/native_resources.hpp"
 #include "runtime/native/native_spi_bus.hpp"
 
 #include <assert.h>
@@ -846,6 +865,25 @@ void TestSixPageProgramBridgeAndTerminalCycle()
 	std::unique_ptr<CleanupEpoch> epoch;
 	assert(broker.BeginCleanup(generation, 3000, 6000, &epoch) ==
 		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> cleanup_input;
+	assert(broker.BeginCleanupOperation(*epoch, OperationKind::input,
+		&cleanup_input) == MISTER_RESULT_OK);
+	const NativeDigitalNeutral captured_neutral = {0, {0x02, 0}};
+	SpiReceipt cleanup_receipt = {};
+	// The deliberately retained selected state is reconciled without starting a
+	// new transaction. A later call performs the exact captured neutral replay.
+	assert(native_input.ReplayDigitalNeutral(FixtureNativeCoreProfile("snes"),
+		*cleanup_input, captured_neutral, &cleanup_receipt) != MISTER_RESULT_OK);
+	assert(!cleanup_receipt.target_may_be_selected &&
+		!cleanup_receipt.strobe_may_be_high);
+	assert(native_input.ReplayDigitalNeutral(FixtureNativeCoreProfile("snes"),
+		*cleanup_input, captured_neutral, &cleanup_receipt) == MISTER_RESULT_OK);
+	assert(cleanup_receipt.completed_words == 2 && cleanup_receipt.deselected);
+	const size_t cleanup_events = operations.events.size();
+	assert(native_input.ReplayDigitalNeutral(FixtureNativeCoreProfile("snes"),
+		*cleanup_input, captured_neutral, &cleanup_receipt) == MISTER_RESULT_OK);
+	assert(operations.events.size() == cleanup_events);
+	cleanup_input.reset();
 	std::unique_ptr<OperationLease> terminal;
 	assert(broker.BeginCleanupOperation(*epoch,
 		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
@@ -895,6 +933,7 @@ struct BridgeBoundaryResult {
 	uint64_t before_sequence;
 	uint64_t after_sequence;
 	std::vector<Event> bridge_events;
+	size_t cleanup_replay_events;
 };
 
 MisterRecoveryObservationV2 Observation();
@@ -971,7 +1010,10 @@ ProgramBoundaryResult RunProgramBoundary(size_t fail_event,
 
 BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 	const char *system = "snes", size_t advance_offset = 0,
-	int input_player = -1, size_t latch_failure_after_input_event = 0)
+	int input_player = -1, size_t latch_failure_after_input_event = 0,
+	bool cleanup_replay = false, bool reconcile_unselected_strobe = false,
+	size_t cleanup_advance_offset = 0, bool cleanup_advance_after = false,
+	bool advance_same_map = false, bool latch_failure_before_cleanup = false)
 {
 	FakeClock clock(1000);
 	HardwareBroker broker(clock);
@@ -1018,11 +1060,14 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 	}
 	if (expire_adapter) operations.now_ms = UINT64_MAX;
 	const NativeBridgeEnableReceipt receipt = containment.EnableBridges(*program);
-	const BridgeBoundaryResult result = {receipt, before,
+	BridgeBoundaryResult result = {receipt, before,
 		broker.mutation_sequence_for_test(),
 		std::vector<Event>(operations.events.begin() + bridge_start,
-			operations.events.end())};
+			operations.events.end()), 0};
 	program.reset();
+	std::unique_ptr<NativeSpiBus> input_bus;
+	std::unique_ptr<NativeInput> native_input;
+	const NativeCoreProfile *input_profile = FixtureNativeCoreProfile(system);
 	if (receipt.result == MISTER_RESULT_OK) {
 		std::unique_ptr<OperationLease> input;
 		assert(broker.Begin(generation, OperationKind::input, UINT64_MAX,
@@ -1033,11 +1078,12 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 		assert(operations.events.size() == before_validation);
 		if (input_player >= 0) {
 			assert(input_player <= 1);
-			const NativeCoreProfile *profile = FixtureNativeCoreProfile(system);
-			assert(profile != nullptr && profile->input.player_command[0] == 0x02 &&
-				profile->input.player_command[1] == 0x03);
-			NativeSpiBus bus(clock, adapter.user_io_only_hardware());
-			NativeInput native_input(bus.input_port());
+			assert(input_profile != nullptr &&
+				input_profile->input.player_command[0] == 0x02 &&
+				input_profile->input.player_command[1] == 0x03);
+			input_bus.reset(new NativeSpiBus(clock,
+				adapter.user_io_only_hardware()));
+			native_input.reset(new NativeInput(input_bus->input_port()));
 			const size_t input_start = operations.events.size();
 			if (latch_failure_after_input_event != 0) {
 				operations.latch_failure_event = operations.event_count +
@@ -1051,7 +1097,7 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 				{static_cast<uint8_t>(input_player), 1}};
 			SpiReceipt delivered = {};
 			const Result delivery_result =
-				native_input.Deliver(profile, *input, press, &delivered);
+				native_input->Deliver(input_profile, *input, press, &delivered);
 			if (latch_failure_after_input_event != 0) {
 				assert(delivery_result == MISTER_RESULT_INVALID_STATE);
 				assert(operations.events.size() == input_start +
@@ -1083,16 +1129,54 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 				0x92300012u, 0x92320012u, 0x92300012u, 0x92200012u
 			};
 			assert(writes == std::vector<uint32_t>(expected, expected + 8));
-			input.reset();
-			assert(broker.Begin(generation, OperationKind::input, UINT64_MAX,
-				&input) == MISTER_RESULT_OK);
-			const NativeInputEvent neutral = {
-				NativeInputKind::digital, static_cast<uint8_t>(input_player),
-				0, false, false, 0,
-				{static_cast<uint8_t>(input_player), 2}};
-			assert(native_input.Deliver(profile, *input, neutral, &delivered) ==
-				MISTER_RESULT_OK);
-			assert(native_input.ledger_size() == 0);
+			if (advance_same_map) {
+				const size_t events_before_same_map = operations.events.size();
+				const uint64_t mutation_before_same_map =
+					broker.mutation_sequence_for_test();
+				const NativeInputEvent newer_same_map = {
+					NativeInputKind::digital, static_cast<uint8_t>(input_player),
+					0x12u, true, false, 0,
+					{static_cast<uint8_t>(input_player), 2}};
+				assert(native_input->Deliver(input_profile, *input, newer_same_map,
+					&delivered) == MISTER_RESULT_OK);
+				assert(delivered.result == MISTER_RESULT_OK && !delivered.selected &&
+					delivered.completed_words == 0 &&
+					!delivered.ack_low_observed &&
+					delivered.response_words_observed == 0 &&
+					delivered.captured_words == 0 &&
+					!delivered.ack_high_observed &&
+					!delivered.select_attempted &&
+					!delivered.deselect_attempted && !delivered.deselected &&
+					!delivered.strobe_low_observed &&
+					!delivered.force_strobe_low_attempted &&
+					!delivered.force_strobe_low_applied &&
+					!delivered.force_strobe_low_observed &&
+					!delivered.target_may_be_selected &&
+					!delivered.strobe_may_be_high &&
+					!delivered.mapping_retained &&
+					delivered.mutation_sequence == 0);
+				assert(operations.events.size() == events_before_same_map &&
+					broker.mutation_sequence_for_test() == mutation_before_same_map);
+				DeliveredInput logical = {};
+				assert(native_input->GetDeliveredInput(0, &logical) &&
+					logical.player == input_player && logical.map == 0x12u &&
+					logical.identity.player == input_player &&
+					logical.identity.sequence == 2);
+			}
+			if (latch_failure_before_cleanup)
+				assert(broker.LatchFailure(generation) == MISTER_RESULT_OK);
+			if (!cleanup_replay) {
+				input.reset();
+				assert(broker.Begin(generation, OperationKind::input, UINT64_MAX,
+					&input) == MISTER_RESULT_OK);
+				const NativeInputEvent neutral = {
+					NativeInputKind::digital, static_cast<uint8_t>(input_player),
+					0, false, false, 0,
+					{static_cast<uint8_t>(input_player), 2}};
+				assert(native_input->Deliver(input_profile, *input, neutral,
+					&delivered) == MISTER_RESULT_OK);
+				assert(native_input->ledger_size() == 0);
+			}
 			}
 		}
 	}
@@ -1103,6 +1187,64 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 	std::unique_ptr<CleanupEpoch> cleanup;
 	assert(broker.BeginCleanup(generation, 3000, 6000, &cleanup) ==
 		MISTER_RESULT_OK);
+	if (cleanup_replay && native_input && input_player >= 0) {
+		std::unique_ptr<OperationLease> cleanup_input;
+		assert(broker.BeginCleanupOperation(*cleanup, OperationKind::input,
+			&cleanup_input) == MISTER_RESULT_OK);
+		const NativeDigitalNeutral neutral = {
+			static_cast<uint8_t>(input_player),
+			{input_profile->input.player_command[input_player], 0}};
+		SpiReceipt neutral_receipt = {};
+		const size_t cleanup_start = operations.events.size();
+		if (reconcile_unselected_strobe) {
+			operations.advance_after_event = operations.event_count + 5;
+			operations.advance_to_ms = 3000;
+			assert(native_input->ReplayDigitalNeutral(input_profile, *cleanup_input,
+				neutral, &neutral_receipt) == MISTER_RESULT_DEADLINE);
+			assert(neutral_receipt.target_may_be_selected &&
+				neutral_receipt.strobe_may_be_high &&
+				native_input->ledger_size() == 1);
+			operations.advance_after_event = 0;
+			operations.now_ms = 1000;
+			operations.core = (operations.core & ~0x00120000u) | 0x00020000u;
+			const size_t prefix_start = operations.events.size();
+			assert(native_input->ReplayDigitalNeutral(input_profile, *cleanup_input,
+				neutral, &neutral_receipt) == MISTER_RESULT_OK);
+			std::vector<uint32_t> prefix_writes;
+			for (size_t index = prefix_start; index != operations.events.size(); ++index) {
+				const Event &event = operations.events[index];
+				if (event.kind == EventKind::write && event.mapping == 1 &&
+					event.offset == 0x10) prefix_writes.push_back(event.value);
+			}
+			assert(prefix_writes.size() >= 2);
+			assert((prefix_writes[0] & 0x00120000u) == 0);
+			assert((prefix_writes[1] & 0x00120000u) == 0x00100000u);
+			assert(neutral_receipt.force_strobe_low_attempted &&
+				neutral_receipt.force_strobe_low_applied &&
+				neutral_receipt.force_strobe_low_observed);
+		} else if (cleanup_advance_offset != 0) {
+			operations.advance_after_event = operations.event_count +
+				cleanup_advance_offset;
+			operations.advance_to_ms = cleanup_advance_after ? 3001 : 3000;
+			assert(native_input->ReplayDigitalNeutral(input_profile, *cleanup_input,
+				neutral, &neutral_receipt) == MISTER_RESULT_DEADLINE);
+			assert(native_input->ledger_size() == 1);
+			operations.advance_after_event = 0;
+			operations.now_ms = 1000;
+			assert(native_input->ReplayDigitalNeutral(input_profile, *cleanup_input,
+				neutral, &neutral_receipt) == MISTER_RESULT_OK);
+		} else {
+		assert(native_input->ReplayDigitalNeutral(input_profile, *cleanup_input,
+			neutral, &neutral_receipt) == MISTER_RESULT_OK);
+		}
+		result.cleanup_replay_events = operations.events.size() - cleanup_start;
+		assert(neutral_receipt.completed_words == 2 &&
+			neutral_receipt.deselected && native_input->ledger_size() == 0);
+		const size_t before_retry = operations.events.size();
+		assert(native_input->ReplayDigitalNeutral(input_profile, *cleanup_input,
+			neutral, &neutral_receipt) == MISTER_RESULT_OK);
+		assert(operations.events.size() == before_retry);
+	}
 	std::unique_ptr<OperationLease> terminal;
 	assert(broker.BeginCleanupOperation(*cleanup,
 		OperationKind::terminal_fpga_cleanup, &terminal) == MISTER_RESULT_OK);
@@ -1113,6 +1255,44 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 	assert(unlink(file.c_str()) == 0 && rmdir(directory.c_str()) == 0 &&
 		rmdir(root.c_str()) == 0);
 	return result;
+}
+
+void TestNewerSameMapNormalAndFailureLatchedCleanupReachTerminal()
+{
+	const char *systems[] = {"snes", "megadrive"};
+	for (const char *system : systems) {
+		for (int player = 0; player != 2; ++player) {
+			for (int failure_latched = 0; failure_latched != 2; ++failure_latched) {
+				const BridgeBoundaryResult result = RunBridgeBoundary(0, false,
+					system, 0, player, 0, true, false, 0, false, true,
+					failure_latched != 0);
+				assert(result.receipt.result == MISTER_RESULT_OK &&
+					result.cleanup_replay_events != 0);
+			}
+		}
+	}
+}
+
+void TestCleanupReadFirstPreservesIndependentLinuxSelectAndStrobeBits()
+{
+	const BridgeBoundaryResult result =
+		RunBridgeBoundary(0, false, "snes", 0, 0, 0, true, true);
+	assert(result.receipt.result == MISTER_RESULT_OK);
+}
+
+void TestCleanupDeadlineEqualityAndAfterEveryLinuxPrimitive()
+{
+	const BridgeBoundaryResult baseline =
+		RunBridgeBoundary(0, false, "snes", 0, 0, 0, true);
+	assert(baseline.cleanup_replay_events != 0);
+	for (size_t offset = 1; offset <= baseline.cleanup_replay_events; ++offset) {
+		const BridgeBoundaryResult equal = RunBridgeBoundary(
+			0, false, "snes", 0, 0, 0, true, false, offset, false);
+		assert(equal.receipt.result == MISTER_RESULT_OK);
+		const BridgeBoundaryResult after = RunBridgeBoundary(
+			0, false, "snes", 0, 0, 0, true, false, offset, true);
+		assert(after.receipt.result == MISTER_RESULT_OK);
+	}
 }
 
 bool PrefixContainsRead(const std::vector<Event> &events, size_t count,
@@ -1255,10 +1435,11 @@ void TestTwoHundredAlternatingConcreteProgramTerminalRecoveryCycles()
 		const char *const system = (cycle & 1) == 0 ? "snes" : "megadrive";
 		const int player = (cycle / 2) & 1;
 		const BridgeBoundaryResult active =
-			RunBridgeBoundary(0, false, system, 0, player);
+			RunBridgeBoundary(0, false, system, 0, player, 0, true);
 		assert(active.receipt.result == MISTER_RESULT_OK &&
 			active.receipt.mutation_applied &&
-			active.after_sequence == active.before_sequence + 1);
+			active.after_sequence == active.before_sequence + 1 &&
+			active.cleanup_replay_events != 0);
 
 		FakeClock clock(1000);
 		HardwareBroker broker(clock);
@@ -2081,6 +2262,9 @@ void RunAllTests()
 	TestProgramFailureAndDeadlineAtEverySemanticPrimitive();
 	TestBridgeAcquiredAndAppliedReceiptsAreDistinctAtEveryPrimitive();
 	TestTwoHundredAlternatingConcreteProgramTerminalRecoveryCycles();
+	TestNewerSameMapNormalAndFailureLatchedCleanupReachTerminal();
+	TestCleanupReadFirstPreservesIndependentLinuxSelectAndStrobeBits();
+	TestCleanupDeadlineEqualityAndAfterEveryLinuxPrimitive();
 	TestEveryPostSelectPrimitiveRevalidatesTheExactInputView();
 	TestPosixVolatileAccessAlignmentAndOverflowChecks();
 	TestManagerResidueIsNeutralizedBeforeMappingRelease();

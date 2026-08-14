@@ -12,6 +12,7 @@ namespace mister {
 namespace native {
 
 class HardwareLeaseView;
+class CleanupInputReplayView;
 
 // The only SPI targets admitted by the target-native runtime. Platform code
 // owns their physical register mapping; no caller can supply a raw bit mask.
@@ -46,6 +47,26 @@ public:
 
 private:
 	friend class NativeSpiBus;
+	virtual MisterResult CleanupValidateDigitalNeutralAuthority(
+		const CleanupInputReplayView &) { return MISTER_RESULT_INVALID_STATE; }
+	virtual MisterResult CleanupObserveDigitalNeutralResidue(
+		const CleanupInputReplayView &, bool *, bool *)
+		{ return MISTER_RESULT_INVALID_STATE; }
+	virtual NativeSpiMutationResult CleanupSelectUserIo(
+		const CleanupInputReplayView &)
+		{ return {MISTER_RESULT_INVALID_STATE, false, false, false}; }
+	virtual NativeSpiMutationResult CleanupWriteDigitalNeutralWord(
+		const CleanupInputReplayView &, uint8_t)
+		{ return {MISTER_RESULT_INVALID_STATE, false, false, false}; }
+	virtual NativeSpiMutationResult CleanupSetStrobe(
+		const CleanupInputReplayView &, bool)
+		{ return {MISTER_RESULT_INVALID_STATE, false, false, false}; }
+	virtual MisterResult CleanupReadAckSample(
+		const CleanupInputReplayView &, NativeSpiAckSample *)
+		{ return MISTER_RESULT_INVALID_STATE; }
+	virtual NativeSpiMutationResult CleanupDeselectUserIo(
+		const CleanupInputReplayView &, uint64_t)
+		{ return {MISTER_RESULT_INVALID_STATE, false, false, false}; }
 	virtual NativeSpiMutationResult Select(const HardwareLeaseView &view,
 		NativeSpiTarget target) = 0;
 	virtual NativeSpiMutationResult WriteWordWithStrobeLow(

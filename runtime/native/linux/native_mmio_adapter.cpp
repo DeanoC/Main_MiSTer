@@ -672,9 +672,15 @@ public:
 		const Result read = ReadRaw(absolute_deadline_ms, Register::core_gpo,
 			kManagerGpo, &current);
 		if (read != MISTER_RESULT_OK) return {read, false, false, false};
-		return MutateInputGpo(absolute_deadline_ms, current, kInputStrobeMask,
+		NativeSpiMutationResult result = MutateInputGpo(absolute_deadline_ms,
+			current, kInputStrobeMask,
 			high ? kInputStrobeMask : 0, kInputOwnedMutationMask,
-			kInputUserSelectMask | (high ? kInputStrobeMask : 0));
+			(current & kInputUserSelectMask) |
+				(high ? kInputStrobeMask : 0));
+		if (result.applied && result.observed)
+			input_target_may_be_selected_ =
+				(current & kInputUserSelectMask) != 0 || high;
+		return result;
 	}
 
 	Result ReadInputAck(uint64_t absolute_deadline_ms,
@@ -689,6 +695,24 @@ public:
 		sample->ack_high = (value & kInputStrobeMask) != 0;
 		sample->fault = (value & kInputFaultMask) != 0;
 		sample->response = static_cast<uint16_t>(value & kInputDataMask);
+		return MISTER_RESULT_OK;
+	}
+
+	Result ObserveInputResidue(uint64_t absolute_deadline_ms,
+		bool *user_io_selected, bool *strobe_high)
+	{
+		if (user_io_selected == nullptr || strobe_high == nullptr)
+			return MISTER_RESULT_INVALID_ARGUMENT;
+		uint32_t current = 0;
+		const Result result = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, &current);
+		if (result != MISTER_RESULT_OK) return result;
+		if ((current & kInputCoreControlMask) != kInputCoreNormal ||
+			(current & kInputFileSelectMask) != 0)
+			return MISTER_RESULT_INVALID_STATE;
+		*user_io_selected = (current & kInputUserSelectMask) != 0;
+		*strobe_high = (current & kInputStrobeMask) != 0;
+		input_target_may_be_selected_ = *user_io_selected || *strobe_high;
 		return MISTER_RESULT_OK;
 	}
 
@@ -1397,6 +1421,75 @@ NativeSpiMutationResult NativeLinuxMmioAdapter::Deselect(
 	return impl_ == nullptr ?
 		NativeSpiMutationResult{MISTER_RESULT_PLATFORM, false, false, false} :
 		impl_->DeselectUserIo(absolute_deadline_ms);
+}
+
+Result NativeLinuxMmioAdapter::CleanupValidateDigitalNeutralAuthority(
+	const CleanupInputReplayView &view)
+{
+	if (impl_ == nullptr || !impl_->BridgeActivationAuthorityLocallyCurrent())
+		return MISTER_RESULT_INVALID_STATE;
+	return view.ValidateBridgeActivationAuthority(
+		impl_->BridgeActivationAuthority());
+}
+
+Result NativeLinuxMmioAdapter::CleanupObserveDigitalNeutralResidue(
+	const CleanupInputReplayView &view, bool *user_io_selected,
+	bool *strobe_high)
+{
+	const Result authority = CleanupValidateDigitalNeutralAuthority(view);
+	if (authority != MISTER_RESULT_OK) return authority;
+	return impl_->ObserveInputResidue(view.absolute_deadline_ms(),
+		user_io_selected, strobe_high);
+}
+
+NativeSpiMutationResult NativeLinuxMmioAdapter::CleanupSelectUserIo(
+	const CleanupInputReplayView &view)
+{
+	const Result authority = CleanupValidateDigitalNeutralAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_->SelectUserIo(view.absolute_deadline_ms());
+}
+
+NativeSpiMutationResult NativeLinuxMmioAdapter::CleanupWriteDigitalNeutralWord(
+	const CleanupInputReplayView &view, uint8_t authorized_word_index)
+{
+	const Result authority = CleanupValidateDigitalNeutralAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	uint16_t word = 0;
+	const Result authorized = view.AuthorizedWord(authorized_word_index, &word);
+	if (authorized != MISTER_RESULT_OK)
+		return {authorized, false, false, false};
+	return impl_->WriteInputWord(view.absolute_deadline_ms(), word);
+}
+
+NativeSpiMutationResult NativeLinuxMmioAdapter::CleanupSetStrobe(
+	const CleanupInputReplayView &view, bool high)
+{
+	const Result authority = CleanupValidateDigitalNeutralAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_->SetInputStrobe(view.absolute_deadline_ms(), high);
+}
+
+Result NativeLinuxMmioAdapter::CleanupReadAckSample(
+	const CleanupInputReplayView &view, NativeSpiAckSample *sample)
+{
+	const Result authority = CleanupValidateDigitalNeutralAuthority(view);
+	if (authority != MISTER_RESULT_OK) return authority;
+	return impl_->ReadInputAck(view.absolute_deadline_ms(), sample);
+}
+
+NativeSpiMutationResult NativeLinuxMmioAdapter::CleanupDeselectUserIo(
+	const CleanupInputReplayView &view, uint64_t absolute_deadline_ms)
+{
+	if (absolute_deadline_ms != view.absolute_deadline_ms())
+		return {MISTER_RESULT_INVALID_ARGUMENT, false, false, false};
+	const Result authority = CleanupValidateDigitalNeutralAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_->DeselectUserIo(absolute_deadline_ms);
 }
 
 #undef IMPL_CALL

@@ -102,6 +102,22 @@ private:
 		NativeSpiAckSample *sample) override;
 	NativeSpiMutationResult Deselect(const HardwareLeaseView &view,
 		NativeSpiTarget target, uint64_t absolute_deadline_ms) override;
+	Result CleanupValidateDigitalNeutralAuthority(
+		const CleanupInputReplayView &view) override;
+	Result CleanupObserveDigitalNeutralResidue(
+		const CleanupInputReplayView &view, bool *user_io_selected,
+		bool *strobe_high) override;
+	NativeSpiMutationResult CleanupSelectUserIo(
+		const CleanupInputReplayView &view) override;
+	NativeSpiMutationResult CleanupWriteDigitalNeutralWord(
+		const CleanupInputReplayView &view, uint8_t authorized_word_index) override;
+	NativeSpiMutationResult CleanupSetStrobe(
+		const CleanupInputReplayView &view, bool high) override;
+	Result CleanupReadAckSample(const CleanupInputReplayView &view,
+		NativeSpiAckSample *sample) override;
+	NativeSpiMutationResult CleanupDeselectUserIo(
+		const CleanupInputReplayView &view,
+		uint64_t absolute_deadline_ms) override;
 
 	Impl *impl_;
 };

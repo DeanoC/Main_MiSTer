@@ -122,6 +122,64 @@ HardwareLeaseView::HardwareLeaseView(
 {
 }
 
+CleanupInputReplayView::CleanupInputReplayView(
+	const std::shared_ptr<OperationRegistration> &registration,
+	PlatformGenerationId originating_generation, uint8_t player,
+	uint16_t command_word, uint16_t neutral_word)
+	: registration_(registration), originating_generation_(originating_generation),
+	  player_(player), words_{command_word, neutral_word}
+{
+}
+
+CleanupInputReplayView::~CleanupInputReplayView()
+{
+	if (!registration_ || !registration_->lifetime) return;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker == registration_->broker)
+		registration_->broker->ReleaseCleanupInputReplayView(*this);
+}
+
+uint64_t CleanupInputReplayView::RecordMutation()
+{
+	if (!registration_ || !registration_->lifetime) return 0;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker) return 0;
+	return registration_->broker->RecordMutation(*this);
+}
+
+uint64_t CleanupInputReplayView::CurrentMutationSequence() const
+{
+	if (!registration_ || !registration_->lifetime) return 0;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker) return 0;
+	return registration_->broker->CurrentMutationSequence(*this);
+}
+
+Result CleanupInputReplayView::ValidateBridgeActivationAuthority(
+	const NativeBridgeActivationAuthority &authority) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->ValidateCleanupInputReplayAuthority(*this,
+		authority);
+}
+
+Result CleanupInputReplayView::AuthorizedWord(uint8_t index,
+	uint16_t *word) const
+{
+	if (word == nullptr || index > 1) return MISTER_RESULT_INVALID_ARGUMENT;
+	*word = words_[index];
+	return MISTER_RESULT_OK;
+}
+
+uint64_t CleanupInputReplayView::absolute_deadline_ms() const
+{
+	return registration_ ? registration_->effective_deadline_ms : 0;
+}
+
 ProcessOperationGuard::ProcessOperationGuard(
 	const std::shared_ptr<OperationRegistration> &registration)
 	: registration_(registration), lifetime_registered_(false)
@@ -282,6 +340,20 @@ Result OperationLease::AcquireInputHardwareLeaseView(HardwareBroker &owner,
 		return MISTER_RESULT_INVALID_STATE;
 	return registration_->broker->AcquireHardwareLeaseViewFor(*this,
 		OperationKind::input, &profile, view);
+}
+
+Result OperationLease::AcquireCleanupInputReplayView(
+	const NativeCoreProfile &profile, uint8_t player,
+	const uint16_t (&words)[2],
+	std::unique_ptr<CleanupInputReplayView> *view) const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->AcquireCleanupInputReplayViewFor(*this,
+		profile, player, words, view);
 }
 
 Result OperationLease::AcquireActiveCoreProtocolSession(HardwareBroker &owner,
@@ -1192,6 +1264,42 @@ Result HardwareBroker::AcquireHardwareLeaseViewFor(const OperationLease &lease,
 
 	std::unique_ptr<HardwareLeaseView> admitted(
 		new (std::nothrow) HardwareLeaseView(registration));
+	if (!admitted) return MISTER_RESULT_PLATFORM;
+	hardware_transaction_active_ = true;
+	*view = std::move(admitted);
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::AcquireCleanupInputReplayViewFor(
+	const OperationLease &lease, const NativeCoreProfile &profile,
+	uint8_t player, const uint16_t (&words)[2],
+	std::unique_ptr<CleanupInputReplayView> *view)
+{
+	if (view == nullptr || view->get() != nullptr)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	if (!ValidateNativeCoreProfileRecord(profile) || player >= kNativePlayerCount ||
+		profile.input.joystick_swap ||
+		words[0] != profile.input.player_command[player] || words[1] != 0)
+		return MISTER_RESULT_UNSUPPORTED;
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::input ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != cleanup_identity_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		registration->profile != &profile || state_ != State::cleanup ||
+		!cleanup_registered_ || generation_ == 0 || terminal_lease_count_ != 0)
+		return MISTER_RESULT_INVALID_STATE;
+	if (clock_.NowMs() >= registration->effective_deadline_ms)
+		return MISTER_RESULT_DEADLINE;
+	if (mutation_sequence_ == UINT64_MAX) return MISTER_RESULT_INVALID_STATE;
+	std::unique_ptr<CleanupInputReplayView> admitted(
+		new (std::nothrow) CleanupInputReplayView(registration, generation_, player,
+			words[0], words[1]));
 	if (!admitted) return MISTER_RESULT_PLATFORM;
 	hardware_transaction_active_ = true;
 	*view = std::move(admitted);
@@ -3125,6 +3233,14 @@ void HardwareBroker::ReleaseHardwareLeaseView(HardwareLeaseView &view)
 	lease_released_.notify_all();
 }
 
+void HardwareBroker::ReleaseCleanupInputReplayView(CleanupInputReplayView &view)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!view.registration_ || view.registration_->broker != this) return;
+	hardware_transaction_active_ = false;
+	lease_released_.notify_all();
+}
+
 void HardwareBroker::ReleaseProcessOperationGuard(ProcessOperationGuard &guard)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -3222,6 +3338,25 @@ uint64_t HardwareBroker::RecordMutation(const HardwareLeaseView &view)
 	return ++mutation_sequence_;
 }
 
+uint64_t HardwareBroker::RecordMutation(const CleanupInputReplayView &view)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->broker != this ||
+		registration->operation_kind != OperationKind::input ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != cleanup_identity_ ||
+		registration->profile == nullptr || registration->profile != profile_ ||
+		view.originating_generation_ != generation_ || state_ != State::cleanup ||
+		!cleanup_registered_ || terminal_lease_count_ != 0 ||
+		mutation_sequence_ == UINT64_MAX)
+		return 0;
+	return ++mutation_sequence_;
+}
+
 uint64_t HardwareBroker::CurrentMutationSequence(
 	const HardwareLeaseView &view)
 {
@@ -3230,6 +3365,24 @@ uint64_t HardwareBroker::CurrentMutationSequence(
 		view.registration_;
 	if (!hardware_transaction_active_ || !registration ||
 		!registration->registered || registration->broker != this)
+		return 0;
+	return mutation_sequence_;
+}
+
+uint64_t HardwareBroker::CurrentMutationSequence(
+	const CleanupInputReplayView &view)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || !registration ||
+		!registration->registered || registration->broker != this ||
+		registration->operation_kind != OperationKind::input ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != cleanup_identity_ ||
+		registration->profile != profile_ ||
+		view.originating_generation_ != generation_ || state_ != State::cleanup ||
+		mutation_sequence_ == UINT64_MAX)
 		return 0;
 	return mutation_sequence_;
 }
@@ -3328,6 +3481,34 @@ Result HardwareBroker::ValidateBridgeActivationAuthority(
 		registration->profile == nullptr || registration->profile != profile_ ||
 		authority.profile_ != profile_ ||
 		state_ != State::active || authority.bridge_mutation_sequence_ == 0 ||
+		mutation_sequence_ == UINT64_MAX ||
+		authority.bridge_mutation_sequence_ > mutation_sequence_)
+		return MISTER_RESULT_INVALID_STATE;
+	return clock_.NowMs() >= registration->effective_deadline_ms ?
+		MISTER_RESULT_DEADLINE : MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::ValidateCleanupInputReplayAuthority(
+	const CleanupInputReplayView &view,
+	const NativeBridgeActivationAuthority &authority)
+{
+	const std::shared_ptr<BrokerLifetime> authority_lifetime =
+		authority.lifetime_.lock();
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		view.registration_;
+	if (!hardware_transaction_active_ || containment_evidence_pending_ ||
+		!registration || !registration->registered ||
+		registration->broker != this || authority.broker_ != this ||
+		!authority_lifetime || authority_lifetime.get() != lifetime_.get() ||
+		registration->operation_kind != OperationKind::input ||
+		registration->authority != LeaseAuthority::cleanup_epoch ||
+		registration->authority_identity != cleanup_identity_ ||
+		generation_ == 0 || view.originating_generation_ != generation_ ||
+		authority.generation_ != generation_ || registration->profile == nullptr ||
+		registration->profile != profile_ || authority.profile_ != profile_ ||
+		state_ != State::cleanup || !cleanup_registered_ ||
+		terminal_lease_count_ != 0 || authority.bridge_mutation_sequence_ == 0 ||
 		mutation_sequence_ == UINT64_MAX ||
 		authority.bridge_mutation_sequence_ > mutation_sequence_)
 		return MISTER_RESULT_INVALID_STATE;

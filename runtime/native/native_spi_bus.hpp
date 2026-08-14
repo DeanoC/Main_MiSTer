@@ -46,6 +46,7 @@ struct SpiReceipt {
 class NativeInput;
 class NativeSpiBus;
 class SpiReceiptCommitToken;
+struct CleanupInputReplayResidue;
 
 // This capability is the only production admission to the input SPI route.
 // It deliberately has no target parameter, so input code cannot select file
@@ -59,6 +60,12 @@ private:
 	friend class NativeInput;
 	explicit NativeInputSpiPort(NativeSpiBus &bus);
 	Result Execute(HardwareLeaseView &view, const SpiWords &words,
+		SpiReceipt *receipt, const SpiReceiptCommitToken *commit);
+	Result ValidateCleanupDigitalNeutralAuthority(
+		const CleanupInputReplayView &view);
+	Result CloseCleanupDigitalNeutralResidue(CleanupInputReplayView &view,
+		CleanupInputReplayResidue *residue, SpiReceipt *receipt);
+	Result ExecuteCleanupDigitalNeutral(CleanupInputReplayView &view,
 		SpiReceipt *receipt, const SpiReceiptCommitToken *commit);
 	NativeSpiBus &bus_;
 };
@@ -101,6 +108,19 @@ private:
 		const NativeSpiMutationResult &mutation, Result *primary);
 	Result WaitForAck(const HardwareLeaseView &view, bool want_high,
 		uint64_t deadline_ms, bool *observed, uint16_t *response);
+	Result WaitForCleanupAck(const CleanupInputReplayView &view, bool want_high,
+		uint64_t deadline_ms, bool *observed, uint16_t *response);
+	bool RecordAppliedCleanupMutation(CleanupInputReplayView &view,
+		SpiReceipt *receipt);
+	void RecordCleanupMutationResult(CleanupInputReplayView &view,
+		SpiReceipt *receipt, const NativeSpiMutationResult &mutation,
+		Result *primary);
+	Result ExchangeCleanupDigitalNeutral(CleanupInputReplayView &view,
+		SpiReceipt *receipt, const SpiReceiptCommitToken *commit);
+	Result ValidateCleanupDigitalNeutralAuthority(
+		const CleanupInputReplayView &view);
+	Result CloseCleanupResidue(CleanupInputReplayView &view,
+		CleanupInputReplayResidue *residue, SpiReceipt *receipt);
 
 	NativeClock &clock_;
 	NativeHardwareIo &hardware_;

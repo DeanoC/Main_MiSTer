@@ -1898,6 +1898,7 @@ void TestCleanupFailureRetainsTheFailedResourceLedger()
 			break;
 		case Event::replay_digital_neutral:
 			assert(ledger.digital_neutral_valid[0]);
+			assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
 			break;
 		case Event::close_input_descriptors:
 			assert(ledger.input_descriptors);
@@ -1924,6 +1925,39 @@ void TestCleanupFailureRetainsTheFailedResourceLedger()
 		default:
 			assert(false);
 		}
+		if (failures[index] == Event::replay_digital_neutral) {
+			const uint64_t epoch =
+				fixture.lifecycle.cleanup_epoch_identity_for_test();
+			const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+			fixture.resources.ClearFailure();
+			fixture.clock.SetNow(200);
+			const Result retry = fixture.lifecycle.Stop(UINT64_MAX);
+			assert(retry == MISTER_RESULT_CLEANUP_INCOMPLETE);
+			assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
+			assert(fixture.resources.Count(Event::replay_digital_neutral) == 2);
+			assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
+			assert(!fixture.lifecycle.ledger().digital_neutral_valid[0]);
+			assert(fixture.resources.LastHardwareDeadline(
+				Event::replay_digital_neutral) == timing.non_fpga_deadline_ms);
+		}
+	}
+	{
+		Fixture fixture(100);
+		assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+			MISTER_RESULT_OK);
+		const NativeDigitalNeutral neutral = {0, {0x02, 0}};
+		fixture.resources.AddDigitalNeutral(neutral);
+		fixture.resources.Fail(Event::replay_digital_neutral);
+		assert(fixture.lifecycle.Stop(UINT64_MAX) ==
+			MISTER_RESULT_CLEANUP_INCOMPLETE);
+		const uint64_t epoch = fixture.lifecycle.cleanup_epoch_identity_for_test();
+		const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
+		fixture.resources.ClearFailure();
+		fixture.clock.SetNow(timing.non_fpga_deadline_ms);
+		assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
+		assert(fixture.lifecycle.cleanup_epoch_identity_for_test() == epoch);
+		assert(fixture.lifecycle.ledger().digital_neutral_valid[0]);
+		assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
 	}
 }
 

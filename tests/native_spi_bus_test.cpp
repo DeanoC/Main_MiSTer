@@ -3,6 +3,8 @@
 
 #include "runtime/native/native_spi_bus.hpp"
 #include "runtime/native/native_core_profile.hpp"
+#include "runtime/native/native_input.hpp"
+#include "runtime/native/native_resources.hpp"
 #include "tests/native_core_protocol_authority_test_peer.hpp"
 
 #include <assert.h>
@@ -1133,6 +1135,30 @@ void TestBrokerDestructionDuringDeselectPreservesLastRecordedSequence()
 	lease.reset();
 }
 
+void TestUnrelatedHardwareSubclassGainsNoCleanupInputAuthority()
+{
+	TestClock clock(10);
+	HardwareBroker broker(clock);
+	PlatformGenerationId generation = 0;
+	Enter(broker, clock, &generation);
+	assert(broker.Quiesce(generation, 100) == MISTER_RESULT_OK);
+	std::unique_ptr<CleanupEpoch> cleanup;
+	assert(broker.BeginCleanup(generation, 100, 200, &cleanup) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> cleanup_input;
+	assert(broker.BeginCleanupOperation(*cleanup, OperationKind::input,
+		&cleanup_input) == MISTER_RESULT_OK);
+	FakeIo io;
+	NativeSpiBus bus(clock, io);
+	NativeInput input(bus.input_port());
+	const NativeCoreProfile *profile = FixtureNativeCoreProfile("snes");
+	const NativeDigitalNeutral neutral = {0, {0x02, 0}};
+	SpiReceipt receipt = {};
+	assert(input.ReplayDigitalNeutral(profile, *cleanup_input, neutral,
+		&receipt) == MISTER_RESULT_INVALID_STATE);
+	assert(io.events.empty() && receipt.mutation_sequence == 0);
+}
+
 } // namespace
 } // namespace native
 } // namespace mister
@@ -1159,5 +1185,6 @@ int main()
 	TestFailureLatchCannotBisectTransaction();
 	TestAuthorityMatrixAndRecoveryClosure();
 	TestDeadlineAndStaleAuthorityProduceNoMmio();
+	TestUnrelatedHardwareSubclassGainsNoCleanupInputAuthority();
 	return 0;
 }
