@@ -315,7 +315,9 @@ test-native-linux-mmio-reachability: $(NATIVE_LINUX_MMIO_PRODUCTION_OBJECT)
 		MISTER_NATIVE_BRIDGE_TOKEN_MOVE_REACHABILITY_PROBE \
 		MISTER_NATIVE_BRIDGE_TOKEN_MINT_REACHABILITY_PROBE \
 		MISTER_NATIVE_BRIDGE_TOKEN_INSTALL_REACHABILITY_PROBE \
-		MISTER_NATIVE_BRIDGE_TOKEN_VALIDATE_REACHABILITY_PROBE; do \
+		MISTER_NATIVE_BRIDGE_TOKEN_VALIDATE_REACHABILITY_PROBE \
+		MISTER_NATIVE_USER_IO_RAW_SELECT_REACHABILITY_PROBE \
+		MISTER_NATIVE_USER_IO_RAW_CAST_REACHABILITY_PROBE; do \
 		if $(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_MMIO_TESTING \
 			-D$$probe -I. -fsyntax-only \
 			tests/native_linux_mmio_containment_test.cpp >/dev/null 2>&1; then \
@@ -514,6 +516,9 @@ test-native-linux-hardware-dependency-invalidation:
 			'runtime/native/hardware_broker.hpp:test-native-hardware-broker:-c tests/native_hardware_broker_test.cpp' \
 			'runtime/native/hardware_broker.hpp:test-native-containment:-c runtime/native/native_containment.cpp' \
 			'runtime/native/hardware_broker.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
+			'runtime/native/native_hardware_io.hpp:test-native-linux-mmio-containment:-c runtime/native/linux/native_mmio_adapter.cpp' \
+			'runtime/native/native_spi_bus.hpp:test-native-linux-mmio-containment:-c tests/native_linux_mmio_containment_test.cpp' \
+			'runtime/native/native_input.hpp:test-native-linux-mmio-containment:-c tests/native_linux_mmio_containment_test.cpp' \
 			'runtime/native/native_clock.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_fpga_programmer.cpp' \
 			'runtime/native/native_core_profile.hpp:test-native-linux-artifact-programmer:-c runtime/native/linux/native_core_artifact_adapter.cpp' \
 			'runtime/native/native_resources.hpp:test-native-linux-artifact-programmer:-c tests/native_linux_artifact_programmer_test.cpp' \
@@ -1006,10 +1011,13 @@ $(NATIVE_LINUX_MMIO_CONTAINMENT_TEST_OBJECT): \
 	runtime/native/linux/native_mmio_adapter.hpp \
 	runtime/native/linux/native_fpga_programmer.hpp \
 	runtime/native/linux/native_core_artifact_adapter.hpp \
-	runtime/native/native_containment.hpp runtime/native/hardware_broker.hpp \
+	runtime/native/native_containment.hpp runtime/native/native_spi_bus.hpp \
+	runtime/native/native_input.hpp runtime/native/native_hardware_io.hpp \
+	runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_MMIO_TESTING \
+		-DMISTER_NATIVE_SPI_TESTING \
 		-I. -pthread -c $< -o $@
 
 $(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT): \
@@ -1017,7 +1025,8 @@ $(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT): \
 	runtime/native/linux/native_mmio_adapter.hpp \
 	runtime/native/linux/native_fpga_programmer.hpp \
 	runtime/native/linux/native_core_artifact_adapter.hpp \
-	runtime/native/native_containment.hpp runtime/native/hardware_broker.hpp \
+	runtime/native/native_containment.hpp runtime/native/native_hardware_io.hpp \
+	runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_MMIO_TESTING \
@@ -1028,7 +1037,8 @@ $(NATIVE_LINUX_MMIO_PRODUCTION_OBJECT): \
 	runtime/native/linux/native_mmio_adapter.hpp \
 	runtime/native/linux/native_fpga_programmer.hpp \
 	runtime/native/linux/native_core_artifact_adapter.hpp \
-	runtime/native/native_containment.hpp runtime/native/hardware_broker.hpp \
+	runtime/native/native_containment.hpp runtime/native/native_hardware_io.hpp \
+	runtime/native/hardware_broker.hpp \
 	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
 	runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_MMIO_TESTING \
@@ -1084,6 +1094,7 @@ $(HOST_TEST_DIR)/native_linux_mmio_containment_test: \
 	$(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT) \
 	$(HOST_TEST_DIR)/native_core_artifact_adapter.o \
 	$(HOST_TEST_DIR)/native_fpga_programmer.o $(NATIVE_CONTAINMENT_OBJECT) \
+	$(NATIVE_SPI_BUS_TEST_IMPLEMENTATION_OBJECT) $(NATIVE_INPUT_OBJECT) \
 	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
 	$(NATIVE_CORE_PROFILE_OBJECT) \
 	$(NATIVE_CORE_PROTOCOL_OBJECT) $(NATIVE_SNES_CONTENT_OBJECT)

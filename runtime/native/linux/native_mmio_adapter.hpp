@@ -5,6 +5,7 @@
 #define MISTER_RUNTIME_NATIVE_LINUX_NATIVE_MMIO_ADAPTER_HPP
 
 #include "runtime/native/native_containment.hpp"
+#include "runtime/native/native_hardware_io.hpp"
 #include "runtime/native/linux/native_fpga_programmer.hpp"
 
 #include <stddef.h>
@@ -42,7 +43,7 @@ public:
 #endif
 
 class NativeLinuxMmioAdapter final : public NativeContainmentIo,
-	public NativeFpgaByteSink {
+	public NativeFpgaByteSink, private NativeHardwareIo {
 public:
 	NativeLinuxMmioAdapter();
 #if defined(MISTER_NATIVE_MMIO_TESTING)
@@ -54,6 +55,7 @@ public:
 	bool HasBridgeActivationAuthorityForTest() const;
 #endif
 	~NativeLinuxMmioAdapter() override;
+	NativeHardwareIo &user_io_only_hardware() { return *this; }
 	Result CloseMappingsForProcessExit();
 	NativeLinuxMmioAdapter(const NativeLinuxMmioAdapter &) = delete;
 	NativeLinuxMmioAdapter &operator=(const NativeLinuxMmioAdapter &) = delete;
@@ -90,6 +92,16 @@ private:
 	Result ReadBridgeReset(const Access &access, uint32_t *value) override;
 	Result ReadRemap(const Access &access, uint32_t *value) override;
 	Result ReleaseMappings(const Access &access) override;
+	NativeSpiMutationResult Select(const HardwareLeaseView &view,
+		NativeSpiTarget target) override;
+	NativeSpiMutationResult WriteWordWithStrobeLow(
+		const HardwareLeaseView &view, uint16_t word) override;
+	NativeSpiMutationResult SetStrobe(const HardwareLeaseView &view,
+		bool high) override;
+	Result ReadAckSample(const HardwareLeaseView &view,
+		NativeSpiAckSample *sample) override;
+	NativeSpiMutationResult Deselect(const HardwareLeaseView &view,
+		NativeSpiTarget target, uint64_t absolute_deadline_ms) override;
 
 	Impl *impl_;
 };

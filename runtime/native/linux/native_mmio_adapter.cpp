@@ -34,7 +34,18 @@ const size_t kManagerCtrl = 0x04;
 const size_t kManagerDclkCount = 0x08;
 const size_t kManagerDclkStatus = 0x0c;
 const size_t kManagerGpo = 0x10;
+const size_t kManagerGpi = 0x14;
 const size_t kManagerMonitorGpio = 0x850;
+
+const uint32_t kInputDataMask = 0x0000ffffu;
+const uint32_t kInputStrobeMask = 0x00020000u;
+const uint32_t kInputFileSelectMask = 0x00040000u;
+const uint32_t kInputUserSelectMask = 0x00100000u;
+const uint32_t kInputOwnedMutationMask = kInputStrobeMask |
+	kInputFileSelectMask | kInputUserSelectMask;
+const uint32_t kInputCoreControlMask = 0xc0000000u;
+const uint32_t kInputCoreNormal = 0x80000000u;
+const uint32_t kInputFaultMask = 0x80000000u;
 
 bool IsPowerOfTwo(size_t value)
 {
@@ -617,6 +628,85 @@ public:
 		return bridge_authority_.get() != nullptr;
 	}
 
+	NativeSpiMutationResult SelectUserIo(uint64_t absolute_deadline_ms)
+	{
+		NativeSpiMutationResult result = {
+			MISTER_RESULT_INVALID_STATE, false, false, false};
+		if (input_target_may_be_selected_) return result;
+		uint32_t current = 0;
+		result.result = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, &current);
+		if (result.result != MISTER_RESULT_OK) return result;
+		if ((current & kInputCoreControlMask) != kInputCoreNormal) {
+			result.result = MISTER_RESULT_INVALID_STATE;
+			return result;
+		}
+		input_target_may_be_selected_ = true;
+		return MutateInputGpo(absolute_deadline_ms, current,
+			kInputOwnedMutationMask, kInputUserSelectMask,
+			kInputOwnedMutationMask | kInputCoreControlMask,
+			kInputUserSelectMask | kInputCoreNormal);
+	}
+
+	NativeSpiMutationResult WriteInputWord(uint64_t absolute_deadline_ms,
+		uint16_t word)
+	{
+		if (!input_target_may_be_selected_)
+			return {MISTER_RESULT_INVALID_STATE, false, false, false};
+		uint32_t current = 0;
+		const Result read = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, &current);
+		if (read != MISTER_RESULT_OK) return {read, false, false, false};
+		return MutateInputGpo(absolute_deadline_ms, current,
+			kInputDataMask | kInputStrobeMask, static_cast<uint32_t>(word),
+			kInputDataMask | kInputOwnedMutationMask,
+			kInputUserSelectMask | static_cast<uint32_t>(word));
+	}
+
+	NativeSpiMutationResult SetInputStrobe(uint64_t absolute_deadline_ms,
+		bool high)
+	{
+		if (!input_target_may_be_selected_)
+			return {MISTER_RESULT_INVALID_STATE, false, false, false};
+		uint32_t current = 0;
+		const Result read = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, &current);
+		if (read != MISTER_RESULT_OK) return {read, false, false, false};
+		return MutateInputGpo(absolute_deadline_ms, current, kInputStrobeMask,
+			high ? kInputStrobeMask : 0, kInputOwnedMutationMask,
+			kInputUserSelectMask | (high ? kInputStrobeMask : 0));
+	}
+
+	Result ReadInputAck(uint64_t absolute_deadline_ms,
+		NativeSpiAckSample *sample)
+	{
+		if (sample == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+		if (!input_target_may_be_selected_) return MISTER_RESULT_INVALID_STATE;
+		uint32_t value = 0;
+		const Result result = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpi, &value);
+		if (result != MISTER_RESULT_OK) return result;
+		sample->ack_high = (value & kInputStrobeMask) != 0;
+		sample->fault = (value & kInputFaultMask) != 0;
+		sample->response = static_cast<uint16_t>(value & kInputDataMask);
+		return MISTER_RESULT_OK;
+	}
+
+	NativeSpiMutationResult DeselectUserIo(uint64_t absolute_deadline_ms)
+	{
+		if (!input_target_may_be_selected_)
+			return {MISTER_RESULT_INVALID_STATE, false, false, false};
+		uint32_t current = 0;
+		const Result read = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, &current);
+		if (read != MISTER_RESULT_OK) return {read, false, false, false};
+		NativeSpiMutationResult result = MutateInputGpo(absolute_deadline_ms,
+			current, kInputOwnedMutationMask, 0, kInputOwnedMutationMask, 0);
+		if (result.applied && result.observed)
+			input_target_may_be_selected_ = false;
+		return result;
+	}
+
 	NativeManagerNeutralReceipt ReconcileManager(const Access &access)
 	{
 		(void)ConsumeAppliedMutation();
@@ -869,6 +959,29 @@ public:
 	}
 
 private:
+	NativeSpiMutationResult MutateInputGpo(uint64_t absolute_deadline_ms,
+		uint32_t current, uint32_t clear_mask, uint32_t set_value,
+		uint32_t observe_mask, uint32_t expected)
+	{
+		NativeSpiMutationResult result = {
+			MISTER_RESULT_OK, true, false, false};
+		result.result = WriteRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, (current & ~clear_mask) | (set_value & clear_mask));
+		result.applied = ConsumeAppliedMutation();
+		if (result.result != MISTER_RESULT_OK) return result;
+		if (!result.applied) {
+			result.result = MISTER_RESULT_PLATFORM;
+			return result;
+		}
+		uint32_t observed = 0;
+		result.result = ReadRaw(absolute_deadline_ms, Register::core_gpo,
+			kManagerGpo, &observed);
+		if (result.result != MISTER_RESULT_OK) return result;
+		result.observed = (observed & observe_mask) == expected;
+		if (!result.observed) result.result = MISTER_RESULT_PLATFORM;
+		return result;
+	}
+
 	void InitializeSlots()
 	{
 		for (Slot &slot : slots_) {
@@ -1049,6 +1162,7 @@ private:
 	bool bridges_attempted_;
 	bool core_normal_observed_;
 	std::unique_ptr<NativeBridgeActivationAuthority> bridge_authority_;
+	bool input_target_may_be_selected_ = false;
 	uint64_t expected_bytes_;
 	uint64_t programmed_bytes_;
 	bool manager_residue_;
@@ -1228,6 +1342,61 @@ Result NativeLinuxMmioAdapter::ReleaseMappings(const Access &access)
 Result NativeLinuxMmioAdapter::CloseMappingsForProcessExit()
 {
 	IMPL_CALL(impl_->CloseMappingsForProcessExit());
+}
+
+NativeSpiMutationResult NativeLinuxMmioAdapter::Select(
+	const HardwareLeaseView &view, NativeSpiTarget target)
+{
+	if (target != NativeSpiTarget::user_io)
+		return {MISTER_RESULT_INVALID_ARGUMENT, false, false, false};
+	const Result authority = ValidateBridgeActivationAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_ == nullptr ?
+		NativeSpiMutationResult{MISTER_RESULT_PLATFORM, false, false, false} :
+		impl_->SelectUserIo(view.absolute_deadline_ms());
+}
+NativeSpiMutationResult NativeLinuxMmioAdapter::WriteWordWithStrobeLow(
+	const HardwareLeaseView &view, uint16_t word)
+{
+	const Result authority = ValidateBridgeActivationAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_ == nullptr ?
+		NativeSpiMutationResult{MISTER_RESULT_PLATFORM, false, false, false} :
+		impl_->WriteInputWord(view.absolute_deadline_ms(), word);
+}
+NativeSpiMutationResult NativeLinuxMmioAdapter::SetStrobe(
+	const HardwareLeaseView &view, bool high)
+{
+	const Result authority = ValidateBridgeActivationAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_ == nullptr ?
+		NativeSpiMutationResult{MISTER_RESULT_PLATFORM, false, false, false} :
+		impl_->SetInputStrobe(view.absolute_deadline_ms(), high);
+}
+Result NativeLinuxMmioAdapter::ReadAckSample(const HardwareLeaseView &view,
+	NativeSpiAckSample *sample)
+{
+	const Result authority = ValidateBridgeActivationAuthority(view);
+	if (authority != MISTER_RESULT_OK) return authority;
+	return impl_ == nullptr ? MISTER_RESULT_PLATFORM :
+		impl_->ReadInputAck(view.absolute_deadline_ms(), sample);
+}
+NativeSpiMutationResult NativeLinuxMmioAdapter::Deselect(
+	const HardwareLeaseView &view, NativeSpiTarget target,
+	uint64_t absolute_deadline_ms)
+{
+	if (target != NativeSpiTarget::user_io ||
+		absolute_deadline_ms != view.absolute_deadline_ms())
+		return {MISTER_RESULT_INVALID_ARGUMENT, false, false, false};
+	const Result authority = ValidateBridgeActivationAuthority(view);
+	if (authority != MISTER_RESULT_OK)
+		return {authority, false, false, false};
+	return impl_ == nullptr ?
+		NativeSpiMutationResult{MISTER_RESULT_PLATFORM, false, false, false} :
+		impl_->DeselectUserIo(absolute_deadline_ms);
 }
 
 #undef IMPL_CALL
