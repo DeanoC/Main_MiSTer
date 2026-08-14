@@ -113,6 +113,10 @@ public:
 		PeripheralSessionKind kind) const;
 	NativeCleanupBrokerSnapshot cleanup_broker_callback_snapshot_for_test(
 		PeripheralSessionKind kind) const;
+	Result cleanup_retained_snapshot_for_test(OperationKind kind,
+		NativeRetainedOperationSnapshot *snapshot) const;
+	Result cleanup_retained_callback_snapshot_for_test(OperationKind kind,
+		NativeRetainedOperationSnapshot *snapshot) const;
 #endif
 	Result Stop(uint64_t callback_deadline_ms);
 

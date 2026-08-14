@@ -98,6 +98,54 @@ void NativeRecovery::ClearRetainedRecovery()
 	retained_kind_ = RetainedRecoveryKind::none;
 }
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+Result NativeRecovery::retained_snapshot_for_test(const RecoveryEpoch &epoch,
+	OperationKind kind, NativeRetainedOperationSnapshot *snapshot) const
+{
+	if (snapshot == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	*snapshot = {};
+	const RetainedRecoveryKind requested = kind == OperationKind::core_protocol ?
+		RetainedRecoveryKind::core_protocol : kind == OperationKind::audio ?
+		RetainedRecoveryKind::audio : kind == OperationKind::video ?
+		RetainedRecoveryKind::video : kind == OperationKind::audio_video ?
+		RetainedRecoveryKind::audio_video : kind == OperationKind::save ?
+		RetainedRecoveryKind::save : RetainedRecoveryKind::none;
+	if (requested == RetainedRecoveryKind::none) return MISTER_RESULT_INVALID_ARGUMENT;
+	if (retained_kind_ != RetainedRecoveryKind::none &&
+		(retained_epoch_ != &epoch || retained_kind_ != requested ||
+		 !retained_lease_)) return MISTER_RESULT_INVALID_STATE;
+	if (kind == OperationKind::audio && audio_ != nullptr) {
+		const PeripheralBackendIdentity expected = audio_->BackendIdentity();
+		return broker_.CopyRetainedOperationSnapshotForTest(
+			LeaseAuthority::recovery_epoch, epoch.identity_for_test(), kind,
+			retained_lease_.get(), &expected, 0, snapshot);
+	}
+	if (kind == OperationKind::video && video_ != nullptr) {
+		const PeripheralBackendIdentity expected = video_->BackendIdentity();
+		return broker_.CopyRetainedOperationSnapshotForTest(
+			LeaseAuthority::recovery_epoch, epoch.identity_for_test(), kind,
+			retained_lease_.get(), &expected, 0, snapshot);
+	}
+	if (kind == OperationKind::audio_video && audio_video_ != nullptr) {
+		const PeripheralBackendIdentity expected = audio_video_->BackendIdentity();
+		return broker_.CopyRetainedOperationSnapshotForTest(
+			LeaseAuthority::recovery_epoch, epoch.identity_for_test(), kind,
+			retained_lease_.get(), &expected, 0, snapshot);
+	}
+	const uintptr_t backend = kind == OperationKind::save && save_ != nullptr ?
+		reinterpret_cast<uintptr_t>(save_) : 0;
+	return broker_.CopyRetainedOperationSnapshotForTest(
+		LeaseAuthority::recovery_epoch, epoch.identity_for_test(), kind,
+		retained_lease_.get(), nullptr, backend, snapshot);
+}
+
+Result NativeRecovery::broker_baseline_snapshot_for_test(
+	NativeRetainedOperationSnapshot *snapshot) const
+{
+	return broker_.CopyIdleRetainedOperationSnapshotForTest(snapshot);
+}
+#endif
+
 Result NativeRecovery::Perform(const RecoveryEpoch &epoch,
 	const OperationInvocation &invocation, OperationKind operation_kind)
 {

@@ -3132,6 +3132,208 @@ Result HardwareBroker::ContinueRecoveryOperation(const RecoveryEpoch &epoch,
 		epoch.identity_, invocation, lease, authority_deadline_ms);
 }
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+Result HardwareBroker::CopyRetainedOperationSnapshotForTest(
+	LeaseAuthority authority, uint64_t authority_identity,
+	OperationKind supplied_kind, const OperationLease *lease,
+	const PeripheralBackendIdentity *expected_peripheral_backend,
+	uintptr_t expected_backend_identity,
+	NativeRetainedOperationSnapshot *snapshot) const
+{
+	if (snapshot == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	*snapshot = {};
+	if (supplied_kind != OperationKind::core_protocol &&
+		supplied_kind != OperationKind::save &&
+		supplied_kind != OperationKind::audio &&
+		supplied_kind != OperationKind::video &&
+		supplied_kind != OperationKind::audio_video)
+		return MISTER_RESULT_INVALID_ARGUMENT;
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	const bool cleanup = authority == LeaseAuthority::cleanup_epoch &&
+		state_ == State::cleanup && cleanup_registered_ &&
+		authority_identity == cleanup_identity_;
+	const bool recovery = authority == LeaseAuthority::recovery_epoch &&
+		state_ == State::recovery && recovery_registered_ &&
+		authority_identity == recovery_identity_ &&
+		!recovery_observation_active_ && !recovery_terminal_neutral_ &&
+		IsRecoveryOperation(supplied_kind, recovery_requested_resource_flags_);
+	if (!cleanup && !recovery) return MISTER_RESULT_INVALID_STATE;
+
+	const std::shared_ptr<OperationRegistration> invoked =
+		invocation_registration_.lock();
+	const std::shared_ptr<OperationRegistration> suspended =
+		suspended_registration_.lock();
+	const std::shared_ptr<OperationRegistration> registration = lease ?
+		lease->registration_ : std::shared_ptr<OperationRegistration>();
+	if (registration && (!registration->registered || registration->broker != this ||
+		registration->authority != authority ||
+		registration->authority_identity != authority_identity ||
+		registration->operation_kind != supplied_kind))
+		return MISTER_RESULT_INVALID_STATE;
+	if (!registration && (invoked || suspended)) return MISTER_RESULT_INVALID_STATE;
+
+	snapshot->authority = authority;
+	snapshot->supplied_operation_kind = supplied_kind;
+	snapshot->authority_identity = authority_identity;
+	snapshot->non_fpga_deadline_ms = cleanup ? cleanup_non_fpga_deadline_ms_ :
+		recovery_non_fpga_deadline_ms_;
+	snapshot->fpga_deadline_ms = cleanup ? cleanup_fpga_deadline_ms_ :
+		recovery_fpga_deadline_ms_;
+	snapshot->requested_resource_flags = recovery ? recovery_requested_resource_flags_ : 0;
+	snapshot->observed_resource_flags = recovery ? recovery_observed_resource_flags_ : 0;
+	snapshot->neutral_resource_flags = recovery ? recovery_neutral_resource_flags_ : 0;
+	snapshot->outstanding_resource_flags = recovery ?
+		(recovery_requested_resource_flags_ & ~recovery_neutral_resource_flags_) : 0;
+	snapshot->recovery_result = recovery ? recovery_result_ : MISTER_RESULT_OK;
+	snapshot->broker_mutation_sequence = mutation_sequence_;
+	snapshot->active_lease_count = active_lease_count_;
+	snapshot->terminal_lease_count = terminal_lease_count_;
+	snapshot->invocation_identity = invocation_identity_;
+	snapshot->invocation_callback_deadline_ms = invocation_callback_deadline_ms_;
+	snapshot->invocation_registered = invocation_registered_;
+	snapshot->invocation_outcome_missing = invocation_outcome_missing_;
+	snapshot->hardware_transaction_active = hardware_transaction_active_;
+	snapshot->cleanup_registered = cleanup_registered_;
+	snapshot->recovery_registered = recovery_registered_;
+	snapshot->recovery_observation_active = recovery_observation_active_;
+	snapshot->terminal_neutral = recovery ? recovery_terminal_neutral_ :
+		state_ == State::terminal_neutral;
+	snapshot->containment_receipt_current = containment_receipt_current_;
+	snapshot->containment_evidence_pending = containment_evidence_pending_;
+	snapshot->broker_idle = state_ == State::idle;
+	if (!registration) {
+		snapshot->query_valid = true;
+		return MISTER_RESULT_OK;
+	}
+
+	snapshot->retained = true;
+	snapshot->typed_registration_present = true;
+	snapshot->retained_operation_kind = registration->operation_kind;
+	snapshot->lease_identity = reinterpret_cast<uintptr_t>(lease);
+	snapshot->registration_identity = reinterpret_cast<uintptr_t>(registration.get());
+	snapshot->registration_authority_deadline_ms = registration->authority_deadline_ms;
+	snapshot->registration_effective_deadline_ms = registration->effective_deadline_ms;
+	snapshot->registration_is_invoked = invoked.get() == registration.get();
+	snapshot->registration_is_suspended = suspended.get() == registration.get();
+	snapshot->registration_outcome_recorded = registration->outcome_recorded;
+	snapshot->process_guard_active = registration->process_guard_active;
+	snapshot->core_disposition = registration->core_protocol_completion;
+	snapshot->peripheral_disposition = registration->peripheral_completion;
+	if (registration->operation_kind == OperationKind::save) {
+		snapshot->backend_applicable = true;
+		snapshot->backend_identity = expected_backend_identity;
+		snapshot->backend_matches_expected = expected_backend_identity != 0;
+	} else if (registration->operation_kind == OperationKind::core_protocol) {
+		snapshot->session_applicable = true;
+		snapshot->backend_applicable = true;
+		const std::shared_ptr<ProtocolSessionState> state =
+			registration->core_protocol_session_state;
+		if (state) {
+			snapshot->typed_session_present = true;
+			snapshot->session_identity = reinterpret_cast<uintptr_t>(state.get());
+			snapshot->backend_identity = reinterpret_cast<uintptr_t>(state->io_state.get());
+			snapshot->backend_matches_expected = snapshot->backend_identity != 0;
+			snapshot->protocol_phase = state->handle_state.load();
+			snapshot->core_disposition = snapshot->protocol_phase ==
+				ProtocolSessionHandleState::abandoned ?
+				CoreProtocolBrokerDisposition::session_abandoned :
+				CoreProtocolBrokerDisposition::session_current;
+			snapshot->session_initial_mutation_sequence = state->initial_mutation_sequence;
+		}
+	} else {
+		snapshot->session_applicable = true;
+		snapshot->backend_applicable = true;
+		snapshot->action_applicable = true;
+		const std::shared_ptr<PeripheralSessionState> state =
+			registration->peripheral_session_state;
+		if (state) {
+			snapshot->typed_session_present = true;
+			snapshot->session_identity = reinterpret_cast<uintptr_t>(state.get());
+			// construction_nonce_ is broker-minted and unique per backend
+			// construction, so this equality-only token rejects address reuse.
+			snapshot->backend_identity = state->backend.construction_nonce_;
+			snapshot->backend_matches_expected = expected_peripheral_backend != nullptr &&
+				state->backend.Matches(*expected_peripheral_backend);
+			snapshot->peripheral_session_kind = state->kind;
+			snapshot->peripheral_action = state->action;
+			snapshot->peripheral_phase = state->phase.load();
+			snapshot->peripheral_disposition = snapshot->peripheral_phase ==
+				PeripheralSessionPhase::abandoned ?
+				PeripheralBrokerDisposition::abandoned :
+				PeripheralBrokerDisposition::live;
+			snapshot->action_word_count = state->action_word_count;
+			snapshot->action_next_word_index = state->action_next_word_index;
+			snapshot->action_transaction_closed = state->action_transaction_closed;
+			snapshot->action_progress_unknown = state->action_progress_unknown;
+			snapshot->recheckout_allowed = state->recheckout_allowed;
+			snapshot->session_initial_mutation_sequence = state->initial_mutation_sequence;
+			snapshot->session_last_mutation_sequence = state->last_mutation_sequence;
+		}
+	}
+	snapshot->query_valid = true;
+	return MISTER_RESULT_OK;
+}
+
+Result HardwareBroker::CopyIdleRetainedOperationSnapshotForTest(
+	NativeRetainedOperationSnapshot *snapshot) const
+{
+	if (snapshot == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	*snapshot = {};
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_ != State::idle || generation_ != 0 || cleanup_identity_ != 0 ||
+		cleanup_non_fpga_deadline_ms_ != 0 || cleanup_fpga_deadline_ms_ != 0 ||
+		terminal_lease_deadline_ms_ != 0 || recovery_identity_ != 0 ||
+		recovery_requested_resource_flags_ != 0 || recovery_non_fpga_deadline_ms_ != 0 ||
+		recovery_fpga_deadline_ms_ != 0 || recovery_observed_resource_flags_ != 0 ||
+		recovery_neutral_resource_flags_ != 0 || recovery_result_ != MISTER_RESULT_OK ||
+		invocation_authority_ != LeaseAuthority::active_generation ||
+		invocation_authority_identity_ != 0 || invocation_identity_ != 0 ||
+		invocation_callback_deadline_ms_ != 0 || invocation_registered_ ||
+		invocation_outcome_missing_ || !invocation_registration_.expired() ||
+		!suspended_registration_.expired() || !core_protocol_session_state_.expired() ||
+		!peripheral_session_state_.expired() || active_lease_count_ != 0 ||
+		terminal_lease_count_ != 0 || cleanup_registered_ || recovery_registered_ ||
+		recovery_observation_active_ || recovery_terminal_neutral_ ||
+		containment_receipt_current_ || containment_evidence_pending_ ||
+		receipt_authority_ != LeaseAuthority::active_generation ||
+		receipt_authority_identity_ != 0 || receipt_generation_ != 0 ||
+		receipt_requested_resource_flags_ != 0 || receipt_core_gpo_ != 0 ||
+		receipt_interface_module_ != 0 || receipt_sdr_port_control_ != 0 ||
+		receipt_bridge_reset_ != 0 || receipt_remap_ != 0 ||
+		receipt_manager_control_ != 0 || receipt_manager_mode_ != 0 ||
+		receipt_manager_neutral_observed_ ||
+		receipt_manager_neutral_mutation_sequence_ != 0 || receipt_mutation_sequence_ != 0 ||
+		receipt_mappings_released_ || receipt_registration_ != nullptr ||
+		core_protocol_failure_receipt_current_ ||
+		core_protocol_failure_receipt_.primary_result != MISTER_RESULT_OK ||
+		core_protocol_failure_receipt_.residue.mapping_retained ||
+		core_protocol_failure_receipt_.residue.identity_mode_may_be_asserted ||
+		core_protocol_failure_receipt_.residue.user_io_selected ||
+		core_protocol_failure_receipt_.residue.file_io_selected ||
+		core_protocol_failure_receipt_.residue.strobe_may_be_high ||
+		core_protocol_failure_receipt_.residue.download_may_be_active ||
+		core_protocol_failure_receipt_.residue.status_reset_asserted ||
+		core_protocol_failure_receipt_.residue.last_mutation_sequence != 0 ||
+		core_protocol_failure_receipt_.mapping_release.result != MISTER_RESULT_OK ||
+		core_protocol_failure_receipt_.mapping_release.selected_transaction_closed ||
+		core_protocol_failure_receipt_.mapping_release.unmap_attempted ||
+		core_protocol_failure_receipt_.mapping_release.mapping_absent ||
+		core_protocol_failure_receipt_.mapping_release.descriptor_close_attempted ||
+		core_protocol_failure_receipt_.mapping_release.descriptor_absent ||
+		core_protocol_failure_receipt_.mapping_release.mutation_sequence != 0 ||
+		core_protocol_failure_receipt_.final_mutation_sequence != 0 ||
+		mutation_sequence_ != 0 || cleanup_ever_started_ || quiesce_complete_ ||
+		quiesce_call_active_ || cleanup_audio_shutdown_complete_ ||
+		recovery_audio_shutdown_complete_ || failure_latched_ || profile_ != nullptr ||
+		hardware_transaction_active_)
+		return MISTER_RESULT_INVALID_STATE;
+	snapshot->query_valid = true;
+	snapshot->broker_idle = true;
+	return MISTER_RESULT_OK;
+}
+#endif
+
 Result HardwareBroker::FinishInvocation(
 	std::unique_ptr<OperationInvocation> &&invocation)
 {
@@ -3191,6 +3393,7 @@ Result HardwareBroker::FinishInvocation(
 		invocation_registration_.reset();
 		invocation_registered_ = false;
 		invocation_outcome_missing_ = false;
+		invocation_authority_ = LeaseAuthority::active_generation;
 		invocation_authority_identity_ = 0;
 		invocation_identity_ = 0;
 		invocation_callback_deadline_ms_ = 0;
@@ -3261,6 +3464,7 @@ Result HardwareBroker::FinishRecovery(std::unique_ptr<RecoveryEpoch> &&epoch,
 		recovery_observed_resource_flags_ = 0;
 		recovery_neutral_resource_flags_ = 0;
 		recovery_result_ = MISTER_RESULT_OK;
+		mutation_sequence_ = 0;
 		recovery_terminal_neutral_ = false;
 		recovery_audio_shutdown_complete_ = false;
 		terminal_lease_deadline_ms_ = 0;
@@ -3441,6 +3645,7 @@ void HardwareBroker::UnregisterInvocation(OperationInvocation &invocation)
 	invocation_registration_.reset();
 	invocation_registered_ = false;
 	invocation_outcome_missing_ = false;
+	invocation_authority_ = LeaseAuthority::active_generation;
 	invocation_authority_identity_ = 0;
 	invocation_identity_ = 0;
 	invocation_callback_deadline_ms_ = 0;

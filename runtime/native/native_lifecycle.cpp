@@ -209,6 +209,59 @@ NativeLifecycle::cleanup_broker_callback_snapshot_for_test(
 	snapshot.backend_matches_expected = session->backend.Matches(expected_backend);
 	return snapshot;
 }
+
+Result NativeLifecycle::cleanup_retained_snapshot_for_test(OperationKind kind,
+	NativeRetainedOperationSnapshot *snapshot) const
+{
+	if (snapshot == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	std::lock_guard<std::mutex> lock(mutex_);
+	return cleanup_retained_callback_snapshot_for_test(kind, snapshot);
+}
+
+Result NativeLifecycle::cleanup_retained_callback_snapshot_for_test(
+	OperationKind kind, NativeRetainedOperationSnapshot *snapshot) const
+{
+	if (snapshot == nullptr) return MISTER_RESULT_INVALID_ARGUMENT;
+	*snapshot = {};
+	const OperationLease *lease = nullptr;
+	uintptr_t backend = 0;
+	switch (kind) {
+	case OperationKind::save:
+		lease = save_cleanup_lease_.get();
+		backend = reinterpret_cast<uintptr_t>(&resources_.save);
+		break;
+	case OperationKind::audio:
+		lease = audio_cleanup_lease_.get();
+		if (!cleanup_epoch_) return MISTER_RESULT_INVALID_STATE;
+		{ const PeripheralBackendIdentity expected = resources_.audio.BackendIdentity();
+			return broker_.CopyRetainedOperationSnapshotForTest(
+				LeaseAuthority::cleanup_epoch, cleanup_epoch_->identity_for_test(), kind,
+				lease, &expected, 0, snapshot); }
+	case OperationKind::video:
+		lease = video_cleanup_lease_.get();
+		if (!cleanup_epoch_) return MISTER_RESULT_INVALID_STATE;
+		{ const PeripheralBackendIdentity expected = resources_.video.BackendIdentity();
+			return broker_.CopyRetainedOperationSnapshotForTest(
+				LeaseAuthority::cleanup_epoch, cleanup_epoch_->identity_for_test(), kind,
+				lease, &expected, 0, snapshot); }
+	case OperationKind::audio_video:
+		lease = coupled_audio_video_cleanup_lease_.get();
+		if (!cleanup_epoch_) return MISTER_RESULT_INVALID_STATE;
+		{ const PeripheralBackendIdentity expected = resources_.audio_video.BackendIdentity();
+			return broker_.CopyRetainedOperationSnapshotForTest(
+				LeaseAuthority::cleanup_epoch, cleanup_epoch_->identity_for_test(), kind,
+				lease, &expected, 0, snapshot); }
+	case OperationKind::core_protocol:
+		lease = core_protocol_cleanup_lease_.get();
+		break;
+	default:
+		return MISTER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!cleanup_epoch_) return MISTER_RESULT_INVALID_STATE;
+	return broker_.CopyRetainedOperationSnapshotForTest(
+		LeaseAuthority::cleanup_epoch, cleanup_epoch_->identity_for_test(), kind, lease,
+		nullptr, backend, snapshot);
+}
 #endif
 
 Result NativeLifecycle::ActivateLocked(const NativeCoreProfile &profile,

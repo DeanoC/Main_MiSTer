@@ -75,6 +75,10 @@ public:
 		const OperationInvocation &invocation, OperationKind operation_kind);
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
 	Result Perform(const RecoveryEpoch &epoch, OperationKind operation_kind);
+	Result retained_snapshot_for_test(const RecoveryEpoch &epoch,
+		OperationKind kind, NativeRetainedOperationSnapshot *snapshot) const;
+	Result broker_baseline_snapshot_for_test(
+		NativeRetainedOperationSnapshot *snapshot) const;
 #endif
 	Result Snapshot(const RecoveryEpoch &epoch,
 		MisterRecoveryObservationV2 *observation) const;

@@ -23,6 +23,91 @@ namespace mister {
 namespace native {
 namespace {
 
+void AssertZeroRetainedSnapshot(const NativeRetainedOperationSnapshot &snapshot)
+{
+	const NativeRetainedOperationSnapshot zero = {};
+	assert(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+}
+
+void AssertSameRetainedSnapshot(const NativeRetainedOperationSnapshot &left,
+	const NativeRetainedOperationSnapshot &right)
+{
+	assert(memcmp(&left, &right, sizeof(left)) == 0);
+}
+
+void NormalizeCleanupRebindFields(NativeRetainedOperationSnapshot *snapshot)
+{
+	snapshot->registration_effective_deadline_ms = 0;
+	snapshot->invocation_identity = 0;
+	snapshot->invocation_callback_deadline_ms = 0;
+	snapshot->peripheral_phase = PeripheralSessionPhase::live;
+	snapshot->protocol_phase = ProtocolSessionHandleState::live;
+	snapshot->core_disposition = CoreProtocolBrokerDisposition::no_session;
+	snapshot->peripheral_disposition = PeripheralBrokerDisposition::no_session;
+	snapshot->invocation_registered = false;
+	snapshot->invocation_outcome_missing = false;
+	snapshot->registration_is_invoked = false;
+	snapshot->registration_is_suspended = false;
+	snapshot->registration_outcome_recorded = false;
+	snapshot->process_guard_active = false;
+}
+
+void AssertOnlyCleanupRebindFieldsChanged(
+	const NativeRetainedOperationSnapshot &before,
+	const NativeRetainedOperationSnapshot &after)
+{
+	NativeRetainedOperationSnapshot normalized_before = before;
+	NativeRetainedOperationSnapshot normalized_after = after;
+	NormalizeCleanupRebindFields(&normalized_before);
+	NormalizeCleanupRebindFields(&normalized_after);
+	AssertSameRetainedSnapshot(normalized_before, normalized_after);
+}
+
+struct LifecycleSaveEvidence {
+	size_t fdatasync_attempts;
+	size_t file_fsync_successes;
+	size_t directory_fsync_successes;
+	size_t descriptor_close_successes;
+	size_t open_descriptor_count;
+	bool file_synced;
+	bool directory_synced;
+	bool descriptors_closed;
+	bool closure_unknown;
+};
+
+void AssertSameLifecycleSaveEvidence(const LifecycleSaveEvidence &left,
+	const LifecycleSaveEvidence &right)
+{
+	assert(left.fdatasync_attempts == right.fdatasync_attempts);
+	assert(left.file_fsync_successes == right.file_fsync_successes);
+	assert(left.directory_fsync_successes == right.directory_fsync_successes);
+	assert(left.descriptor_close_successes == right.descriptor_close_successes);
+	assert(left.open_descriptor_count == right.open_descriptor_count);
+	assert(left.file_synced == right.file_synced);
+	assert(left.directory_synced == right.directory_synced);
+	assert(left.descriptors_closed == right.descriptors_closed);
+	assert(left.closure_unknown == right.closure_unknown);
+}
+
+struct LifecycleCoreEvidence {
+	size_t mapping_count;
+	size_t descriptor_count;
+	size_t release_attempts;
+	size_t release_successes;
+	bool selected_transaction_closed;
+};
+
+void AssertSameLifecycleCoreEvidence(const LifecycleCoreEvidence &left,
+	const LifecycleCoreEvidence &right)
+{
+	assert(left.mapping_count == right.mapping_count);
+	assert(left.descriptor_count == right.descriptor_count);
+	assert(left.release_attempts == right.release_attempts);
+	assert(left.release_successes == right.release_successes);
+	assert(left.selected_transaction_closed ==
+		right.selected_transaction_closed);
+}
+
 class FakeClock final : public NativeClock {
 public:
 	explicit FakeClock(uint64_t now_ms)
@@ -74,6 +159,7 @@ struct LifecycleSaveNode {
 	int descriptor;
 	struct stat identity;
 	uint64_t mount_id;
+	bool open;
 };
 
 // The real adapter is kept intact; this is only its filesystem boundary. The
@@ -87,7 +173,8 @@ public:
 		: failing_mount_call_(failing_mount_call), mount_calls_(0), trace_(),
 		  corrupt_system_entry_after_create_(corrupt_system_entry_after_create),
 		  file_created_(false), fail_first_root_open_once_(fail_first_root_open_once),
-		  now_ms_(now_ms), operation_count_(0),
+		  now_ms_(now_ms), operation_count_(0), fail_fdatasync_once_(false),
+		  evidence_(), snapshot_lifecycle_(nullptr), callback_snapshots_(),
 		  root_(Node(10, 1, S_IFDIR | 0755, 0, 0)),
 		  parent_(Node(11, 2, S_IFDIR | 0755, 0, 0)),
 		  save_root_(Node(12, 3, S_IFDIR | 0700, 1000, 1000)),
@@ -105,16 +192,27 @@ public:
 			fail_first_root_open_once_ = false;
 			return {-1, EIO};
 		}
-		if (parent == AT_FDCWD && strcmp(name, "/") == 0) return {10, 0};
-		if (parent == 10 && strcmp(name, "fogcast-fixture") == 0) return {11, 0};
-		if (parent == 11 && strcmp(name, "saves") == 0) return {12, 0};
-		if (parent == 12 && strcmp(name, "snes") == 0) return {13, 0};
+		int descriptor = -1;
+		if (parent == AT_FDCWD && strcmp(name, "/") == 0) descriptor = 10;
+		else if (parent == 10 && strcmp(name, "fogcast-fixture") == 0)
+			descriptor = 11;
+		else if (parent == 11 && strcmp(name, "saves") == 0) descriptor = 12;
+		else if (parent == 12 && strcmp(name, "snes") == 0) descriptor = 13;
 		if (parent == 13 && strstr(name, ".sav") != nullptr) {
 			if (corrupt_system_entry_after_create_ && !file_created_) {
 				if ((flags & O_CREAT) == 0) return {-1, ENOENT};
 				file_created_ = true;
 			}
-			return {14, 0};
+			descriptor = 14;
+		}
+		if (descriptor >= 0) {
+			LifecycleSaveNode *const node = NodeForMutable(descriptor);
+			assert(node != nullptr);
+			if (!node->open) {
+				node->open = true;
+				++evidence_.open_descriptor_count;
+			}
+			return {descriptor, 0};
 		}
 		return {-1, ENOENT};
 	}
@@ -155,20 +253,40 @@ public:
 	int Fdatasync(int descriptor) override
 	{
 		++operation_count_;
+		CaptureCallbackSnapshot();
+		++evidence_.fdatasync_attempts;
 		trace_.push_back('d');
-		return NodeFor(descriptor) == nullptr ? -1 : 0;
+		if (NodeFor(descriptor) == nullptr) return -1;
+		if (fail_fdatasync_once_) {
+			fail_fdatasync_once_ = false;
+			return -1;
+		}
+		evidence_.file_synced = true;
+		return 0;
 	}
 	int Fsync(int descriptor) override
 	{
 		++operation_count_;
 		trace_.push_back(descriptor == 14 ? 'f' : 's');
-		return NodeFor(descriptor) == nullptr ? -1 : 0;
+		if (NodeFor(descriptor) == nullptr) return -1;
+		if (descriptor == 14) ++evidence_.file_fsync_successes;
+		else {
+			++evidence_.directory_fsync_successes;
+			evidence_.directory_synced = true;
+		}
+		return 0;
 	}
 	int Close(int descriptor) override
 	{
 		++operation_count_;
 		trace_.push_back(static_cast<char>('0' + descriptor - 10));
-		return NodeFor(descriptor) == nullptr ? -1 : 0;
+		LifecycleSaveNode *const node = NodeForMutable(descriptor);
+		if (node == nullptr || !node->open) return -1;
+		node->open = false;
+		--evidence_.open_descriptor_count;
+		++evidence_.descriptor_close_successes;
+		evidence_.descriptors_closed = evidence_.open_descriptor_count == 0;
+		return 0;
 	}
 	const std::vector<char> &trace() const { return trace_; }
 	size_t operation_count() const { return operation_count_; }
@@ -177,6 +295,12 @@ public:
 	{
 		corrupt_system_entry_after_create_ = false;
 	}
+	void FailFdatasyncOnce() { fail_fdatasync_once_ = true; }
+	void ObserveSnapshots(NativeLifecycle *lifecycle)
+	{ snapshot_lifecycle_ = lifecycle; }
+	const LifecycleSaveEvidence &evidence() const { return evidence_; }
+	const std::vector<NativeRetainedOperationSnapshot> &callback_snapshots() const
+	{ return callback_snapshots_; }
 
 private:
 	static LifecycleSaveNode Node(int descriptor, ino_t inode, mode_t mode,
@@ -191,6 +315,7 @@ private:
 		node.identity.st_uid = uid;
 		node.identity.st_gid = gid;
 		node.mount_id = 77;
+		node.open = false;
 		return node;
 	}
 	const LifecycleSaveNode *NodeFor(int descriptor) const
@@ -201,6 +326,22 @@ private:
 			if (nodes[index]->descriptor == descriptor) return nodes[index];
 		return nullptr;
 	}
+	LifecycleSaveNode *NodeForMutable(int descriptor)
+	{
+		LifecycleSaveNode *const nodes[] = {
+			&root_, &parent_, &save_root_, &system_, &file_};
+		for (size_t index = 0; index < sizeof(nodes) / sizeof(nodes[0]); ++index)
+			if (nodes[index]->descriptor == descriptor) return nodes[index];
+		return nullptr;
+	}
+	void CaptureCallbackSnapshot()
+	{
+		if (snapshot_lifecycle_ == nullptr) return;
+		NativeRetainedOperationSnapshot snapshot = {};
+		assert(snapshot_lifecycle_->cleanup_retained_callback_snapshot_for_test(
+			OperationKind::save, &snapshot) == MISTER_RESULT_OK);
+		callback_snapshots_.push_back(snapshot);
+	}
 
 	int failing_mount_call_;
 	int mount_calls_;
@@ -210,12 +351,67 @@ private:
 	bool fail_first_root_open_once_;
 	uint64_t now_ms_;
 	size_t operation_count_;
+	bool fail_fdatasync_once_;
+	LifecycleSaveEvidence evidence_;
+	NativeLifecycle *snapshot_lifecycle_;
+	std::vector<NativeRetainedOperationSnapshot> callback_snapshots_;
 	LifecycleSaveNode root_;
 	LifecycleSaveNode parent_;
 	LifecycleSaveNode save_root_;
 	LifecycleSaveNode system_;
 	LifecycleSaveNode file_;
 };
+
+class ObservedLifecycleSaveResource final : public NativeSaveResource {
+public:
+	explicit ObservedLifecycleSaveResource(NativeSaveResource &delegate)
+		: delegate_(delegate) {}
+
+	NativeSaveOpenOutcome OpenSave(const OperationLease &lease,
+		const NativeCoreProfile &profile, const NativeSaveKey &key) override
+	{
+		const NativeSaveOpenOutcome outcome =
+			delegate_.OpenSave(lease, profile, key);
+		open_outcomes.push_back(outcome);
+		return outcome;
+	}
+
+	NativeSaveCloseOutcome FlushAndCloseSave(
+		const OperationLease &lease) override
+	{
+		const NativeSaveCloseOutcome outcome = delegate_.FlushAndCloseSave(lease);
+		close_outcomes.push_back(outcome);
+		return outcome;
+	}
+
+	NativeSaveCloseOutcome RecoverSave(const OperationLease &lease,
+		const SafeSaveRecoveryRecord &record) override
+	{
+		return delegate_.RecoverSave(lease, record);
+	}
+
+	void CloseSaveForProcessExit() override
+	{
+		++process_exit_close_calls;
+		delegate_.CloseSaveForProcessExit();
+	}
+
+	NativeSaveResource &delegate_;
+	std::vector<NativeSaveOpenOutcome> open_outcomes;
+	std::vector<NativeSaveCloseOutcome> close_outcomes;
+	size_t process_exit_close_calls = 0;
+};
+
+void AssertSaveCloseOutcome(const NativeSaveCloseOutcome &outcome,
+	Result result, bool data_synchronized, bool metadata_synchronized,
+	bool descriptors_absent, bool closure_unknown)
+{
+	assert(outcome.result == result);
+	assert(outcome.data_synchronized == data_synchronized);
+	assert(outcome.metadata_synchronized == metadata_synchronized);
+	assert(outcome.descriptors_absent == descriptors_absent);
+	assert(outcome.closure_unknown == closure_unknown);
+}
 
 enum class Event : uint8_t {
 	preflight,
@@ -595,10 +791,20 @@ public:
 		const Result acquire = CoreProtocolAuthorityTestPeer::AcquireCleanup(
 			lease, broker_, &session);
 		if (acquire != MISTER_RESULT_OK) return acquire;
+		if (core_mapping_count_ == 0) core_mapping_count_ = 1;
+		if (core_descriptor_count_ == 0) core_descriptor_count_ = 2;
+		core_selected_transaction_closed_ = false;
+		if (lifecycle_ != nullptr) {
+			NativeRetainedOperationSnapshot snapshot = {};
+			assert(lifecycle_->cleanup_retained_callback_snapshot_for_test(
+				OperationKind::core_protocol, &snapshot) == MISTER_RESULT_OK);
+			core_cleanup_snapshots.push_back(snapshot);
+		}
 		shutdown_protocol_profile_ = protocol_profile_;
 		hardware_events.push_back(Event::shutdown_core_protocol);
 		hardware_deadlines.push_back(lease.absolute_deadline_ms());
 		const Result primary = Run(Event::shutdown_core_protocol);
+		++core_release_attempts_;
 		if (abandon_core_protocol_release_once_) {
 			abandon_core_protocol_release_once_ = false;
 			return MISTER_RESULT_PLATFORM;
@@ -609,6 +815,12 @@ public:
 			broker_.mutation_sequence_for_test()};
 		const Result completed = CoreProtocolAuthorityTestPeer::CompleteCleanup(
 			lease, broker_, std::move(session), release);
+		if (completed == MISTER_RESULT_OK) {
+			core_mapping_count_ = 0;
+			core_descriptor_count_ = 0;
+			++core_release_successes_;
+			core_selected_transaction_closed_ = true;
+		}
 		return completed == MISTER_RESULT_OK ? primary : completed;
 	}
 
@@ -675,6 +887,12 @@ public:
 			first_save_cleanup_lease_ = &lease;
 		else
 			save_cleanup_lease_reused_ = first_save_cleanup_lease_ == &lease;
+		if (lifecycle_ != nullptr) {
+			NativeRetainedOperationSnapshot snapshot = {};
+			assert(lifecycle_->cleanup_retained_callback_snapshot_for_test(
+				OperationKind::save, &snapshot) == MISTER_RESULT_OK);
+			save_cleanup_snapshots.push_back(snapshot);
+		}
 		bounded_events.push_back(Event::flush_close_save);
 		bounded_deadlines.push_back(lease.absolute_deadline_ms());
 		const Result result = Run(Event::flush_close_save);
@@ -682,7 +900,10 @@ public:
 			advance_broker_clock_after_save_cleanup_ms_ != 0)
 			clock_.SetNow(advance_broker_clock_after_save_cleanup_ms_);
 		const bool complete = result == MISTER_RESULT_OK;
-		return {result, complete, complete, complete, false};
+		const NativeSaveCloseOutcome outcome =
+			{result, complete, complete, complete, false};
+		save_close_outcomes.push_back(outcome);
+		return outcome;
 	}
 	NativeSaveCloseOutcome RecoverSave(const OperationLease &,
 		const SafeSaveRecoveryRecord &) override
@@ -775,6 +996,12 @@ public:
 	size_t mapping_count() const { return mapping_count_; }
 	size_t descriptor_count() const { return descriptor_count_; }
 	size_t worker_count() const { return worker_count_; }
+	LifecycleCoreEvidence core_evidence() const
+	{
+		return {core_mapping_count_, core_descriptor_count_,
+			core_release_attempts_, core_release_successes_,
+			core_selected_transaction_closed_};
+	}
 
 	uint64_t LastHardwareDeadline(Event event) const
 	{
@@ -833,8 +1060,16 @@ public:
 	size_t mapping_count_ = 0;
 	size_t descriptor_count_ = 0;
 	size_t worker_count_ = 0;
+	size_t core_mapping_count_ = 0;
+	size_t core_descriptor_count_ = 0;
+	size_t core_release_attempts_ = 0;
+	size_t core_release_successes_ = 0;
+	bool core_selected_transaction_closed_ = true;
 	std::vector<NativeCleanupBrokerSnapshot> audio_cleanup_snapshots;
 	std::vector<NativeCleanupBrokerSnapshot> coupled_cleanup_snapshots;
+	std::vector<NativeRetainedOperationSnapshot> core_cleanup_snapshots;
+	std::vector<NativeRetainedOperationSnapshot> save_cleanup_snapshots;
+	std::vector<NativeSaveCloseOutcome> save_close_outcomes;
 
 private:
 	void ArmCleanupCheckout(OperationKind kind)
@@ -1114,6 +1349,29 @@ struct Fixture {
 	FakeResources resources;
 	NativeResourceSet set;
 	NativeLifecycle lifecycle;
+	const NativeCoreProfile &profile;
+};
+
+struct OwnedLifecycleFixture {
+	explicit OwnedLifecycleFixture(uint64_t now_ms)
+		: clock(now_ms), broker(clock), resources(clock, broker), containment_io(),
+		  containment(broker, containment_io), hardware(resources, containment),
+		  set{resources, hardware, resources, resources, resources, resources,
+			resources, resources, resources, resources},
+		  lifecycle(new NativeLifecycle(clock, broker, set)),
+		  profile(*FixtureNativeCoreProfile("snes"))
+	{
+		resources.ObserveLifecycle(lifecycle.get());
+	}
+
+	FakeClock clock;
+	HardwareBroker broker;
+	FakeResources resources;
+	LifecycleContainmentIo containment_io;
+	NativeContainment containment;
+	LifecycleHardwareWithContainment hardware;
+	NativeResourceSet set;
+	std::unique_ptr<NativeLifecycle> lifecycle;
 	const NativeCoreProfile &profile;
 };
 
@@ -1434,6 +1692,192 @@ void TestRealAdapterPostCreateAuthorityLossRetainsSavesUntilStableCleanup()
 	assert(filesystem.trace().size() == sizeof(expected));
 	for (size_t index = 0; index < sizeof(expected); ++index)
 		assert(filesystem.trace()[index] == expected[index]);
+}
+
+void AssertLiveLifecycleSaveSnapshot(
+	const NativeRetainedOperationSnapshot &snapshot, uint64_t group_deadline,
+	uint64_t effective_deadline)
+{
+	assert(snapshot.query_valid && snapshot.retained);
+	assert(snapshot.authority == LeaseAuthority::cleanup_epoch);
+	assert(snapshot.supplied_operation_kind == OperationKind::save &&
+		snapshot.retained_operation_kind == OperationKind::save);
+	assert(snapshot.typed_registration_present &&
+		!snapshot.typed_session_present && !snapshot.session_applicable);
+	assert(snapshot.backend_applicable && snapshot.backend_matches_expected);
+	assert(!snapshot.action_applicable &&
+		snapshot.action_word_count == 0 &&
+		snapshot.action_next_word_index == 0 &&
+		snapshot.session_initial_mutation_sequence == 0 &&
+		snapshot.session_last_mutation_sequence == 0);
+	assert(snapshot.registration_authority_deadline_ms == group_deadline &&
+		snapshot.registration_effective_deadline_ms == effective_deadline);
+	assert(snapshot.lease_identity != 0 &&
+		snapshot.registration_identity != 0 &&
+		snapshot.session_identity == 0 && snapshot.backend_identity != 0 &&
+		snapshot.invocation_identity != 0);
+	assert(snapshot.invocation_registered &&
+		snapshot.registration_is_invoked &&
+		!snapshot.registration_is_suspended && snapshot.process_guard_active);
+}
+
+// The real Linux save adapter supplies the fdatasync/descriptor authority
+// paired with the common retained snapshot on an ordinary Stop retry.
+void TestRealSaveNormalStopSnapshotPairsExactIoAndRebind()
+{
+	FakeClock clock(100);
+	HardwareBroker broker(clock);
+	FakeResources resources(clock, broker);
+	LifecycleContainmentIo containment_io;
+	NativeContainment containment(broker, containment_io);
+	LifecycleHardwareWithContainment hardware(resources, containment);
+	LifecycleSaveFileSystem filesystem(0);
+	linux_native::NativeSaveAdapter adapter(broker, filesystem);
+	ObservedLifecycleSaveResource save(adapter);
+	NativeResourceSet set = {resources, hardware, resources, resources,
+		resources, resources, resources, save, resources, resources};
+	NativeLifecycle lifecycle(clock, broker, set);
+	resources.ObserveLifecycle(&lifecycle);
+	filesystem.ObserveSnapshots(&lifecycle);
+	const NativeCoreProfile *const profile = FixtureNativeCoreProfile("snes");
+	assert(profile != nullptr);
+	assert(lifecycle.ActivateFixtureForTest(*profile, 1000) == MISTER_RESULT_OK);
+	assert(save.open_outcomes.size() == 1 &&
+		save.open_outcomes[0].result == MISTER_RESULT_OK &&
+		save.open_outcomes[0].acquired);
+	const LifecycleSaveEvidence opened = filesystem.evidence();
+	assert(opened.open_descriptor_count == 5 &&
+		opened.fdatasync_attempts == 0 &&
+		opened.descriptor_close_successes == 0);
+
+	filesystem.FailFdatasyncOnce();
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(save.close_outcomes.size() == 1);
+	AssertSaveCloseOutcome(save.close_outcomes[0], MISTER_RESULT_PLATFORM,
+		false, true, false, false);
+	assert(filesystem.callback_snapshots().size() == 1);
+	const NativeRetainedOperationSnapshot live =
+		filesystem.callback_snapshots()[0];
+	AssertLiveLifecycleSaveSnapshot(live, 2100, 2100);
+	NativeRetainedOperationSnapshot suspended = {};
+	assert(lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&suspended) == MISTER_RESULT_OK);
+	assert(suspended.registration_is_suspended &&
+		suspended.registration_effective_deadline_ms == 0 &&
+		suspended.invocation_identity == 0);
+	AssertOnlyCleanupRebindFieldsChanged(live, suspended);
+	NativeRetainedOperationSnapshot stable = {};
+	assert(lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&stable) == MISTER_RESULT_OK);
+	AssertSameRetainedSnapshot(suspended, stable);
+	const LifecycleSaveEvidence failed = filesystem.evidence();
+	assert(failed.fdatasync_attempts == 1 &&
+		failed.file_fsync_successes == 0 &&
+		failed.directory_fsync_successes == 0 &&
+		failed.descriptor_close_successes == 0 &&
+		failed.open_descriptor_count == 5 && !failed.file_synced &&
+		!failed.directory_synced && !failed.descriptors_closed &&
+		!failed.closure_unknown);
+	AssertSameLifecycleSaveEvidence(failed, filesystem.evidence());
+
+	clock.SetNow(200);
+	filesystem.SetNow(200);
+	resources.Fail(Event::terminal_fpga_cleanup);
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(save.close_outcomes.size() == 2);
+	AssertSaveCloseOutcome(save.close_outcomes[1], MISTER_RESULT_OK,
+		true, true, true, false);
+	assert(filesystem.callback_snapshots().size() == 2);
+	const NativeRetainedOperationSnapshot rebound =
+		filesystem.callback_snapshots()[1];
+	AssertOnlyCleanupRebindFieldsChanged(suspended, rebound);
+	const LifecycleSaveEvidence closed = filesystem.evidence();
+	assert(closed.fdatasync_attempts == 2 && closed.file_synced &&
+		closed.file_fsync_successes == 0 &&
+		closed.directory_fsync_successes == 0 &&
+		closed.descriptor_close_successes == 5 &&
+		closed.open_descriptor_count == 0 && !closed.directory_synced &&
+		closed.descriptors_closed && !closed.closure_unknown);
+	const char expected[] = {'d', 'd', '4', '3', '2', '1', '0'};
+	assert(filesystem.trace().size() == sizeof(expected));
+	for (size_t index = 0; index != sizeof(expected); ++index)
+		assert(filesystem.trace()[index] == expected[index]);
+	NativeRetainedOperationSnapshot destroyed = {};
+	assert(lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&destroyed) == MISTER_RESULT_OK);
+	assert(destroyed.query_valid && !destroyed.retained);
+	resources.ClearFailure();
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
+	assert(save.process_exit_close_calls == 0);
+}
+
+// The same real-adapter facts must hold when activation failure enters cleanup
+// and the retained save registration is rebound by a later Stop callback.
+void TestRealSaveActivationUnwindSnapshotPairsExactIoAndRebind()
+{
+	FakeClock clock(100);
+	HardwareBroker broker(clock);
+	FakeResources resources(clock, broker);
+	LifecycleContainmentIo containment_io;
+	NativeContainment containment(broker, containment_io);
+	LifecycleHardwareWithContainment hardware(resources, containment);
+	LifecycleSaveFileSystem filesystem(0);
+	linux_native::NativeSaveAdapter adapter(broker, filesystem);
+	ObservedLifecycleSaveResource save(adapter);
+	NativeResourceSet set = {resources, hardware, resources, resources,
+		resources, resources, resources, save, resources, resources};
+	NativeLifecycle lifecycle(clock, broker, set);
+	resources.ObserveLifecycle(&lifecycle);
+	filesystem.ObserveSnapshots(&lifecycle);
+	const NativeCoreProfile *const profile = FixtureNativeCoreProfile("snes");
+	assert(profile != nullptr);
+	resources.Fail(Event::start_scheduler);
+	filesystem.FailFdatasyncOnce();
+	assert(lifecycle.ActivateFixtureForTest(*profile, 1000) ==
+		MISTER_RESULT_PLATFORM);
+	assert(lifecycle.state() == NativeLifecycleState::cleanup);
+	assert(save.close_outcomes.size() == 1);
+	AssertSaveCloseOutcome(save.close_outcomes[0], MISTER_RESULT_PLATFORM,
+		false, true, false, false);
+	assert(filesystem.callback_snapshots().size() == 1);
+	const NativeRetainedOperationSnapshot live =
+		filesystem.callback_snapshots()[0];
+	AssertLiveLifecycleSaveSnapshot(live, 2100, 1000);
+	NativeRetainedOperationSnapshot suspended = {};
+	assert(lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&suspended) == MISTER_RESULT_OK);
+	AssertOnlyCleanupRebindFieldsChanged(live, suspended);
+	const LifecycleSaveEvidence failed = filesystem.evidence();
+	assert(failed.fdatasync_attempts == 1 &&
+		failed.open_descriptor_count == 5 &&
+		failed.descriptor_close_successes == 0);
+
+	resources.ClearFailure();
+	clock.SetNow(200);
+	filesystem.SetNow(200);
+	resources.Fail(Event::terminal_fpga_cleanup);
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(save.close_outcomes.size() == 2);
+	AssertSaveCloseOutcome(save.close_outcomes[1], MISTER_RESULT_OK,
+		true, true, true, false);
+	assert(filesystem.callback_snapshots().size() == 2);
+	const NativeRetainedOperationSnapshot rebound =
+		filesystem.callback_snapshots()[1];
+	AssertOnlyCleanupRebindFieldsChanged(suspended, rebound);
+	const LifecycleSaveEvidence closed = filesystem.evidence();
+	assert(closed.fdatasync_attempts == 2 && closed.file_synced &&
+		closed.file_fsync_successes == 0 &&
+		closed.directory_fsync_successes == 0 &&
+		closed.descriptor_close_successes == 5 &&
+		closed.open_descriptor_count == 0 && closed.descriptors_closed &&
+		!closed.closure_unknown);
+	NativeRetainedOperationSnapshot destroyed = {};
+	assert(lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&destroyed) == MISTER_RESULT_OK);
+	assert(destroyed.query_valid && !destroyed.retained);
+	resources.ClearFailure();
+	assert(lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_OK);
+	assert(save.process_exit_close_calls == 0);
 }
 
 void TestCoreProtocolReceivesAdmittedProfileAndRetainedContent()
@@ -1805,18 +2249,80 @@ void TestCoreProtocolReleaseRetryRetainsItsCleanupLease()
 	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
 	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 1);
+	assert(fixture.resources.core_cleanup_snapshots.size() == 1);
+	const NativeRetainedOperationSnapshot live =
+		fixture.resources.core_cleanup_snapshots[0];
+	assert(live.query_valid && live.retained && live.registration_is_invoked);
+	assert(live.core_disposition == CoreProtocolBrokerDisposition::session_current);
+	assert(live.protocol_phase == ProtocolSessionHandleState::live);
+	assert(live.lease_identity != 0 && live.registration_identity != 0 &&
+		live.session_identity != 0 && live.invocation_identity != 0);
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
 	assert((fixture.lifecycle.ledger().resource_flags &
 		MISTER_RESOURCE_CORE_PROTOCOL) != 0);
 	assert(!fixture.lifecycle.ledger().core_protocol_shutdown_complete);
+	NativeRetainedOperationSnapshot retained = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::core_protocol, &retained) == MISTER_RESULT_OK);
+	assert(retained.query_valid && retained.retained);
+	assert(retained.typed_registration_present && retained.typed_session_present);
+	assert(retained.registration_is_suspended && !retained.registration_is_invoked);
+	assert(retained.registration_effective_deadline_ms == 0);
+	assert(retained.invocation_identity == 0);
+	assert(retained.authority == LeaseAuthority::cleanup_epoch);
+	assert(retained.registration_authority_deadline_ms == timing.fpga_deadline_ms);
+	assert(retained.protocol_phase == ProtocolSessionHandleState::abandoned);
+	assert(retained.core_disposition ==
+		CoreProtocolBrokerDisposition::session_abandoned);
+	assert(retained.lease_identity == live.lease_identity &&
+		retained.registration_identity == live.registration_identity &&
+		retained.session_identity == live.session_identity &&
+		retained.invocation_identity == 0 &&
+		retained.session_last_mutation_sequence ==
+			live.session_last_mutation_sequence);
+	AssertOnlyCleanupRebindFieldsChanged(live, retained);
+	const LifecycleCoreEvidence failed_core = fixture.resources.core_evidence();
+	assert(failed_core.mapping_count == 1 &&
+		failed_core.descriptor_count == 2 &&
+		failed_core.release_attempts == 1 &&
+		failed_core.release_successes == 0 &&
+		!failed_core.selected_transaction_closed);
+	NativeRetainedOperationSnapshot retained_again = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::core_protocol, &retained_again) == MISTER_RESULT_OK);
+	AssertSameRetainedSnapshot(retained, retained_again);
+	AssertSameLifecycleCoreEvidence(failed_core,
+		fixture.resources.core_evidence());
 
 	fixture.clock.SetNow(200);
 	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.resources.Count(Event::shutdown_core_protocol) == 2);
+	assert(fixture.resources.core_cleanup_snapshots.size() == 2);
+	const NativeRetainedOperationSnapshot rebound =
+		fixture.resources.core_cleanup_snapshots[1];
+	assert(rebound.query_valid && rebound.retained &&
+		rebound.registration_is_invoked &&
+		rebound.invocation_identity != live.invocation_identity &&
+		rebound.lease_identity == live.lease_identity &&
+		rebound.registration_identity == live.registration_identity &&
+		rebound.session_identity == live.session_identity);
+	AssertOnlyCleanupRebindFieldsChanged(retained, rebound);
 	assert(fixture.resources.LastHardwareDeadline(Event::shutdown_core_protocol) ==
 		timing.fpga_deadline_ms);
 	assert(fixture.lifecycle.ledger().core_protocol_shutdown_complete);
 	assert(fixture.resources.Count(Event::terminal_fpga_cleanup) == 1);
+	const LifecycleCoreEvidence released_core = fixture.resources.core_evidence();
+	assert(released_core.mapping_count == 0 &&
+		released_core.descriptor_count == 0 &&
+		released_core.release_attempts == 2 &&
+		released_core.release_successes == 1 &&
+		released_core.selected_transaction_closed);
+	NativeRetainedOperationSnapshot destroyed = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::core_protocol, &destroyed) == MISTER_RESULT_OK);
+	assert(destroyed.query_valid && !destroyed.retained &&
+		destroyed.lease_identity == 0 && destroyed.registration_identity == 0 &&
+		destroyed.session_identity == 0 && destroyed.invocation_identity == 0);
 }
 
 void TestTypedCheckoutDeadlineDropsNonresumableRegistration()
@@ -1861,18 +2367,174 @@ void TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline()
 	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	const NativeCleanupTiming timing = fixture.lifecycle.cleanup_timing();
 	assert(fixture.resources.Count(Event::flush_close_save) == 1);
+	assert(fixture.resources.save_close_outcomes.size() == 1);
+	AssertSaveCloseOutcome(fixture.resources.save_close_outcomes[0],
+		MISTER_RESULT_PLATFORM, false, false, false, false);
+	assert(fixture.resources.save_cleanup_snapshots.size() == 1);
+	const NativeRetainedOperationSnapshot live =
+		fixture.resources.save_cleanup_snapshots[0];
+	assert(live.query_valid && live.retained && live.registration_is_invoked &&
+		live.lease_identity != 0 && live.registration_identity != 0 &&
+		live.invocation_identity != 0 &&
+		live.backend_applicable && live.backend_matches_expected);
 	assert((fixture.lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) != 0);
 	assert(fixture.resources.LastBoundedDeadline(Event::flush_close_save) ==
 		timing.non_fpga_deadline_ms);
+	NativeRetainedOperationSnapshot retained = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::save, &retained) == MISTER_RESULT_OK);
+	assert(retained.query_valid && retained.retained);
+	assert(retained.typed_registration_present && !retained.typed_session_present);
+	assert(!retained.session_applicable && retained.backend_applicable);
+	assert(!retained.action_applicable && retained.backend_matches_expected);
+	assert(retained.registration_is_suspended && !retained.registration_is_invoked);
+	assert(retained.registration_effective_deadline_ms == 0);
+	assert(retained.invocation_identity == 0);
+	assert(retained.registration_authority_deadline_ms == timing.non_fpga_deadline_ms);
+	assert(retained.lease_identity == live.lease_identity &&
+		retained.registration_identity == live.registration_identity &&
+		retained.session_identity == 0 &&
+		retained.session_last_mutation_sequence ==
+			live.session_last_mutation_sequence);
+	AssertOnlyCleanupRebindFieldsChanged(live, retained);
+	NativeRetainedOperationSnapshot retained_again = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::save, &retained_again) == MISTER_RESULT_OK);
+	AssertSameRetainedSnapshot(retained, retained_again);
 
 	fixture.resources.ClearFailure();
 	fixture.clock.SetNow(200);
 	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	assert(fixture.resources.Count(Event::flush_close_save) == 2);
+	assert(fixture.resources.save_cleanup_snapshots.size() == 2);
+	const NativeRetainedOperationSnapshot rebound =
+		fixture.resources.save_cleanup_snapshots[1];
+	assert(rebound.query_valid && rebound.retained &&
+		rebound.registration_is_invoked &&
+		rebound.invocation_identity != live.invocation_identity &&
+		rebound.lease_identity == live.lease_identity &&
+		rebound.registration_identity == live.registration_identity &&
+		rebound.session_identity == 0);
+	AssertOnlyCleanupRebindFieldsChanged(retained, rebound);
 	assert(fixture.resources.save_cleanup_lease_reused_);
+	assert(fixture.resources.save_close_outcomes.size() == 2);
+	AssertSaveCloseOutcome(fixture.resources.save_close_outcomes[1],
+		MISTER_RESULT_OK, true, true, true, false);
 	assert(fixture.resources.LastBoundedDeadline(Event::flush_close_save) ==
 		timing.non_fpga_deadline_ms);
 	assert((fixture.lifecycle.ledger().resource_flags & MISTER_RESOURCE_SAVES) == 0);
+	NativeRetainedOperationSnapshot destroyed = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::save, &destroyed) == MISTER_RESULT_OK);
+	assert(destroyed.query_valid && !destroyed.retained &&
+		destroyed.lease_identity == 0 && destroyed.registration_identity == 0 &&
+		destroyed.invocation_identity == 0);
+}
+
+// Breaks if activation-unwind cleanup gives save a fresh registration or
+// silently replays the successful cleanup prefix on the retry.
+void TestActivationUnwindSaveRetainedSnapshotRebindsWithoutPrefixReplay()
+{
+	Fixture fixture(100);
+	fixture.resources.Fail(Event::start_scheduler);
+	fixture.resources.FailAlso(Event::flush_close_save);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_PLATFORM);
+	assert(fixture.resources.save_cleanup_snapshots.size() == 1);
+	const NativeRetainedOperationSnapshot live =
+		fixture.resources.save_cleanup_snapshots[0];
+	assert(live.query_valid && live.retained && live.registration_is_invoked &&
+		live.authority == LeaseAuthority::cleanup_epoch);
+	NativeRetainedOperationSnapshot suspended = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&suspended) == MISTER_RESULT_OK);
+	assert(suspended.registration_is_suspended &&
+		suspended.registration_effective_deadline_ms == 0 &&
+		suspended.lease_identity == live.lease_identity &&
+		suspended.registration_identity == live.registration_identity);
+	AssertOnlyCleanupRebindFieldsChanged(live, suspended);
+	assert(fixture.resources.save_close_outcomes.size() == 1);
+	AssertSaveCloseOutcome(fixture.resources.save_close_outcomes[0],
+		MISTER_RESULT_PLATFORM, false, false, false, false);
+	const size_t save_prefix = fixture.resources.Count(Event::flush_close_save);
+	fixture.resources.ClearFailure();
+	fixture.clock.SetNow(200);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.resources.save_cleanup_snapshots.size() == 2);
+	const NativeRetainedOperationSnapshot rebound =
+		fixture.resources.save_cleanup_snapshots[1];
+	assert(rebound.registration_is_invoked &&
+		rebound.invocation_identity != live.invocation_identity &&
+		rebound.lease_identity == live.lease_identity &&
+		rebound.registration_identity == live.registration_identity);
+	AssertOnlyCleanupRebindFieldsChanged(suspended, rebound);
+	assert(fixture.resources.Count(Event::flush_close_save) == save_prefix + 1);
+	assert(fixture.resources.save_close_outcomes.size() == 2);
+	AssertSaveCloseOutcome(fixture.resources.save_close_outcomes[1],
+		MISTER_RESULT_OK, true, true, true, false);
+	NativeRetainedOperationSnapshot destroyed = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		&destroyed) == MISTER_RESULT_OK);
+	assert(destroyed.query_valid && !destroyed.retained);
+}
+
+// Breaks if activation-unwind core cleanup loses its retained identity or
+// repeats the save prefix after the core callback is rebound.
+void TestActivationUnwindCoreRetainedSnapshotRebindsWithoutPrefixReplay()
+{
+	Fixture fixture(100);
+	fixture.resources.Fail(Event::start_scheduler);
+	fixture.resources.FailAlso(Event::shutdown_core_protocol);
+	assert(fixture.lifecycle.ActivateFixtureForTest(fixture.profile, 1000) ==
+		MISTER_RESULT_PLATFORM);
+	assert(fixture.resources.core_cleanup_snapshots.size() == 1);
+	const NativeRetainedOperationSnapshot live =
+		fixture.resources.core_cleanup_snapshots[0];
+	assert(live.query_valid && live.retained && live.registration_is_invoked &&
+		live.core_disposition == CoreProtocolBrokerDisposition::session_current);
+	NativeRetainedOperationSnapshot suspended = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::core_protocol, &suspended) == MISTER_RESULT_OK);
+	assert(suspended.registration_is_suspended &&
+		suspended.protocol_phase == ProtocolSessionHandleState::abandoned &&
+		suspended.core_disposition ==
+			CoreProtocolBrokerDisposition::session_abandoned &&
+		suspended.lease_identity == live.lease_identity &&
+		suspended.registration_identity == live.registration_identity &&
+		suspended.session_identity == live.session_identity);
+	AssertOnlyCleanupRebindFieldsChanged(live, suspended);
+	const LifecycleCoreEvidence failed_core = fixture.resources.core_evidence();
+	assert(failed_core.mapping_count == 1 &&
+		failed_core.descriptor_count == 2 &&
+		failed_core.release_attempts == 1 &&
+		failed_core.release_successes == 0 &&
+		!failed_core.selected_transaction_closed);
+	const size_t core_prefix = fixture.resources.Count(Event::shutdown_core_protocol);
+	const size_t save_prefix = fixture.resources.Count(Event::flush_close_save);
+	fixture.resources.ClearFailure();
+	fixture.clock.SetNow(200);
+	assert(fixture.lifecycle.Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(fixture.resources.core_cleanup_snapshots.size() == 2);
+	const NativeRetainedOperationSnapshot rebound =
+		fixture.resources.core_cleanup_snapshots[1];
+	assert(rebound.registration_is_invoked &&
+		rebound.invocation_identity != live.invocation_identity &&
+		rebound.lease_identity == live.lease_identity &&
+		rebound.registration_identity == live.registration_identity &&
+		rebound.session_identity == live.session_identity);
+	AssertOnlyCleanupRebindFieldsChanged(suspended, rebound);
+	assert(fixture.resources.Count(Event::shutdown_core_protocol) == core_prefix + 1);
+	assert(fixture.resources.Count(Event::flush_close_save) == save_prefix);
+	const LifecycleCoreEvidence released_core = fixture.resources.core_evidence();
+	assert(released_core.mapping_count == 0 &&
+		released_core.descriptor_count == 0 &&
+		released_core.release_attempts == 2 &&
+		released_core.release_successes == 1 &&
+		released_core.selected_transaction_closed);
+	NativeRetainedOperationSnapshot destroyed = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::core_protocol, &destroyed) == MISTER_RESULT_OK);
+	assert(destroyed.query_valid && !destroyed.retained);
 }
 
 void TestSaveCleanupChecksTheBrokerClockAtLedgerCommit()
@@ -2158,6 +2820,208 @@ void TestRetainedAudioVideoCleanupRebindsExactDeadlineBoundaries()
 	}
 }
 
+// Breaks if save/core cleanup treats an expired callback as a fresh group
+// deadline, or lets an expired group resume the retained callback.
+void TestRetainedSaveAndCoreCleanupRebindExactDeadlineBoundaries()
+{
+	struct Case {
+		OperationKind kind;
+		Event event;
+		Event process_exit_event;
+		uint64_t group_deadline_ms;
+	};
+	const Case cases[] = {
+		{OperationKind::save, Event::flush_close_save, Event::destruct_save, 2100},
+		{OperationKind::core_protocol, Event::shutdown_core_protocol,
+			Event::destruct_core_protocol, 5100}};
+	struct Boundary {
+		bool group_authority;
+		int offset;
+	};
+	const Boundary boundaries[] = {{false, -1}, {false, 0}, {false, 1},
+		{true, -1}, {true, 0}, {true, 1}};
+	for (const Case &test : cases) {
+		for (const Boundary &boundary : boundaries) {
+			OwnedLifecycleFixture fixture(100);
+			assert(fixture.lifecycle->ActivateFixtureForTest(fixture.profile, 1000) ==
+				MISTER_RESULT_OK);
+			fixture.resources.Fail(test.event);
+			assert(fixture.lifecycle->Stop(UINT64_MAX) ==
+				MISTER_RESULT_CLEANUP_INCOMPLETE);
+			NativeRetainedOperationSnapshot suspended = {};
+			assert(fixture.lifecycle->cleanup_retained_snapshot_for_test(test.kind,
+				&suspended) == MISTER_RESULT_OK);
+			assert(suspended.retained && suspended.registration_is_suspended &&
+				suspended.registration_effective_deadline_ms == 0 &&
+				suspended.registration_authority_deadline_ms ==
+					test.group_deadline_ms);
+			NativeRetainedOperationSnapshot suspended_again = {};
+			assert(fixture.lifecycle->cleanup_retained_snapshot_for_test(test.kind,
+				&suspended_again) == MISTER_RESULT_OK);
+			AssertSameRetainedSnapshot(suspended, suspended_again);
+			const size_t count = fixture.resources.Count(test.event);
+			const size_t callback_snapshot_count = test.kind == OperationKind::save ?
+				fixture.resources.save_cleanup_snapshots.size() :
+				fixture.resources.core_cleanup_snapshots.size();
+			const LifecycleCoreEvidence core_before =
+				fixture.resources.core_evidence();
+			const size_t save_outcomes_before =
+				fixture.resources.save_close_outcomes.size();
+			const NativeSaveCloseOutcome save_before = test.kind == OperationKind::save ?
+				fixture.resources.save_close_outcomes.back() : NativeSaveCloseOutcome();
+			const uint64_t callback_deadline_ms = 1000;
+			const uint64_t boundary_ms = boundary.group_authority ?
+				test.group_deadline_ms : callback_deadline_ms;
+			const uint64_t now_ms = static_cast<uint64_t>(
+				static_cast<int64_t>(boundary_ms) + boundary.offset);
+			fixture.clock.SetNow(now_ms);
+			fixture.resources.ClearFailure();
+			if (boundary.offset < 0)
+				fixture.resources.Fail(Event::terminal_fpga_cleanup);
+			const Result result = fixture.lifecycle->Stop(
+				boundary.group_authority ? UINT64_MAX : callback_deadline_ms);
+			if (boundary.offset < 0) {
+				assert(result != MISTER_RESULT_DEADLINE);
+				assert(fixture.resources.Count(test.event) == count + 1);
+				const uint64_t effective_deadline = boundary.group_authority ?
+					test.group_deadline_ms : callback_deadline_ms;
+				const uint64_t actual_deadline = test.kind == OperationKind::save ?
+					fixture.resources.LastBoundedDeadline(test.event) :
+					fixture.resources.LastHardwareDeadline(test.event);
+				assert(actual_deadline == effective_deadline);
+				const NativeRetainedOperationSnapshot rebound = test.kind ==
+					OperationKind::save ? fixture.resources.save_cleanup_snapshots.back() :
+					fixture.resources.core_cleanup_snapshots.back();
+				assert((test.kind == OperationKind::save ?
+					fixture.resources.save_cleanup_snapshots.size() :
+					fixture.resources.core_cleanup_snapshots.size()) ==
+					callback_snapshot_count + 1);
+				AssertOnlyCleanupRebindFieldsChanged(suspended, rebound);
+			} else {
+				assert(result == MISTER_RESULT_DEADLINE);
+				assert(fixture.resources.Count(test.event) == count);
+				NativeRetainedOperationSnapshot unchanged = {};
+				assert(fixture.lifecycle->cleanup_retained_snapshot_for_test(test.kind,
+					&unchanged) == MISTER_RESULT_OK);
+				AssertSameRetainedSnapshot(suspended, unchanged);
+				NativeRetainedOperationSnapshot unchanged_again = {};
+				assert(fixture.lifecycle->cleanup_retained_snapshot_for_test(test.kind,
+					&unchanged_again) == MISTER_RESULT_OK);
+				AssertSameRetainedSnapshot(unchanged, unchanged_again);
+				assert((test.kind == OperationKind::save ?
+					fixture.resources.save_cleanup_snapshots.size() :
+					fixture.resources.core_cleanup_snapshots.size()) ==
+					callback_snapshot_count);
+				if (test.kind == OperationKind::save) {
+					assert(fixture.resources.save_close_outcomes.size() ==
+						save_outcomes_before);
+					AssertSaveCloseOutcome(fixture.resources.save_close_outcomes.back(),
+						save_before.result, save_before.data_synchronized,
+						save_before.metadata_synchronized,
+						save_before.descriptors_absent,
+						save_before.closure_unknown);
+				} else {
+					AssertSameLifecycleCoreEvidence(core_before,
+						fixture.resources.core_evidence());
+				}
+				if (boundary.group_authority) {
+					const PlatformGenerationId generation =
+						fixture.lifecycle->generation();
+					const uint64_t cleanup_epoch =
+						fixture.lifecycle->cleanup_epoch_identity_for_test();
+					const NativeCleanupTiming timing =
+						fixture.lifecycle->cleanup_timing();
+					const NativeResourceLedger ledger = fixture.lifecycle->ledger();
+					fixture.clock.SetNow(now_ms + 1);
+					assert(fixture.lifecycle->Stop(UINT64_MAX) ==
+						MISTER_RESULT_DEADLINE);
+					assert(fixture.resources.Count(test.event) == count);
+					assert(fixture.lifecycle->generation() == generation &&
+						fixture.lifecycle->cleanup_epoch_identity_for_test() ==
+							cleanup_epoch &&
+						fixture.lifecycle->cleanup_timing().cleanup_start_ms ==
+							timing.cleanup_start_ms &&
+						fixture.lifecycle->cleanup_timing().non_fpga_deadline_ms ==
+							timing.non_fpga_deadline_ms &&
+						fixture.lifecycle->cleanup_timing().fpga_deadline_ms ==
+							timing.fpga_deadline_ms &&
+						fixture.lifecycle->ledger().resource_flags ==
+							ledger.resource_flags &&
+						fixture.resources.Count(Event::terminal_fpga_cleanup) == 0);
+					NativeRetainedOperationSnapshot terminal = {};
+					assert(fixture.lifecycle->cleanup_retained_snapshot_for_test(
+						test.kind, &terminal) == MISTER_RESULT_OK);
+					AssertSameRetainedSnapshot(unchanged, terminal);
+					const size_t process_exit_before =
+						fixture.resources.Count(test.process_exit_event);
+					fixture.resources.ObserveLifecycle(nullptr);
+					fixture.lifecycle.reset();
+					assert(fixture.resources.Count(test.event) == count);
+					assert(fixture.resources.Count(test.process_exit_event) ==
+						process_exit_before + 1);
+					continue;
+				}
+				const uint64_t retry_now_ms = 1100;
+				const uint64_t retry_callback_deadline_ms = 1500;
+				fixture.clock.SetNow(retry_now_ms);
+				assert(now_ms <= retry_now_ms && retry_now_ms <
+					retry_callback_deadline_ms && retry_callback_deadline_ms <
+					test.group_deadline_ms);
+				fixture.resources.Fail(Event::terminal_fpga_cleanup);
+				assert(fixture.lifecycle->Stop(retry_callback_deadline_ms) ==
+					MISTER_RESULT_CLEANUP_INCOMPLETE);
+				assert(fixture.resources.Count(test.event) == count + 1);
+				const uint64_t actual_deadline = test.kind == OperationKind::save ?
+					fixture.resources.LastBoundedDeadline(test.event) :
+					fixture.resources.LastHardwareDeadline(test.event);
+				assert(actual_deadline == retry_callback_deadline_ms);
+				const NativeRetainedOperationSnapshot rebound = test.kind ==
+					OperationKind::save ? fixture.resources.save_cleanup_snapshots.back() :
+					fixture.resources.core_cleanup_snapshots.back();
+				AssertOnlyCleanupRebindFieldsChanged(suspended, rebound);
+			}
+			if (test.kind == OperationKind::save) {
+				assert(fixture.resources.save_close_outcomes.size() ==
+					save_outcomes_before + 1);
+				AssertSaveCloseOutcome(fixture.resources.save_close_outcomes.back(),
+					MISTER_RESULT_OK, true, true, true, false);
+			} else {
+				const LifecycleCoreEvidence released =
+					fixture.resources.core_evidence();
+				assert(released.mapping_count == 0 &&
+					released.descriptor_count == 0 &&
+					released.release_attempts == core_before.release_attempts + 1 &&
+					released.release_successes ==
+						core_before.release_successes + 1 &&
+					released.selected_transaction_closed);
+			}
+			NativeRetainedOperationSnapshot destroyed = {};
+			assert(fixture.lifecycle->cleanup_retained_snapshot_for_test(test.kind,
+				&destroyed) == MISTER_RESULT_OK);
+			assert(destroyed.query_valid && !destroyed.retained);
+			const size_t completed_count = fixture.resources.Count(test.event);
+			fixture.resources.ClearFailure();
+			const Result final_result = fixture.lifecycle->Stop(UINT64_MAX);
+			assert(fixture.resources.Count(test.event) == completed_count);
+			if (test.kind == OperationKind::core_protocol &&
+				boundary.group_authority) {
+				// At core G-1 the exact core release succeeds, but the already-expired
+				// non-FPGA authority correctly prevents the later audio promotion.
+				assert(final_result == MISTER_RESULT_DEADLINE);
+				const size_t process_exit_before = fixture.resources.Count(
+					Event::destruct_core_protocol);
+				fixture.resources.ObserveLifecycle(nullptr);
+				fixture.lifecycle.reset();
+				assert(fixture.resources.Count(test.event) == completed_count);
+				assert(fixture.resources.Count(Event::destruct_core_protocol) ==
+					process_exit_before + 1);
+			} else {
+				assert(final_result == MISTER_RESULT_OK);
+			}
+		}
+	}
+}
+
 void TestActivationUnwindResumesRetainedAudioVideoWithoutPrefixReplay()
 {
 	const Event retained_events[] = {Event::stop_audio,
@@ -2388,6 +3252,11 @@ void TestTwoHundredLifecycleCyclesReturnToTheEmptyBaseline()
 		assert(final.hardware_transaction_active ==
 			baseline.hardware_transaction_active);
 		assert(final.broker_idle == baseline.broker_idle);
+		NativeRetainedOperationSnapshot no_current = {};
+		memset(&no_current, 0xff, sizeof(no_current));
+		assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+			OperationKind::save, &no_current) == MISTER_RESULT_INVALID_STATE);
+		AssertZeroRetainedSnapshot(no_current);
 		assert(fixture.resources.mapping_count() == mapping_baseline);
 		assert(fixture.resources.descriptor_count() == descriptor_baseline);
 		assert(fixture.resources.worker_count() == worker_baseline);
@@ -2668,6 +3537,47 @@ void TestDestroyingRetainedTypedCleanupDoesNotReplayAndUsesProcessExitClose()
 	}
 }
 
+// Break caught: omitting the common retained snapshot would leave save cleanup
+// registrations unobservable after a retryable close outcome.
+void TestSaveCleanupRetainedSnapshotIsInitiallyNonRetained()
+{
+	Fixture fixture(100);
+	NativeRetainedOperationSnapshot snapshot = {};
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::save, &snapshot) == MISTER_RESULT_INVALID_STATE);
+	assert(!snapshot.query_valid);
+}
+
+// Cleanup-query failure is fail-closed: a caller cannot retain evidence from
+// a no-current, unsupported, null, foreign-owner, or completed cleanup epoch.
+void TestLifecycleSnapshotFailureMatrixZeroesEveryField()
+{
+	const OperationKind kinds[] = {OperationKind::save, OperationKind::video,
+		OperationKind::audio, OperationKind::audio_video,
+		OperationKind::core_protocol};
+	Fixture fixture(100);
+	for (OperationKind kind : kinds) {
+		NativeRetainedOperationSnapshot snapshot = {};
+		memset(&snapshot, 0xff, sizeof(snapshot));
+		assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(kind,
+			&snapshot) == MISTER_RESULT_INVALID_STATE);
+		AssertZeroRetainedSnapshot(snapshot);
+	}
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(OperationKind::save,
+		nullptr) == MISTER_RESULT_INVALID_ARGUMENT);
+	NativeRetainedOperationSnapshot snapshot = {};
+	memset(&snapshot, 0xff, sizeof(snapshot));
+	assert(fixture.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::input, &snapshot) == MISTER_RESULT_INVALID_ARGUMENT);
+	AssertZeroRetainedSnapshot(snapshot);
+
+	Fixture foreign(100);
+	memset(&snapshot, 0xff, sizeof(snapshot));
+	assert(foreign.lifecycle.cleanup_retained_snapshot_for_test(
+		OperationKind::core_protocol, &snapshot) == MISTER_RESULT_INVALID_STATE);
+	AssertZeroRetainedSnapshot(snapshot);
+}
+
 } // namespace
 } // namespace native
 } // namespace mister
@@ -2685,6 +3595,8 @@ int main()
 	mister::native::TestRealAdapterZeroDescriptorFailuresClearStateForReuse();
 	mister::native::TestRealAdapterZeroDescriptorFailureDestructorPerformsNoIo();
 	mister::native::TestRealAdapterPostCreateAuthorityLossRetainsSavesUntilStableCleanup();
+	mister::native::TestRealSaveNormalStopSnapshotPairsExactIoAndRebind();
+	mister::native::TestRealSaveActivationUnwindSnapshotPairsExactIoAndRebind();
 	mister::native::TestCoreProtocolReceivesAdmittedProfileAndRetainedContent();
 	mister::native::TestRetainedContentDescriptionAndReadStayBounded();
 	mister::native::TestFailureAfterEveryAcquisitionUnwindsWithoutChangingResult();
@@ -2700,10 +3612,13 @@ int main()
 	mister::native::TestCoreProtocolReleaseRetryRetainsItsCleanupLease();
 	mister::native::TestTypedCheckoutDeadlineDropsNonresumableRegistration();
 	mister::native::TestSaveReleaseRetryRetainsItsCleanupLeaseAndDeadline();
+	mister::native::TestActivationUnwindSaveRetainedSnapshotRebindsWithoutPrefixReplay();
+	mister::native::TestActivationUnwindCoreRetainedSnapshotRebindsWithoutPrefixReplay();
 	mister::native::TestSaveCleanupChecksTheBrokerClockAtLedgerCommit();
 	mister::native::TestRetainedAudioCleanupSkipsCompletedVideoPrefix();
 	mister::native::TestRetainedCoupledCleanupSkipsCompletedVideoAndAudioPrefixes();
 	mister::native::TestRetainedAudioVideoCleanupRebindsExactDeadlineBoundaries();
+	mister::native::TestRetainedSaveAndCoreCleanupRebindExactDeadlineBoundaries();
 	mister::native::TestActivationUnwindResumesRetainedAudioVideoWithoutPrefixReplay();
 	mister::native::TestDestroyingActivationUnwindRetainedTypedCleanupUsesProcessExitClose();
 	mister::native::TestVideoCompletionFactRequiresSuccessAndResetsAtContainment();
@@ -2714,5 +3629,7 @@ int main()
 	mister::native::TestCapturedNeutralMustMatchTheActiveProfile();
 	mister::native::TestDestructorClosesOnlyOwnedProcessResources();
 	mister::native::TestDestroyingRetainedTypedCleanupDoesNotReplayAndUsesProcessExitClose();
+	mister::native::TestSaveCleanupRetainedSnapshotIsInitiallyNonRetained();
+	mister::native::TestLifecycleSnapshotFailureMatrixZeroesEveryField();
 	return 0;
 }

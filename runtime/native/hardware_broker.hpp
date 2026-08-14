@@ -9,6 +9,10 @@
 #include "runtime/native/native_core_profile.hpp"
 #include "runtime/native/native_peripheral_session.hpp"
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+#include "runtime/native/native_core_protocol_session_state.hpp"
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -90,6 +94,69 @@ enum class RecoveryResourceState : uint8_t;
 struct BrokerLifetime;
 struct OperationRegistration;
 struct ProtocolSessionState;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+// Host-only, equality-only observation of one broker-owned retained typed
+// operation. This deliberately carries no capability back to its caller.
+struct NativeRetainedOperationSnapshot {
+	LeaseAuthority authority;
+	OperationKind supplied_operation_kind;
+	OperationKind retained_operation_kind;
+	PeripheralSessionKind peripheral_session_kind;
+	PeripheralSessionAction peripheral_action;
+	PeripheralSessionPhase peripheral_phase;
+	ProtocolSessionHandleState protocol_phase;
+	CoreProtocolBrokerDisposition core_disposition;
+	PeripheralBrokerDisposition peripheral_disposition;
+	Result recovery_result;
+	uint64_t authority_identity;
+	uint32_t requested_resource_flags;
+	uint32_t observed_resource_flags;
+	uint32_t neutral_resource_flags;
+	uint32_t outstanding_resource_flags;
+	uint64_t non_fpga_deadline_ms;
+	uint64_t fpga_deadline_ms;
+	uint64_t registration_authority_deadline_ms;
+	uint64_t registration_effective_deadline_ms;
+	uint64_t invocation_identity;
+	uint64_t invocation_callback_deadline_ms;
+	uintptr_t lease_identity;
+	uintptr_t registration_identity;
+	uintptr_t session_identity;
+	uintptr_t backend_identity;
+	uint64_t session_initial_mutation_sequence;
+	uint64_t session_last_mutation_sequence;
+	uint64_t broker_mutation_sequence;
+	uint8_t action_word_count;
+	uint8_t action_next_word_index;
+	size_t active_lease_count;
+	size_t terminal_lease_count;
+	bool query_valid;
+	bool retained;
+	bool typed_registration_present;
+	bool typed_session_present;
+	bool session_applicable;
+	bool backend_applicable;
+	bool backend_matches_expected;
+	bool action_applicable;
+	bool action_transaction_closed;
+	bool action_progress_unknown;
+	bool recheckout_allowed;
+	bool invocation_registered;
+	bool invocation_outcome_missing;
+	bool registration_is_invoked;
+	bool registration_is_suspended;
+	bool registration_outcome_recorded;
+	bool process_guard_active;
+	bool hardware_transaction_active;
+	bool cleanup_registered;
+	bool recovery_registered;
+	bool recovery_observation_active;
+	bool terminal_neutral;
+	bool containment_receipt_current;
+	bool containment_evidence_pending;
+	bool broker_idle;
+};
+#endif
 namespace linux_native {
 class NativeFpgaProgrammer;
 class NativeInputAdapter;
@@ -661,6 +728,16 @@ private:
 	Result ContinueInvokedOperation(LeaseAuthority authority,
 		uint64_t authority_identity, const OperationInvocation &invocation,
 		const OperationLease &lease, uint64_t authority_deadline_ms);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	Result CopyRetainedOperationSnapshotForTest(LeaseAuthority authority,
+		uint64_t authority_identity, OperationKind supplied_kind,
+		const OperationLease *lease,
+		const PeripheralBackendIdentity *expected_peripheral_backend,
+		uintptr_t expected_backend_identity,
+		NativeRetainedOperationSnapshot *snapshot) const;
+	Result CopyIdleRetainedOperationSnapshotForTest(
+		NativeRetainedOperationSnapshot *snapshot) const;
+#endif
 	static bool IsHardwareOperation(OperationKind operation_kind);
 	static bool IsRecoveryOperation(OperationKind operation_kind,
 		uint32_t requested_resource_flags);
