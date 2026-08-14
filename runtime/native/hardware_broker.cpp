@@ -304,6 +304,16 @@ OperationLease::~OperationLease()
 {
 }
 
+Result OperationLease::BreakRetainedTypedOwnerCycle() const
+{
+	if (!registration_ || !registration_->lifetime)
+		return MISTER_RESULT_INVALID_STATE;
+	std::lock_guard<std::mutex> lifetime_lock(registration_->lifetime->mutex);
+	if (registration_->lifetime->broker != registration_->broker)
+		return MISTER_RESULT_INVALID_STATE;
+	return registration_->broker->BreakRetainedTypedOwnerCycle(*this);
+}
+
 Result OperationLease::AcquireHardwareLeaseView(
 	std::unique_ptr<HardwareLeaseView> *view) const
 {
@@ -732,6 +742,7 @@ HardwareBroker::HardwareBroker(NativeClock &clock)
 	  recovery_audio_shutdown_complete_(false),
 	  recovery_registered_(false),
 	  recovery_observation_active_(false), recovery_terminal_neutral_(false),
+	  retained_owner_destruction_failures_(0),
 	  hardware_transaction_active_(false), failure_latched_(false),
 	  recovery_result_(MISTER_RESULT_OK),
 	  receipt_authority_(LeaseAuthority::active_generation),
@@ -934,6 +945,149 @@ bool HardwareBroker::core_protocol_session_abandoned_for_test(
 		current->view->registration_.get() == registration.get() &&
 		current->handle_state.load() ==
 			ProtocolSessionHandleState::abandoned;
+}
+
+uint64_t HardwareBroker::retained_owner_destruction_failures_for_test()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return retained_owner_destruction_failures_;
+}
+
+bool HardwareBroker::exact_idle_for_test()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return state_ == State::idle && generation_ == 0 &&
+		cleanup_identity_ == 0 && recovery_identity_ == 0 &&
+		active_lease_count_ == 0 && terminal_lease_count_ == 0 &&
+		!cleanup_registered_ && !recovery_registered_ &&
+		!invocation_registered_ && invocation_registration_.expired() &&
+		suspended_registration_.expired() &&
+		core_protocol_session_state_.expired() &&
+		peripheral_session_state_.expired() &&
+		!containment_receipt_current_ && !containment_evidence_pending_ &&
+		!recovery_observation_active_ && !recovery_terminal_neutral_ &&
+		recovery_result_ == MISTER_RESULT_OK &&
+		recovery_observed_resource_flags_ == 0 &&
+		recovery_neutral_resource_flags_ == 0 &&
+		!hardware_transaction_active_ &&
+		retained_owner_destruction_failures_ == 0;
+}
+
+HardwareBroker::OwnerDestructionSnapshot
+HardwareBroker::owner_destruction_snapshot_for_test()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> registration =
+		suspended_registration_.lock();
+	const std::shared_ptr<PeripheralSessionState> peripheral =
+		peripheral_session_state_.lock();
+	const std::shared_ptr<ProtocolSessionState> core =
+		core_protocol_session_state_.lock();
+	const std::shared_ptr<OperationRegistration> session_registration = peripheral ?
+		peripheral->owner_registration.lock() : core ?
+		core->owner_registration.lock() : std::shared_ptr<OperationRegistration>();
+	const bool view_names_registration = peripheral ? peripheral->view &&
+		peripheral->view->registration_.get() == session_registration.get() : core ?
+		core->view && core->view->registration_.get() == session_registration.get() :
+		false;
+	const OwnerDestructionSnapshot snapshot = {
+		generation_, cleanup_identity_, recovery_identity_,
+		static_cast<uint64_t>(reinterpret_cast<uintptr_t>(registration.get())),
+		static_cast<uint64_t>(reinterpret_cast<uintptr_t>(peripheral ?
+			static_cast<void *>(peripheral.get()) : static_cast<void *>(core.get()))),
+		peripheral ? peripheral->initial_mutation_sequence : 0,
+		peripheral ? peripheral->last_mutation_sequence : 0,
+		registration ? registration->effective_deadline_ms : 0,
+		active_lease_count_, terminal_lease_count_,
+		registration ? registration->operation_kind : OperationKind::program_fpga,
+		peripheral ? peripheral->kind : PeripheralSessionKind::audio,
+		peripheral ? peripheral->phase.load() : PeripheralSessionPhase::finalized,
+		peripheral ? peripheral->action : PeripheralSessionAction::none,
+		static_cast<uint8_t>(core ? core->handle_state.load() :
+			ProtocolSessionHandleState::finalized),
+		invocation_registered_, registration != nullptr, core != nullptr,
+		peripheral != nullptr, view_names_registration,
+		peripheral && peripheral->action_progress_unknown,
+		peripheral && peripheral->recheckout_allowed, hardware_transaction_active_,
+		mutation_sequence_, retained_owner_destruction_failures_};
+	return snapshot;
+}
+
+Result HardwareBroker::BreakRetainedTypedOwnerCycleForTest(
+	const OperationLease &lease)
+{
+	return BreakRetainedTypedOwnerCycle(lease);
+}
+
+Result HardwareBroker::BreakRetainedTypedOwnerCycleForTest(
+	const OperationLease &lease, OwnerDestructionTestFault fault)
+{
+	std::shared_ptr<OperationRegistration> registration = lease.registration_;
+	if (!registration) return MISTER_RESULT_INVALID_STATE;
+	OperationKind saved_kind = OperationKind::program_fpga;
+	uint64_t saved_identity = 0;
+	PeripheralSessionPhase saved_phase = PeripheralSessionPhase::finalized;
+	std::shared_ptr<OperationRegistration> saved_view_registration;
+	std::weak_ptr<PeripheralSessionState> saved_peripheral;
+	bool saved_containment = false;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (registration->broker != this) return MISTER_RESULT_INVALID_STATE;
+		saved_kind = registration->operation_kind;
+		saved_identity = registration->authority_identity;
+		saved_containment = containment_evidence_pending_;
+		if (registration->peripheral_session_state)
+			saved_phase = registration->peripheral_session_state->phase.load();
+		if (registration->peripheral_session_state &&
+			registration->peripheral_session_state->view)
+			saved_view_registration =
+				registration->peripheral_session_state->view->registration_;
+		saved_peripheral = peripheral_session_state_;
+		switch (fault) {
+		case OwnerDestructionTestFault::wrong_kind:
+			registration->operation_kind = OperationKind::save;
+			break;
+		case OwnerDestructionTestFault::wrong_epoch:
+			++registration->authority_identity;
+			break;
+		case OwnerDestructionTestFault::live_session:
+			if (registration->peripheral_session_state)
+				registration->peripheral_session_state->phase.store(
+					PeripheralSessionPhase::live);
+			break;
+		case OwnerDestructionTestFault::finalized_session:
+			if (registration->peripheral_session_state)
+				registration->peripheral_session_state->phase.store(
+					PeripheralSessionPhase::finalized);
+			break;
+		case OwnerDestructionTestFault::missing_view_edge:
+			if (registration->peripheral_session_state &&
+				registration->peripheral_session_state->view)
+				registration->peripheral_session_state->view->registration_.reset();
+			break;
+		case OwnerDestructionTestFault::foreign_session:
+			peripheral_session_state_.reset();
+			break;
+		case OwnerDestructionTestFault::containment_pending:
+			containment_evidence_pending_ = true;
+			break;
+		}
+	}
+	const Result result = BreakRetainedTypedOwnerCycle(lease);
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		registration->operation_kind = saved_kind;
+		registration->authority_identity = saved_identity;
+		if (registration->peripheral_session_state)
+			registration->peripheral_session_state->phase.store(saved_phase);
+		if (registration->peripheral_session_state &&
+			registration->peripheral_session_state->view)
+			registration->peripheral_session_state->view->registration_ =
+				saved_view_registration;
+		peripheral_session_state_ = saved_peripheral;
+		containment_evidence_pending_ = saved_containment;
+	}
+	return result;
 }
 #endif
 
@@ -3197,6 +3351,73 @@ void HardwareBroker::ReleaseOperation(OperationRegistration &registration)
 		active_lease_count_ == 0)
 		quiesce_complete_ = true;
 	lease_released_.notify_all();
+}
+
+void HardwareBroker::RecordRetainedOwnerDestructionFailure()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	++retained_owner_destruction_failures_;
+}
+
+Result HardwareBroker::BreakRetainedTypedOwnerCycle(const OperationLease &lease)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const std::shared_ptr<OperationRegistration> &registration =
+		lease.registration_;
+	if (!registration || !registration->registered ||
+		registration->broker != this ||
+		(registration->authority != LeaseAuthority::cleanup_epoch &&
+		 registration->authority != LeaseAuthority::recovery_epoch) ||
+		(registration->authority == LeaseAuthority::cleanup_epoch &&
+			(state_ != State::cleanup || !cleanup_registered_ ||
+			 registration->authority_identity != cleanup_identity_)) ||
+		(registration->authority == LeaseAuthority::recovery_epoch &&
+			(state_ != State::recovery || !recovery_registered_ ||
+			 registration->authority_identity != recovery_identity_)) ||
+		registration->effective_deadline_ms != 0 ||
+		registration->invocation_identity != 0 || !registration->outcome_recorded ||
+		invocation_registered_ || !invocation_registration_.expired() ||
+		active_lease_count_ != 1 || terminal_lease_count_ != 0 ||
+		!hardware_transaction_active_ || containment_evidence_pending_ ||
+		suspended_registration_.lock().get() != registration.get())
+		return MISTER_RESULT_INVALID_STATE;
+
+	if (registration->operation_kind == OperationKind::core_protocol) {
+		const std::shared_ptr<ProtocolSessionState> state =
+			registration->core_protocol_session_state;
+		if (!state || core_protocol_session_state_.lock().get() != state.get() ||
+			state->handle_state.load() != ProtocolSessionHandleState::abandoned ||
+			state->owner_registration.lock().get() != registration.get() ||
+			!state->view || state->view->registration_.get() != registration.get())
+			return MISTER_RESULT_INVALID_STATE;
+		state->handle_state.store(ProtocolSessionHandleState::finalized);
+		state->view->registration_.reset();
+		state->view.reset();
+		registration->core_protocol_session_state.reset();
+		core_protocol_session_state_.reset();
+	} else if (registration->operation_kind == OperationKind::audio ||
+		registration->operation_kind == OperationKind::video ||
+		registration->operation_kind == OperationKind::audio_video) {
+		const std::shared_ptr<PeripheralSessionState> state =
+			registration->peripheral_session_state;
+		if (!state || peripheral_session_state_.lock().get() != state.get() ||
+			state->phase.load() != PeripheralSessionPhase::abandoned ||
+			state->owner_registration.lock().get() != registration.get() ||
+			!state->view || state->view->registration_.get() != registration.get() ||
+			registration->peripheral_completion !=
+				PeripheralBrokerDisposition::no_session)
+			return MISTER_RESULT_INVALID_STATE;
+		state->phase.store(PeripheralSessionPhase::finalized);
+		state->view->registration_.reset();
+		state->view.reset();
+		registration->peripheral_session_state.reset();
+		peripheral_session_state_.reset();
+	} else {
+		return MISTER_RESULT_INVALID_STATE;
+	}
+	hardware_transaction_active_ = false;
+	lease_released_.notify_all();
+	return MISTER_RESULT_OK;
 }
 
 void HardwareBroker::UnregisterInvocation(OperationInvocation &invocation)

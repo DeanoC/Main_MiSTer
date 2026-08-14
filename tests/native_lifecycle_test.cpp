@@ -2193,6 +2193,75 @@ void TestActivationUnwindResumesRetainedAudioVideoWithoutPrefixReplay()
 	}
 }
 
+void TestDestroyingActivationUnwindRetainedTypedCleanupUsesProcessExitClose()
+{
+	const Event retained_events[] = {Event::stop_audio, Event::stop_video,
+		Event::stop_audio_video, Event::shutdown_core_protocol};
+	for (Event retained_event : retained_events) {
+		FakeClock clock(100);
+		HardwareBroker broker(clock);
+		FakeResources resources(clock, broker);
+		NativeResourceSet set = resources.Set();
+		std::unique_ptr<NativeLifecycle> lifecycle(
+			new NativeLifecycle(clock, broker, set));
+		resources.ObserveLifecycle(lifecycle.get());
+		resources.Fail(Event::start_scheduler);
+		resources.FailAlso(retained_event);
+		const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+		assert(lifecycle->ActivateFixtureForTest(profile, 1000) ==
+			MISTER_RESULT_PLATFORM);
+		const size_t typed_calls = resources.Count(retained_event);
+		const HardwareBroker::OwnerDestructionSnapshot retained =
+			broker.owner_destruction_snapshot_for_test();
+		assert(typed_calls == 1);
+		assert(retained.active_lease_count == 1);
+		assert(retained.hardware_transaction_active);
+		const uint64_t group_deadline = retained_event == Event::shutdown_core_protocol ?
+			5100 : 2100;
+		clock.SetNow(group_deadline);
+		assert(lifecycle->Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
+		assert(resources.Count(retained_event) == typed_calls);
+		clock.SetNow(group_deadline + 1);
+		assert(lifecycle->Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
+		assert(resources.Count(retained_event) == typed_calls);
+		const size_t event_count_before_destruction = resources.events.size();
+		lifecycle.reset();
+		assert(resources.Count(retained_event) == typed_calls);
+		const HardwareBroker::OwnerDestructionSnapshot destroyed =
+			broker.owner_destruction_snapshot_for_test();
+		assert(destroyed.active_lease_count == 0);
+		assert(!destroyed.core_session_present);
+		assert(!destroyed.peripheral_session_present);
+		assert(!destroyed.hardware_transaction_active);
+		assert(destroyed.destruction_failure_count == 0);
+		const std::vector<Event>::const_iterator destruction_begin =
+			resources.events.cbegin() + event_count_before_destruction;
+		if (retained_event == Event::stop_audio) {
+			assert(resources.Count(Event::destruct_audio) == 1);
+			assert(std::find(destruction_begin, resources.events.cend(),
+				Event::destruct_audio) != resources.events.cend());
+		} else if (retained_event == Event::stop_video) {
+			assert(resources.Count(Event::destruct_video) == 1);
+			assert(std::find(destruction_begin, resources.events.cend(),
+				Event::destruct_video) != resources.events.cend());
+		} else if (retained_event == Event::stop_audio_video) {
+			assert(resources.Count(Event::destruct_video) == 1);
+			assert(resources.Count(Event::destruct_audio) == 1);
+			const std::vector<Event>::const_iterator video_close = std::find(
+				destruction_begin, resources.events.cend(), Event::destruct_video);
+			const std::vector<Event>::const_iterator audio_close = std::find(
+				destruction_begin, resources.events.cend(), Event::destruct_audio);
+			assert(video_close != resources.events.cend());
+			assert(audio_close != resources.events.cend());
+			assert(video_close < audio_close);
+		} else {
+			assert(resources.Count(Event::destruct_core_protocol) == 1);
+			assert(std::find(destruction_begin, resources.events.cend(),
+				Event::destruct_core_protocol) != resources.events.cend());
+		}
+	}
+}
+
 void TestVideoCompletionFactRequiresSuccessAndResetsAtContainment()
 {
 	ContainedFixture retained(100);
@@ -2537,6 +2606,68 @@ void TestDestructorClosesOnlyOwnedProcessResources()
 	assert(resources.Count(Event::shutdown_core_protocol) == 0);
 }
 
+void TestDestroyingRetainedTypedCleanupDoesNotReplayAndUsesProcessExitClose()
+{
+	const Event cases[] = {Event::flush_close_save, Event::stop_audio,
+		Event::stop_video, Event::stop_audio_video, Event::shutdown_core_protocol};
+	const uint64_t expiry[] = {2100, 2100, 2100, 2100, 5100};
+	for (size_t index = 0; index != sizeof(cases) / sizeof(cases[0]); ++index) {
+		const Event retained_event = cases[index];
+		FakeClock clock(100);
+		HardwareBroker broker(clock);
+		FakeResources resources(clock, broker);
+		NativeResourceSet set = resources.Set();
+		std::unique_ptr<NativeLifecycle> lifecycle(
+			new NativeLifecycle(clock, broker, set));
+		resources.ObserveLifecycle(lifecycle.get());
+		const NativeCoreProfile &profile = *FixtureNativeCoreProfile("snes");
+		assert(lifecycle->ActivateFixtureForTest(profile, 1000) ==
+			MISTER_RESULT_OK);
+		resources.Fail(retained_event);
+		assert(lifecycle->Stop(UINT64_MAX) == MISTER_RESULT_CLEANUP_INCOMPLETE);
+		const size_t typed_calls = resources.Count(retained_event);
+		const HardwareBroker::OwnerDestructionSnapshot retained =
+			broker.owner_destruction_snapshot_for_test();
+		assert(retained.active_lease_count == 1);
+		assert(retained.hardware_transaction_active ==
+			(retained_event != Event::flush_close_save));
+		assert(retained.core_session_present ==
+			(retained_event == Event::shutdown_core_protocol));
+		assert(retained.peripheral_session_present ==
+			(retained_event == Event::stop_audio || retained_event == Event::stop_video ||
+			 retained_event == Event::stop_audio_video));
+		clock.SetNow(expiry[index]);
+		assert(lifecycle->Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
+		assert(resources.Count(retained_event) == typed_calls);
+		clock.SetNow(expiry[index] + 1);
+		assert(lifecycle->Stop(UINT64_MAX) == MISTER_RESULT_DEADLINE);
+		assert(resources.Count(retained_event) == typed_calls);
+		lifecycle.reset();
+		assert(resources.Count(retained_event) == typed_calls);
+		const HardwareBroker::OwnerDestructionSnapshot destroyed =
+			broker.owner_destruction_snapshot_for_test();
+		assert(destroyed.active_lease_count == 0);
+		assert(destroyed.terminal_lease_count == 0);
+		assert(!destroyed.core_session_present);
+		assert(!destroyed.peripheral_session_present);
+		assert(!destroyed.hardware_transaction_active);
+		assert(destroyed.destruction_failure_count == 0);
+		if (retained_event == Event::flush_close_save)
+			assert(resources.Count(Event::destruct_save) == 1);
+		else if (retained_event == Event::stop_audio)
+			assert(resources.Count(Event::destruct_audio) == 1);
+		else if (retained_event == Event::stop_video)
+			assert(resources.Count(Event::destruct_video) == 1);
+		else {
+			if (retained_event == Event::stop_audio_video) {
+				assert(resources.Count(Event::destruct_audio) == 1);
+				assert(resources.Count(Event::destruct_video) == 1);
+			} else
+				assert(resources.Count(Event::destruct_core_protocol) == 1);
+		}
+	}
+}
+
 } // namespace
 } // namespace native
 } // namespace mister
@@ -2574,6 +2705,7 @@ int main()
 	mister::native::TestRetainedCoupledCleanupSkipsCompletedVideoAndAudioPrefixes();
 	mister::native::TestRetainedAudioVideoCleanupRebindsExactDeadlineBoundaries();
 	mister::native::TestActivationUnwindResumesRetainedAudioVideoWithoutPrefixReplay();
+	mister::native::TestDestroyingActivationUnwindRetainedTypedCleanupUsesProcessExitClose();
 	mister::native::TestVideoCompletionFactRequiresSuccessAndResetsAtContainment();
 	mister::native::TestTwoHundredLifecycleCyclesReturnToTheEmptyBaseline();
 	mister::native::TestNormalStopUsesTheNormativeOrder();
@@ -2581,5 +2713,6 @@ int main()
 	mister::native::TestCleanupSuccessAtDeadlineDoesNotClearTheLedger();
 	mister::native::TestCapturedNeutralMustMatchTheActiveProfile();
 	mister::native::TestDestructorClosesOnlyOwnedProcessResources();
+	mister::native::TestDestroyingRetainedTypedCleanupDoesNotReplayAndUsesProcessExitClose();
 	return 0;
 }

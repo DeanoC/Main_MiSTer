@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include <array>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,37 @@ private:
 size_t KindIndex(OperationKind kind)
 {
 	return static_cast<size_t>(kind);
+}
+
+void AssertSameOwnerDestructionSnapshot(
+	const HardwareBroker::OwnerDestructionSnapshot &left,
+	const HardwareBroker::OwnerDestructionSnapshot &right)
+{
+	assert(left.generation == right.generation);
+	assert(left.cleanup_identity == right.cleanup_identity);
+	assert(left.recovery_identity == right.recovery_identity);
+	assert(left.registration_identity == right.registration_identity);
+	assert(left.session_identity == right.session_identity);
+	assert(left.session_initial_mutation_sequence == right.session_initial_mutation_sequence);
+	assert(left.session_last_mutation_sequence == right.session_last_mutation_sequence);
+	assert(left.effective_deadline_ms == right.effective_deadline_ms);
+	assert(left.active_lease_count == right.active_lease_count);
+	assert(left.terminal_lease_count == right.terminal_lease_count);
+	assert(left.operation_kind == right.operation_kind);
+	assert(left.peripheral_kind == right.peripheral_kind);
+	assert(left.peripheral_phase == right.peripheral_phase);
+	assert(left.peripheral_action == right.peripheral_action);
+	assert(left.core_handle_state == right.core_handle_state);
+	assert(left.invocation_registered == right.invocation_registered);
+	assert(left.suspended_registration_present == right.suspended_registration_present);
+	assert(left.core_session_present == right.core_session_present);
+	assert(left.peripheral_session_present == right.peripheral_session_present);
+	assert(left.session_view_names_registration == right.session_view_names_registration);
+	assert(left.session_progress_unknown == right.session_progress_unknown);
+	assert(left.session_recheckout_allowed == right.session_recheckout_allowed);
+	assert(left.hardware_transaction_active == right.hardware_transaction_active);
+	assert(left.mutation_sequence == right.mutation_sequence);
+	assert(left.destruction_failure_count == right.destruction_failure_count);
 }
 
 class FakeRecoveryIo final : public NativeRecoveryIo {
@@ -284,6 +316,85 @@ public:
 	uint64_t deadline_to_expire;
 	bool coupled_all_neutral;
 };
+
+struct RecoveryResourceTrace {
+	std::array<RecoveryResourceState, 11> io_states;
+	std::array<Result, 11> io_results;
+	int io_calls;
+	int core_protocol_session_calls;
+	uint64_t io_last_deadline;
+	bool abandon_core_protocol_release_once;
+	FakeClock *io_deadline_clock;
+	bool deadline_core_once;
+	const SafeSaveRecoveryRecord *save_record;
+	int audio_calls;
+	int video_calls;
+	int coupled_calls;
+	uint64_t resource_last_deadline;
+	bool abandon_once;
+	bool closure_unknown_once;
+	FakeClock *resource_deadline_clock;
+	OperationKind deadline_once_kind;
+	uint64_t deadline_to_expire;
+	bool coupled_all_neutral;
+};
+
+RecoveryResourceTrace CaptureRecoveryResourceTrace(const FakeRecoveryIo &io,
+	const FakeTypedRecoveryResources &resources)
+{
+	RecoveryResourceTrace trace = {};
+	for (size_t index = 0; index != trace.io_states.size(); ++index) {
+		trace.io_states[index] = io.states[index];
+		trace.io_results[index] = io.results[index];
+	}
+	trace.io_calls = io.calls;
+	trace.core_protocol_session_calls = io.core_protocol_session_calls;
+	trace.io_last_deadline = io.last_deadline;
+	trace.abandon_core_protocol_release_once =
+		io.abandon_core_protocol_release_once;
+	trace.io_deadline_clock = io.deadline_clock;
+	trace.deadline_core_once = io.deadline_core_once;
+	trace.save_record = io.save_record;
+	trace.audio_calls = resources.audio_calls;
+	trace.video_calls = resources.video_calls;
+	trace.coupled_calls = resources.coupled_calls;
+	trace.resource_last_deadline = resources.last_deadline;
+	trace.abandon_once = resources.abandon_once;
+	trace.closure_unknown_once = resources.closure_unknown_once;
+	trace.resource_deadline_clock = resources.deadline_clock;
+	trace.deadline_once_kind = resources.deadline_once_kind;
+	trace.deadline_to_expire = resources.deadline_to_expire;
+	trace.coupled_all_neutral = resources.coupled_all_neutral;
+	return trace;
+}
+
+void AssertSameRecoveryResourceTrace(const RecoveryResourceTrace &left,
+	const RecoveryResourceTrace &right)
+{
+	for (size_t index = 0; index != left.io_states.size(); ++index) {
+		assert(left.io_states[index] == right.io_states[index]);
+		assert(left.io_results[index] == right.io_results[index]);
+	}
+	assert(left.io_calls == right.io_calls);
+	assert(left.core_protocol_session_calls ==
+		right.core_protocol_session_calls);
+	assert(left.io_last_deadline == right.io_last_deadline);
+	assert(left.abandon_core_protocol_release_once ==
+		right.abandon_core_protocol_release_once);
+	assert(left.io_deadline_clock == right.io_deadline_clock);
+	assert(left.deadline_core_once == right.deadline_core_once);
+	assert(left.save_record == right.save_record);
+	assert(left.audio_calls == right.audio_calls);
+	assert(left.video_calls == right.video_calls);
+	assert(left.coupled_calls == right.coupled_calls);
+	assert(left.resource_last_deadline == right.resource_last_deadline);
+	assert(left.abandon_once == right.abandon_once);
+	assert(left.closure_unknown_once == right.closure_unknown_once);
+	assert(left.resource_deadline_clock == right.resource_deadline_clock);
+	assert(left.deadline_once_kind == right.deadline_once_kind);
+	assert(left.deadline_to_expire == right.deadline_to_expire);
+	assert(left.coupled_all_neutral == right.coupled_all_neutral);
+}
 
 class FakeTypedSaveRecoveryResource final : public NativeSaveResource {
 public:
@@ -1492,7 +1603,7 @@ void TestForeignTypedRecoveryBackendCannotAdoptARetainedSession()
 	assert(foreign_resources.coupled_calls == 0);
 }
 
-void TestDestroyingRetainedRecoveryDoesNotPermitNewRawAvIo()
+void TestDestroyingRetainedRecoveryPermitsAuthorizedSameEpochRetry()
 {
 	FakeClock clock(1000);
 	HardwareBroker broker(clock);
@@ -1512,8 +1623,402 @@ void TestDestroyingRetainedRecoveryDoesNotPermitNewRawAvIo()
 	NativeRecovery after_destruction(broker, io, resources, resources,
 		resources);
 	assert(after_destruction.Perform(*epoch, OperationKind::audio_video) ==
+		MISTER_RESULT_OK);
+	assert(resources.coupled_calls == 2);
+	MisterRecoveryObservationV2 observation = Observation();
+	assert(after_destruction.Finish(std::move(epoch), &observation) ==
+		MISTER_RESULT_CLEANUP_INCOMPLETE);
+	assert(epoch != nullptr);
+	epoch.reset();
+	assert(broker.exact_idle_for_test());
+}
+
+void TestDestroyingAbandonedTypedRecoveryBreaksItsRetainedOwnerCycle()
+{
+	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	struct Case {
+		OperationKind kind;
+		uint32_t requested;
+		bool closure_unknown;
+	};
+	const Case cases[] = {
+		{OperationKind::audio, closure | MISTER_RESOURCE_NATIVE_AUDIO, false},
+		{OperationKind::video, MISTER_RESOURCE_NATIVE_VIDEO, false},
+		{OperationKind::audio_video, closure | MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO, false},
+		{OperationKind::audio_video, closure | MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO, true},
+		{OperationKind::core_protocol, MISTER_RESOURCE_CORE_PROTOCOL, false}
+	};
+	for (size_t cycle = 0; cycle != 200; ++cycle) {
+		for (const Case &test : cases) {
+			FakeClock clock(1000);
+			HardwareBroker broker(clock);
+			FakeRecoveryIo io(broker);
+			FakeTypedRecoveryResources resources(broker);
+			std::unique_ptr<RecoveryEpoch> epoch;
+			assert(broker.BeginRecovery(test.requested, 3000, 6000, &epoch) ==
+				MISTER_RESULT_OK);
+			if (test.kind == OperationKind::core_protocol) {
+				io.abandon_core_protocol_release_once = true;
+			} else if (test.kind == OperationKind::audio_video) {
+				resources.abandon_once = true;
+				resources.closure_unknown_once = test.closure_unknown;
+			} else {
+				resources.deadline_clock = &clock;
+				resources.deadline_once_kind = test.kind;
+				resources.deadline_to_expire = 3000;
+			}
+			HardwareBroker::OwnerDestructionSnapshot retained = {};
+			{
+				NativeRecovery recovery(broker, io, resources, resources, resources);
+				assert(recovery.Perform(*epoch, test.kind) != MISTER_RESULT_OK);
+				retained = broker.owner_destruction_snapshot_for_test();
+				assert(retained.active_lease_count == 1);
+				assert(retained.terminal_lease_count == 0);
+				assert(!retained.invocation_registered);
+				assert(retained.suspended_registration_present);
+				assert(retained.hardware_transaction_active);
+				assert(retained.registration_identity != 0);
+				assert(retained.session_identity != 0);
+				assert(retained.effective_deadline_ms == 0);
+				assert(retained.operation_kind == test.kind);
+				assert(retained.session_view_names_registration);
+				assert(!retained.session_progress_unknown);
+				assert(retained.session_last_mutation_sequence ==
+					retained.mutation_sequence);
+				assert(retained.core_session_present ==
+					(test.kind == OperationKind::core_protocol));
+				assert(retained.peripheral_session_present ==
+					(test.kind != OperationKind::core_protocol));
+			}
+			const HardwareBroker::OwnerDestructionSnapshot destroyed =
+				broker.owner_destruction_snapshot_for_test();
+			assert(destroyed.recovery_identity == retained.recovery_identity);
+			assert(destroyed.active_lease_count == 0);
+			assert(destroyed.terminal_lease_count == 0);
+			assert(!destroyed.suspended_registration_present);
+			assert(!destroyed.core_session_present);
+			assert(!destroyed.peripheral_session_present);
+			assert(destroyed.registration_identity == 0);
+			assert(destroyed.session_identity == 0);
+			assert(!destroyed.session_view_names_registration);
+			assert(!destroyed.hardware_transaction_active);
+			assert(destroyed.mutation_sequence == retained.mutation_sequence);
+			assert(destroyed.destruction_failure_count == 0);
+			assert(resources.audio_calls + resources.video_calls +
+				resources.coupled_calls == (test.kind == OperationKind::audio ? 1 :
+					test.kind == OperationKind::video ? 1 :
+					test.kind == OperationKind::audio_video ? 1 : 0));
+			const RecoveryResourceTrace resource_after_destruction =
+				CaptureRecoveryResourceTrace(io, resources);
+			clock.SetNow(test.kind == OperationKind::core_protocol ? 6000 : 3000);
+			std::unique_ptr<OperationLease> expired_retry;
+			assert(broker.BeginRecoveryOperation(*epoch, test.kind,
+				&expired_retry) == MISTER_RESULT_DEADLINE);
+			assert(expired_retry == nullptr);
+			MisterRecoveryObservationV2 observation = Observation();
+			NativeRecovery observer(broker, io, resources, resources, resources);
+			assert(observer.Snapshot(*epoch, &observation) ==
+				(test.closure_unknown ? MISTER_RESULT_PLATFORM :
+					MISTER_RESULT_DEADLINE));
+			const Result finish = broker.FinishRecovery(std::move(epoch), &observation);
+			assert(finish != MISTER_RESULT_INVALID_STATE);
+			assert(finish == (test.closure_unknown ? MISTER_RESULT_PLATFORM :
+				MISTER_RESULT_DEADLINE));
+			assert(epoch == nullptr);
+			AssertSameRecoveryResourceTrace(resource_after_destruction,
+				CaptureRecoveryResourceTrace(io, resources));
+			assert(broker.exact_idle_for_test());
+			std::unique_ptr<RecoveryEpoch> fresh;
+			assert(broker.BeginRecovery(0, 7000, 10000, &fresh) == MISTER_RESULT_OK);
+			assert(broker.FinishRecovery(std::move(fresh), &observation) ==
+				MISTER_RESULT_OK);
+		}
+	}
+}
+
+void TestCallbackExpiredOwnerDestructionDoesNotFenceSameEpochAdmission()
+{
+	const uint32_t closure = MISTER_RESOURCE_FPGA | MISTER_RESOURCE_BRIDGES |
+		MISTER_RESOURCE_CORE_PROTOCOL;
+	struct Case { OperationKind kind; uint32_t requested; };
+	const Case cases[] = {
+		{OperationKind::audio, closure | MISTER_RESOURCE_NATIVE_AUDIO},
+		{OperationKind::video, MISTER_RESOURCE_NATIVE_VIDEO},
+		{OperationKind::audio_video, closure | MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO},
+		{OperationKind::core_protocol, MISTER_RESOURCE_CORE_PROTOCOL}
+	};
+	for (const Case &test : cases) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeRecoveryIo io(broker);
+		FakeTypedRecoveryResources resources(broker);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(test.requested, 3000, 6000, &epoch) ==
+			MISTER_RESULT_OK);
+		resources.deadline_clock = &clock;
+		resources.deadline_once_kind = test.kind;
+		resources.deadline_to_expire = 1500;
+		if (test.kind == OperationKind::core_protocol)
+			io.deadline_core_once = true;
+		std::unique_ptr<OperationInvocation> invocation;
+		assert(broker.BeginRecoveryInvocation(*epoch, 1500, &invocation) ==
+			MISTER_RESULT_OK);
+		{
+			NativeRecovery recovery(broker, io, resources, resources, resources);
+			assert(recovery.Perform(*epoch, *invocation, test.kind) !=
+				MISTER_RESULT_OK);
+			assert(broker.FinishInvocation(std::move(invocation)) == MISTER_RESULT_OK);
+		}
+		MisterRecoveryObservationV2 observation = Observation();
+		NativeRecovery observer(broker, io, resources, resources, resources);
+		assert(observer.Snapshot(*epoch, &observation) ==
+			MISTER_RESULT_CLEANUP_INCOMPLETE);
+		assert(observation.neutral_resource_flags == 0);
+		assert(broker.retained_owner_destruction_failures_for_test() == 0);
+		assert(observer.Finish(std::move(epoch), &observation) ==
+			MISTER_RESULT_CLEANUP_INCOMPLETE);
+		assert(epoch != nullptr);
+		const RecoveryResourceTrace resource_before_retry_admission =
+			CaptureRecoveryResourceTrace(io, resources);
+		std::unique_ptr<OperationLease> same_epoch_retry;
+		assert(broker.BeginRecoveryOperation(*epoch, test.kind,
+			&same_epoch_retry) == MISTER_RESULT_OK);
+		same_epoch_retry.reset();
+		std::unique_ptr<OperationInvocation> retry_invocation;
+		assert(broker.BeginRecoveryInvocation(*epoch, 2500, &retry_invocation) ==
+			MISTER_RESULT_OK);
+		assert(broker.BeginRecoveryOperation(*epoch, *retry_invocation, test.kind,
+			&same_epoch_retry) == MISTER_RESULT_OK);
+		assert(broker.RecordOperationOutcome(*retry_invocation, *same_epoch_retry,
+			MISTER_RESULT_CLEANUP_INCOMPLETE) == MISTER_RESULT_OK);
+		same_epoch_retry.reset();
+		assert(broker.FinishInvocation(std::move(retry_invocation)) ==
+			MISTER_RESULT_OK);
+		AssertSameRecoveryResourceTrace(resource_before_retry_admission,
+			CaptureRecoveryResourceTrace(io, resources));
+		epoch.reset();
+		assert(broker.exact_idle_for_test());
+		std::unique_ptr<RecoveryEpoch> fresh;
+		assert(broker.BeginRecovery(0, 4000, 7000, &fresh) == MISTER_RESULT_OK);
+		assert(broker.FinishRecovery(std::move(fresh), &observation) ==
+			MISTER_RESULT_OK);
+	}
+}
+
+void TestRejectedInvokedOwnerDestructionIsObservableAndNeverIdle()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	FakeTypedRecoveryResources resources(broker);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_NATIVE_AUDIO, 3000, 6000,
+		&epoch) == MISTER_RESULT_OK);
+	resources.deadline_clock = &clock;
+	resources.deadline_once_kind = OperationKind::audio;
+	std::unique_ptr<OperationInvocation> invocation;
+	assert(broker.BeginRecoveryInvocation(*epoch, 2000, &invocation) ==
+		MISTER_RESULT_OK);
+	std::unique_ptr<NativeRecovery> recovery(
+		new NativeRecovery(broker, io, resources, resources, resources));
+	assert(recovery->Perform(*epoch, *invocation, OperationKind::audio) !=
+		MISTER_RESULT_OK);
+	const uint64_t mutations = broker.mutation_sequence_for_test();
+	const RecoveryResourceTrace resource_before =
+		CaptureRecoveryResourceTrace(io, resources);
+	recovery.reset();
+	assert(broker.retained_owner_destruction_failures_for_test() == 1);
+	assert(!broker.exact_idle_for_test());
+	assert(broker.mutation_sequence_for_test() == mutations);
+	AssertSameRecoveryResourceTrace(resource_before,
+		CaptureRecoveryResourceTrace(io, resources));
+	invocation.reset();
+}
+
+void TestCycleBreakRejectsForeignLiveAndTerminalLeasesWithoutMutation()
+{
+	const OperationKind kinds[] = {OperationKind::audio,
+		OperationKind::terminal_fpga_cleanup};
+	for (OperationKind kind : kinds) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeRecoveryIo io(broker);
+		FakeTypedRecoveryResources resources(broker);
+		HardwareBroker foreign(clock);
+		FakeRecoveryIo foreign_io(foreign);
+		FakeTypedRecoveryResources foreign_resources(foreign);
+		std::unique_ptr<RecoveryEpoch> foreign_epoch;
+		assert(foreign.BeginRecovery(MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO, 3000, 6000, &foreign_epoch) ==
+			MISTER_RESULT_OK);
+		foreign_resources.abandon_once = true;
+		NativeRecovery foreign_owner(foreign, foreign_io, foreign_resources,
+			foreign_resources, foreign_resources);
+		assert(foreign_owner.Perform(*foreign_epoch, OperationKind::audio_video) ==
+			MISTER_RESULT_PLATFORM);
+		const HardwareBroker::OwnerDestructionSnapshot foreign_before =
+			foreign.owner_destruction_snapshot_for_test();
+		std::unique_ptr<RecoveryEpoch> epoch;
+		const uint32_t requested = kind == OperationKind::audio ?
+			MISTER_RESOURCE_NATIVE_AUDIO : (MISTER_RESOURCE_FPGA |
+				MISTER_RESOURCE_BRIDGES | MISTER_RESOURCE_CORE_PROTOCOL);
+		assert(broker.BeginRecovery(requested, 3000, 6000, &epoch) ==
+			MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> lease;
+		assert(broker.BeginRecoveryOperation(*epoch, kind, &lease) ==
+			MISTER_RESULT_OK);
+		const HardwareBroker::OwnerDestructionSnapshot before =
+			broker.owner_destruction_snapshot_for_test();
+		const RecoveryResourceTrace resource_before =
+			CaptureRecoveryResourceTrace(io, resources);
+		const RecoveryResourceTrace foreign_resource_before =
+			CaptureRecoveryResourceTrace(foreign_io, foreign_resources);
+		assert(broker.BreakRetainedTypedOwnerCycleForTest(*lease) ==
+			MISTER_RESULT_INVALID_STATE);
+		assert(foreign.BreakRetainedTypedOwnerCycleForTest(*lease) ==
+			MISTER_RESULT_INVALID_STATE);
+		const HardwareBroker::OwnerDestructionSnapshot after =
+			broker.owner_destruction_snapshot_for_test();
+		AssertSameOwnerDestructionSnapshot(before, after);
+		AssertSameOwnerDestructionSnapshot(foreign_before,
+			foreign.owner_destruction_snapshot_for_test());
+		AssertSameRecoveryResourceTrace(resource_before,
+			CaptureRecoveryResourceTrace(io, resources));
+		AssertSameRecoveryResourceTrace(foreign_resource_before,
+			CaptureRecoveryResourceTrace(foreign_io, foreign_resources));
+		lease.reset();
+		epoch.reset();
+		assert(broker.exact_idle_for_test());
+		assert(foreign.BreakRetainedTypedOwnerCycleForTest(
+			*foreign_owner.retained_lease_for_test()) == MISTER_RESULT_OK);
+		foreign_owner.clear_retained_recovery_for_test();
+		foreign_epoch.reset();
+		assert(foreign.exact_idle_for_test());
+	}
+}
+
+void TestCycleBreakRejectsAnAlreadyConsumedExactLeaseWithoutMutation()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	FakeTypedRecoveryResources resources(broker);
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_NATIVE_AUDIO |
+		MISTER_RESOURCE_NATIVE_VIDEO, 3000, 6000, &epoch) == MISTER_RESULT_OK);
+	resources.abandon_once = true;
+	NativeRecovery recovery(broker, io, resources, resources, resources);
+	assert(recovery.Perform(*epoch, OperationKind::audio_video) ==
+		MISTER_RESULT_PLATFORM);
+	OperationLease *const lease = recovery.retained_lease_for_test();
+	assert(lease != nullptr);
+	assert(broker.BreakRetainedTypedOwnerCycleForTest(*lease) == MISTER_RESULT_OK);
+	const HardwareBroker::OwnerDestructionSnapshot before =
+		broker.owner_destruction_snapshot_for_test();
+	const RecoveryResourceTrace resource_before =
+		CaptureRecoveryResourceTrace(io, resources);
+	assert(broker.BreakRetainedTypedOwnerCycleForTest(*lease) ==
 		MISTER_RESULT_INVALID_STATE);
-	assert(resources.coupled_calls == 1);
+	const HardwareBroker::OwnerDestructionSnapshot after =
+		broker.owner_destruction_snapshot_for_test();
+	AssertSameOwnerDestructionSnapshot(before, after);
+	AssertSameRecoveryResourceTrace(resource_before,
+		CaptureRecoveryResourceTrace(io, resources));
+	recovery.clear_retained_recovery_for_test();
+	epoch.reset();
+	assert(broker.exact_idle_for_test());
+}
+
+void TestCycleBreakRejectsMalformedTypedStateWithoutMutation()
+{
+	const HardwareBroker::OwnerDestructionTestFault faults[] = {
+		HardwareBroker::OwnerDestructionTestFault::wrong_kind,
+		HardwareBroker::OwnerDestructionTestFault::wrong_epoch,
+		HardwareBroker::OwnerDestructionTestFault::live_session,
+		HardwareBroker::OwnerDestructionTestFault::finalized_session,
+		HardwareBroker::OwnerDestructionTestFault::missing_view_edge,
+		HardwareBroker::OwnerDestructionTestFault::foreign_session,
+		HardwareBroker::OwnerDestructionTestFault::containment_pending
+	};
+	for (HardwareBroker::OwnerDestructionTestFault fault : faults) {
+		FakeClock clock(1000);
+		HardwareBroker broker(clock);
+		FakeRecoveryIo io(broker);
+		FakeTypedRecoveryResources resources(broker);
+		std::unique_ptr<RecoveryEpoch> epoch;
+		assert(broker.BeginRecovery(MISTER_RESOURCE_NATIVE_AUDIO |
+			MISTER_RESOURCE_NATIVE_VIDEO, 3000, 6000, &epoch) == MISTER_RESULT_OK);
+		resources.abandon_once = true;
+		NativeRecovery recovery(broker, io, resources, resources, resources);
+		assert(recovery.Perform(*epoch, OperationKind::audio_video) ==
+			MISTER_RESULT_PLATFORM);
+		OperationLease *const lease = recovery.retained_lease_for_test();
+		const HardwareBroker::OwnerDestructionSnapshot before =
+			broker.owner_destruction_snapshot_for_test();
+		const RecoveryResourceTrace resource_before =
+			CaptureRecoveryResourceTrace(io, resources);
+		assert(broker.BreakRetainedTypedOwnerCycleForTest(*lease, fault) ==
+			MISTER_RESULT_INVALID_STATE);
+		const HardwareBroker::OwnerDestructionSnapshot after =
+			broker.owner_destruction_snapshot_for_test();
+		AssertSameOwnerDestructionSnapshot(before, after);
+		AssertSameRecoveryResourceTrace(resource_before,
+			CaptureRecoveryResourceTrace(io, resources));
+	}
+}
+
+void TestSaveOwnerDestructionUsesTheNormalLeaseReleaseControl()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	FakeTypedRecoveryResources resources(broker);
+	FakeTypedSaveRecoveryResource save;
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_SAVES, 3000, 6000, &epoch) ==
+		MISTER_RESULT_OK);
+	save.fail_once = true;
+	{
+		NativeRecovery recovery(broker, io, resources, resources, resources, save);
+		assert(recovery.Perform(*epoch, OperationKind::save) ==
+			MISTER_RESULT_PLATFORM);
+		assert(save.calls == 1);
+	}
+	assert(broker.retained_owner_destruction_failures_for_test() == 0);
+	epoch.reset();
+	assert(broker.exact_idle_for_test());
+}
+
+void TestCycleBreakRejectsRetainedSaveControlWithoutMutation()
+{
+	FakeClock clock(1000);
+	HardwareBroker broker(clock);
+	FakeRecoveryIo io(broker);
+	FakeTypedRecoveryResources resources(broker);
+	FakeTypedSaveRecoveryResource save;
+	std::unique_ptr<RecoveryEpoch> epoch;
+	assert(broker.BeginRecovery(MISTER_RESOURCE_SAVES, 3000, 6000, &epoch) ==
+		MISTER_RESULT_OK);
+	save.fail_once = true;
+	NativeRecovery recovery(broker, io, resources, resources, resources, save);
+	assert(recovery.Perform(*epoch, OperationKind::save) == MISTER_RESULT_PLATFORM);
+	OperationLease *const lease = recovery.retained_lease_for_test();
+	assert(lease != nullptr);
+	const HardwareBroker::OwnerDestructionSnapshot before =
+		broker.owner_destruction_snapshot_for_test();
+	const int save_calls = save.calls;
+	assert(broker.BreakRetainedTypedOwnerCycleForTest(*lease) ==
+		MISTER_RESULT_INVALID_STATE);
+	AssertSameOwnerDestructionSnapshot(before,
+		broker.owner_destruction_snapshot_for_test());
+	assert(save.calls == save_calls);
+	recovery.clear_retained_recovery_for_test();
+	epoch.reset();
+	assert(broker.exact_idle_for_test());
 }
 
 void TestTypedAudioTerminalPromotionHonorsBothImmutableDeadlines()
@@ -1883,6 +2388,14 @@ int main()
 	TestCoreProtocolRecoveryUsesProfilelessSessionAuthority();
 	TestCoreProtocolRecoveryReleaseRetryRetainsItsRecoveryLease();
 	TestTypedCoupledRecoverySnapshotsVideoNeutralWhileAudioRemainsUnknown();
+	TestDestroyingAbandonedTypedRecoveryBreaksItsRetainedOwnerCycle();
+	TestCallbackExpiredOwnerDestructionDoesNotFenceSameEpochAdmission();
+	TestRejectedInvokedOwnerDestructionIsObservableAndNeverIdle();
+	TestCycleBreakRejectsForeignLiveAndTerminalLeasesWithoutMutation();
+	TestCycleBreakRejectsAnAlreadyConsumedExactLeaseWithoutMutation();
+	TestCycleBreakRejectsMalformedTypedStateWithoutMutation();
+	TestSaveOwnerDestructionUsesTheNormalLeaseReleaseControl();
+	TestCycleBreakRejectsRetainedSaveControlWithoutMutation();
 	TestTypedSaveRecoveryRetainsOneTaggedLeaseAndOriginalDeadline();
 	TestTaggedSaveRecoveryUsesTheFreshNativeSaveAdapterAndExactRecord();
 	TestSaveRecoveryRejectsMissingForgedAndExpiredSafeAuthorityBeforeIo();
@@ -1891,7 +2404,7 @@ int main()
 	TestCoupledRecoveryClosureUnknownBlocksRawRetry();
 	TestCoupledRecoveryCannotBorrowTheLaterFpgaDeadline();
 	TestForeignTypedRecoveryBackendCannotAdoptARetainedSession();
-	TestDestroyingRetainedRecoveryDoesNotPermitNewRawAvIo();
+	TestDestroyingRetainedRecoveryPermitsAuthorizedSameEpochRetry();
 	TestTypedAudioTerminalPromotionHonorsBothImmutableDeadlines();
 	TestTerminalRecoveryAndReadOnlyObservation();
 	TestRepeatedObservationReplacesStaleClassification();

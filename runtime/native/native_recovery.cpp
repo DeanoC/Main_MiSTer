@@ -26,6 +26,18 @@ NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
 {
 }
 
+NativeRecovery::~NativeRecovery()
+{
+	if (retained_lease_ && (retained_kind_ == RetainedRecoveryKind::core_protocol ||
+		retained_kind_ == RetainedRecoveryKind::audio ||
+		retained_kind_ == RetainedRecoveryKind::video ||
+		retained_kind_ == RetainedRecoveryKind::audio_video)) {
+		if (retained_lease_->BreakRetainedTypedOwnerCycle() != MISTER_RESULT_OK)
+			broker_.RecordRetainedOwnerDestructionFailure();
+	}
+	ClearRetainedRecovery();
+}
+
 NativeRecovery::NativeRecovery(HardwareBroker &broker, NativeRecoveryIo &io,
 	NativeAudioResource &audio, NativeVideoResource &video,
 	NativeAudioVideoResource &audio_video, NativeContainment &containment)
@@ -402,6 +414,18 @@ Result NativeRecovery::Finish(std::unique_ptr<RecoveryEpoch> &&epoch,
 		return MISTER_RESULT_CLEANUP_INCOMPLETE;
 	return broker_.FinishRecovery(std::move(epoch), observation);
 }
+
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+OperationLease *NativeRecovery::retained_lease_for_test() const
+{
+	return retained_lease_.get();
+}
+
+void NativeRecovery::clear_retained_recovery_for_test()
+{
+	ClearRetainedRecovery();
+}
+#endif
 
 } // namespace native
 } // namespace mister

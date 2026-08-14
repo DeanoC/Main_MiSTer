@@ -367,6 +367,7 @@ private:
 		OperationKind required_operation_kind,
 		const NativeCoreProfile *required_profile,
 		std::unique_ptr<ProcessOperationGuard> *guard) const;
+	Result BreakRetainedTypedOwnerCycle() const;
 
 	std::shared_ptr<OperationRegistration> registration_;
 };
@@ -501,6 +502,42 @@ public:
 	Result Enter(const NativeCoreProfile *profile,
 		PlatformGenerationId *generation);
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
+	struct OwnerDestructionSnapshot {
+		uint64_t generation;
+		uint64_t cleanup_identity;
+		uint64_t recovery_identity;
+		uint64_t registration_identity;
+		uint64_t session_identity;
+		uint64_t session_initial_mutation_sequence;
+		uint64_t session_last_mutation_sequence;
+		uint64_t effective_deadline_ms;
+		size_t active_lease_count;
+		size_t terminal_lease_count;
+		OperationKind operation_kind;
+		PeripheralSessionKind peripheral_kind;
+		PeripheralSessionPhase peripheral_phase;
+		PeripheralSessionAction peripheral_action;
+		uint8_t core_handle_state;
+		bool invocation_registered;
+		bool suspended_registration_present;
+		bool core_session_present;
+		bool peripheral_session_present;
+		bool session_view_names_registration;
+		bool session_progress_unknown;
+		bool session_recheckout_allowed;
+		bool hardware_transaction_active;
+		uint64_t mutation_sequence;
+		uint64_t destruction_failure_count;
+	};
+	enum class OwnerDestructionTestFault : uint8_t {
+		wrong_kind,
+		wrong_epoch,
+		live_session,
+		finalized_session,
+		missing_view_edge,
+		foreign_session,
+		containment_pending
+	};
 	Result EnterFixtureForTest(const NativeCoreProfile &profile,
 		PlatformGenerationId *generation);
 	bool has_live_generation_for_test();
@@ -513,6 +550,12 @@ public:
 	bool core_protocol_session_current_for_test();
 	bool core_protocol_session_abandoned_for_test(
 		const OperationLease &lease);
+	uint64_t retained_owner_destruction_failures_for_test();
+	bool exact_idle_for_test();
+	OwnerDestructionSnapshot owner_destruction_snapshot_for_test();
+	Result BreakRetainedTypedOwnerCycleForTest(const OperationLease &lease);
+	Result BreakRetainedTypedOwnerCycleForTest(const OperationLease &lease,
+		OwnerDestructionTestFault fault);
 #endif
 	Result Begin(PlatformGenerationId generation, OperationKind operation_kind,
 		uint64_t absolute_deadline_ms,
@@ -595,6 +638,8 @@ private:
 	};
 
 	void ReleaseOperation(OperationRegistration &registration);
+	Result BreakRetainedTypedOwnerCycle(const OperationLease &lease);
+	void RecordRetainedOwnerDestructionFailure();
 	void UnregisterInvocation(OperationInvocation &invocation);
 	void ReleaseHardwareLeaseView(HardwareLeaseView &view);
 	void ReleaseCleanupInputReplayView(CleanupInputReplayView &view);
@@ -903,6 +948,7 @@ private:
 	bool recovery_registered_;
 	bool recovery_observation_active_;
 	bool recovery_terminal_neutral_;
+	uint64_t retained_owner_destruction_failures_;
 	bool hardware_transaction_active_;
 	bool failure_latched_;
 	Result recovery_result_;

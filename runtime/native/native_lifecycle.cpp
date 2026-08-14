@@ -51,12 +51,26 @@ NativeLifecycle::~NativeLifecycle()
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (state_ == NativeLifecycleState::active && generation_ != 0)
 		broker_.LatchFailure(generation_);
-	// This only releases the registration. The protocol resource owns the
-	// process-exit close path and session-handle destruction performs no I/O.
+	if (core_protocol_cleanup_lease_)
+		if (core_protocol_cleanup_lease_->BreakRetainedTypedOwnerCycle() !=
+			MISTER_RESULT_OK)
+			broker_.RecordRetainedOwnerDestructionFailure();
 	core_protocol_cleanup_lease_.reset();
 	save_cleanup_lease_.reset();
+	if (audio_cleanup_lease_)
+		if (audio_cleanup_lease_->BreakRetainedTypedOwnerCycle() !=
+			MISTER_RESULT_OK)
+			broker_.RecordRetainedOwnerDestructionFailure();
 	audio_cleanup_lease_.reset();
+	if (video_cleanup_lease_)
+		if (video_cleanup_lease_->BreakRetainedTypedOwnerCycle() !=
+			MISTER_RESULT_OK)
+			broker_.RecordRetainedOwnerDestructionFailure();
 	video_cleanup_lease_.reset();
+	if (coupled_audio_video_cleanup_lease_)
+		if (coupled_audio_video_cleanup_lease_->BreakRetainedTypedOwnerCycle() !=
+			MISTER_RESULT_OK)
+			broker_.RecordRetainedOwnerDestructionFailure();
 	coupled_audio_video_cleanup_lease_.reset();
 	cleanup_invocation_.reset();
 	cleanup_epoch_.reset();

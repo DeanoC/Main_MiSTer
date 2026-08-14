@@ -70,6 +70,7 @@ public:
 		NativeAudioResource &audio, NativeVideoResource &video,
 		NativeAudioVideoResource &audio_video, NativeSaveResource &save,
 		NativeContainment &containment);
+	~NativeRecovery();
 	Result Perform(const RecoveryEpoch &epoch,
 		const OperationInvocation &invocation, OperationKind operation_kind);
 #if defined(MISTER_NATIVE_PROFILE_TESTING)
@@ -81,6 +82,10 @@ public:
 		uint32_t callback_requested_flags) const;
 	Result Finish(std::unique_ptr<RecoveryEpoch> &&epoch,
 		MisterRecoveryObservationV2 *observation);
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	OperationLease *retained_lease_for_test() const;
+	void clear_retained_recovery_for_test();
+#endif
 
 private:
 	enum class RetainedRecoveryKind : uint8_t {
