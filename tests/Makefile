@@ -45,6 +45,12 @@ FOGCAST_MAIN_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_main.o
 FOGCAST_PLATFORM_FAKE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_platform_fake.o
 FOGCAST_PLATFORM_UNAVAILABLE_OBJECT = $(HOST_TEST_DIR)/fogcast_runtime_platform_unavailable.o
 RUNTIME_LINUX_V2_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_linux_v2_test.o
+NATIVE_LINUX_V2_CONTEXT_TEST_OBJECT = \
+	$(HOST_TEST_DIR)/native_linux_v2_context_test.o
+NATIVE_LINUX_V2_CONTEXT_OBJECT = \
+	$(HOST_TEST_DIR)/native_linux_v2_context.o
+NATIVE_LINUX_V2_CONTEXT_PRODUCTION_OBJECT = \
+	$(HOST_TEST_DIR)/native_linux_v2_context_production.o
 RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test.o
 RUNTIME_OFFLOAD_LIFECYCLE_TEST_OBJECT = $(HOST_TEST_DIR)/mister_runtime_offload_lifecycle_test.o
 OFFLOAD_TEST_OBJECT = $(HOST_TEST_DIR)/offload_test.o
@@ -133,7 +139,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-linux-hardware-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-linux-hardware-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-native-linux-v2-context test-native-linux-v2-context-sanitize test-native-linux-v2-context-tsan test-native-linux-v2-context-concurrent test-native-linux-v2-context-production test-native-linux-v2-context-reachability test-native-linux-v2-context-dependency-invalidation test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 test-native-linux-core-protocol-io: \
 	$(HOST_TEST_DIR)/native_linux_core_protocol_io_test \
@@ -338,7 +344,11 @@ test-native-linux-mmio-reachability: $(NATIVE_LINUX_MMIO_PRODUCTION_OBJECT)
 		echo "production object exports raw MMIO symbols" >&2; exit 1; \
 	fi
 
-stage-c0-software-test: test-runtime-v2 test-fogcast-protocol test-fogcast-state \
+stage-c0-software-test: test-runtime-v2 test-native-linux-v2-context \
+	test-native-linux-v2-context-sanitize test-native-linux-v2-context-concurrent \
+	test-native-linux-v2-context-production \
+	test-native-linux-v2-context-dependency-invalidation \
+	test-fogcast-protocol test-fogcast-state \
 	test-fogcast-coordinator test-fogcast-fence test-fogcast-server \
 	test-runtime-linux-v2 test-runtime-resource-teardown test-scheduler \
 	test-runtime-offload-lifecycle \
@@ -602,6 +612,135 @@ test-runtime-linux-v2-sanitize:
 		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
 		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-runtime-linux-v2
 
+test-native-linux-v2-context: $(HOST_TEST_DIR)/native_linux_v2_context_test
+	@privacy_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-v2-context-output.XXXXXX"); \
+		trap 'rm -r "$$privacy_dir"' EXIT; \
+		if ! $(HOST_TEST_DIR)/native_linux_v2_context_test \
+			>"$$privacy_dir/stdout" 2>"$$privacy_dir/stderr"; then \
+			echo "native Linux v2 context test failed; captured output withheld" >&2; exit 1; \
+		fi; \
+		if test -s "$$privacy_dir/stdout" || test -s "$$privacy_dir/stderr"; then \
+			echo "native Linux v2 context test emitted private output" >&2; exit 1; \
+		fi; \
+		for sentinel in task7-game-sentinel \
+			0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; do \
+			if grep -F -q "$$sentinel" "$$privacy_dir/stdout" "$$privacy_dir/stderr"; then \
+				echo "native Linux v2 context leaked a privacy sentinel" >&2; exit 1; \
+			fi; \
+		done
+
+test-native-linux-v2-context-sanitize:
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-linux-v2-context-sanitize-inner \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-native-linux-v2-context
+
+test-native-linux-v2-context-tsan:
+	TSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-linux-v2-context-tsan-inner \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' test-native-linux-v2-context
+
+test-native-linux-v2-context-concurrent:
+	$(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-normal \
+		$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-normal/native_linux_v2_context_test
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile \
+		HOST_TEST_DIR=$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-sanitize \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+		$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-sanitize/native_linux_v2_context_test
+	TSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile \
+		HOST_TEST_DIR=$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-tsan \
+		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer' \
+		HOST_LINK_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' \
+		$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-tsan/native_linux_v2_context_test
+	@privacy_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-v2-context-concurrent.XXXXXX"); \
+		trap 'rm -r "$$privacy_dir"' EXIT; \
+		if test -n "$$(find . -maxdepth 1 -type d -name '.fogcast-v2-graph.*' -print -quit)"; then \
+			echo "native Linux v2 context concurrent test found fixture residue before execution" >&2; exit 1; \
+		fi; \
+		$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-normal/native_linux_v2_context_test \
+			>"$$privacy_dir/normal.stdout" 2>"$$privacy_dir/normal.stderr" & normal_pid=$$!; \
+		ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+			$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-sanitize/native_linux_v2_context_test \
+			>"$$privacy_dir/sanitize.stdout" 2>"$$privacy_dir/sanitize.stderr" & sanitize_pid=$$!; \
+		TSAN_OPTIONS=halt_on_error=1 \
+			$(HOST_TEST_DIR)/native-linux-v2-context-concurrent-tsan/native_linux_v2_context_test \
+			>"$$privacy_dir/tsan.stdout" 2>"$$privacy_dir/tsan.stderr" & tsan_pid=$$!; \
+		normal_status=0; wait $$normal_pid || normal_status=$$?; \
+		sanitize_status=0; wait $$sanitize_pid || sanitize_status=$$?; \
+		tsan_status=0; wait $$tsan_pid || tsan_status=$$?; \
+		if test $$normal_status -ne 0 || test $$sanitize_status -ne 0 || test $$tsan_status -ne 0; then \
+			echo "native Linux v2 context concurrent test failed; captured output withheld" >&2; exit 1; \
+		fi; \
+		for output in "$$privacy_dir"/*.stdout "$$privacy_dir"/*.stderr; do \
+			if test -s "$$output"; then \
+				echo "native Linux v2 context concurrent test emitted private output" >&2; exit 1; \
+			fi; \
+		done; \
+		if test -n "$$(find . -maxdepth 1 -type d -name '.fogcast-v2-graph.*' -print -quit)"; then \
+			echo "native Linux v2 context concurrent test left fixture residue" >&2; exit 1; \
+		fi
+
+test-native-linux-v2-context-production: \
+	$(NATIVE_LINUX_V2_CONTEXT_PRODUCTION_OBJECT) \
+	$(HOST_TEST_DIR)/fogcast-runtime test-native-linux-v2-context-reachability
+	@if nm -g $(NATIVE_LINUX_V2_CONTEXT_PRODUCTION_OBJECT) | \
+		grep -E 'Fixture|GenerationFactory|RecoveryFactory|ForTest' >/dev/null; then \
+		echo "production context exports fixture construction authority" >&2; exit 1; \
+	fi
+	@if nm -g $(HOST_TEST_DIR)/fogcast-runtime | \
+		grep 'CreateProductionNativeLinuxV2Context' >/dev/null; then \
+		echo "production FogCast provider unexpectedly links the private context" >&2; exit 1; \
+	fi
+
+test-native-linux-v2-context-reachability:
+	@probe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-v2-context.XXXXXX"); \
+		trap 'rm -r "$$probe_dir"' EXIT; \
+		if $(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_LINUX_V2_CONTEXT_TESTING \
+			-DMISTER_NATIVE_LINUX_V2_CONTEXT_REACHABILITY_PROBE -I. -fsyntax-only \
+			tests/native_linux_v2_context_test.cpp >"$$probe_dir/out" 2>"$$probe_dir/err"; then \
+			echo "production header exposes fixture context authority" >&2; exit 1; \
+		fi; \
+		if ! grep 'NativeLinuxV2FixtureProfiles' "$$probe_dir/err" >/dev/null; then \
+			echo "context reachability probe failed for unrelated reason" >&2; exit 1; \
+		fi
+
+test-native-linux-v2-context-dependency-invalidation:
+	@probe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-v2-context-deps.XXXXXX"); \
+		trap 'rm -r "$$probe_dir"' EXIT; \
+		for check in \
+			'runtime/native/linux/native_linux_v2_context.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/hardware_broker.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_containment.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_core_protocol.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_input.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_lifecycle.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_recovery.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_resources.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/native_spi_bus.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_audio_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_av_io_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_content_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_core_artifact_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_core_protocol_io_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_fpga_programmer.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_input_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_mmio_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_offload_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_save_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_scheduler_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_video_adapter.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
+			'runtime/native/linux/native_linux_v2_context.hpp:test-native-linux-v2-context:-c runtime/native/linux/native_linux_v2_context.cpp' \
+			'runtime/native/native_clock.hpp:test-native-linux-v2-context:-c runtime/native/linux/native_linux_v2_context.cpp' \
+			'runtime/native/native_core_profile.hpp:test-native-linux-v2-context:-c runtime/native/linux/native_linux_v2_context.cpp' \
+			'runtime/mister_runtime.h:test-native-linux-v2-context:-c runtime/native/linux/native_linux_v2_context.cpp'; do \
+			header=$${check%%:*}; rest=$${check#*:}; target=$${rest%%:*}; expected=$${rest#*:}; \
+			$(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" "$$target" >/dev/null || exit 1; \
+			if ! $(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" -W "$$header" -n "$$target" | \
+				grep -F -- "$$expected" >/dev/null; then \
+				echo "context dependency invalidation missing: $$header" >&2; exit 1; \
+			fi; \
+		done
+
 test-runtime-resource-teardown-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/resource-teardown-sanitize \
 		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
@@ -659,6 +798,48 @@ $(FOGCAST_PLATFORM_UNAVAILABLE_OBJECT): fogcast/runtime_platform_unavailable.cpp
 
 $(RUNTIME_LINUX_V2_TEST_OBJECT): tests/mister_runtime_linux_v2_test.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
+
+$(NATIVE_LINUX_V2_CONTEXT_TEST_OBJECT): tests/native_linux_v2_context_test.cpp \
+	runtime/native/linux/native_linux_v2_context.hpp \
+	runtime/native/hardware_broker.hpp runtime/native/native_containment.hpp \
+	runtime/native/native_core_protocol.hpp runtime/native/native_input.hpp \
+	runtime/native/native_lifecycle.hpp runtime/native/native_recovery.hpp \
+	runtime/native/native_resources.hpp runtime/native/native_spi_bus.hpp \
+	runtime/native/linux/native_audio_adapter.hpp \
+	runtime/native/linux/native_av_io_adapter.hpp \
+	runtime/native/linux/native_content_adapter.hpp \
+	runtime/native/linux/native_core_artifact_adapter.hpp \
+	runtime/native/linux/native_core_protocol_io_adapter.hpp \
+	runtime/native/linux/native_fpga_programmer.hpp \
+	runtime/native/linux/native_input_adapter.hpp \
+	runtime/native/linux/native_mmio_adapter.hpp \
+	runtime/native/linux/native_offload_adapter.hpp \
+	runtime/native/linux/native_save_adapter.hpp \
+	runtime/native/linux/native_scheduler_adapter.hpp \
+	runtime/native/linux/native_video_adapter.hpp \
+	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
+	runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_LINUX_V2_CONTEXT_TESTING \
+		-DMISTER_NATIVE_MMIO_TESTING \
+		-DMISTER_NATIVE_CORE_PROTOCOL_IO_TESTING \
+		-DMISTER_NATIVE_AUDIO_VIDEO_TESTING -DMISTER_NATIVE_SAVE_TESTING \
+		-DMISTER_NATIVE_LINUX_EXECUTION_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(NATIVE_LINUX_V2_CONTEXT_OBJECT): runtime/native/linux/native_linux_v2_context.cpp \
+	runtime/native/linux/native_linux_v2_context.hpp \
+	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
+	runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -DMISTER_NATIVE_LINUX_V2_CONTEXT_TESTING \
+		-I. -pthread -c $< -o $@
+
+$(NATIVE_LINUX_V2_CONTEXT_PRODUCTION_OBJECT): \
+	runtime/native/linux/native_linux_v2_context.cpp \
+	runtime/native/linux/native_linux_v2_context.hpp \
+	runtime/native/native_clock.hpp runtime/native/native_core_profile.hpp \
+	runtime/mister_runtime.h | $(HOST_TEST_DIR)
+	$(HOST_CXX) $(HOST_CXX_FLAGS) -UMISTER_NATIVE_LINUX_V2_CONTEXT_TESTING \
+		-I. -pthread -c $< -o $@
 
 $(RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT): tests/mister_runtime_resource_teardown_test.cpp runtime/mister_runtime_linux_v2.hpp runtime/mister_runtime.h | $(HOST_TEST_DIR)
 	$(HOST_CXX) $(HOST_CXX_FLAGS) -I. -c $< -o $@
@@ -1263,6 +1444,27 @@ $(HOST_TEST_DIR)/mister_runtime_v2_production_sanitize: $(C99_V2_PRODUCTION_SANI
 
 $(HOST_TEST_DIR)/mister_runtime_linux_v2_test: $(RUNTIME_LINUX_V2_TEST_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
+
+$(HOST_TEST_DIR)/native_linux_v2_context_test: \
+	$(NATIVE_LINUX_V2_CONTEXT_TEST_OBJECT) $(NATIVE_LINUX_V2_CONTEXT_OBJECT) \
+	$(NATIVE_CORE_PROFILE_OBJECT) $(RUNTIME_OBJECT) $(RUNTIME_V2_OBJECT) \
+	$(NATIVE_HARDWARE_BROKER_OBJECT) $(NATIVE_PERIPHERAL_SESSION_OBJECT) \
+	$(NATIVE_SNES_CONTENT_OBJECT) $(NATIVE_CORE_PROTOCOL_OBJECT) \
+	$(NATIVE_LINUX_CORE_PROTOCOL_IO_OBJECT) $(NATIVE_SPI_BUS_OBJECT) \
+	$(NATIVE_INPUT_OBJECT) $(NATIVE_LIFECYCLE_OBJECT) \
+	$(NATIVE_CONTAINMENT_OBJECT) $(NATIVE_RECOVERY_OBJECT) \
+	$(HOST_TEST_DIR)/native_core_artifact_adapter.o \
+	$(HOST_TEST_DIR)/native_content_adapter.o \
+	$(HOST_TEST_DIR)/native_fpga_programmer.o \
+	$(NATIVE_LINUX_MMIO_CONTAINMENT_OBJECT) \
+	$(HOST_TEST_DIR)/native_input_adapter.o \
+	$(HOST_TEST_DIR)/native_scheduler_adapter.o \
+	$(HOST_TEST_DIR)/native_offload_adapter.o \
+	$(HOST_TEST_DIR)/native_av_io_adapter.o \
+	$(HOST_TEST_DIR)/native_audio_adapter.o \
+	$(HOST_TEST_DIR)/native_video_adapter.o \
+	$(HOST_TEST_DIR)/native_save_key.o $(HOST_TEST_DIR)/native_save_adapter.o
+	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -pthread -o $@
 
 $(HOST_TEST_DIR)/mister_runtime_resource_teardown_test: $(RUNTIME_RESOURCE_TEARDOWN_TEST_OBJECT) $(RUNTIME_LINUX_V2_OBJECT)
 	$(HOST_CXX) $(HOST_LINK_FLAGS) $^ -o $@
