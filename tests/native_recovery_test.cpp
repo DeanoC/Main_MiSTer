@@ -552,7 +552,7 @@ public:
 				abandoned, affected, 0, 0, false, closure_unknown, sequence};
 		}
 		const uint32_t neutral = coupled_all_neutral ? affected :
-			MISTER_RESOURCE_NATIVE_VIDEO;
+			static_cast<uint32_t>(MISTER_RESOURCE_NATIVE_VIDEO);
 		const CoupledRecoveryReceipt receipt = {MISTER_RESULT_OK, affected, 0,
 			neutral, true, false, sequence, true, 0xa55a};
 		const Result completed = PeripheralAuthorityTestPeer::CompleteAudioVideo(
