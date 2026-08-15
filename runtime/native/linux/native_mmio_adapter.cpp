@@ -150,7 +150,16 @@ public:
 	}
 	int OrderingBarrier() override
 	{
+		// GCC TSan does not model atomic fences. This fence orders MMIO rather than
+		// C++ shared memory, so keep -Wtsan visible without promoting it to an error.
+#if defined(__GNUC__) && defined(__SANITIZE_THREAD__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic warning "-Wtsan"
+#endif
 		std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(__GNUC__) && defined(__SANITIZE_THREAD__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 		return 0;
 	}
 };
