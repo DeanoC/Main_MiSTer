@@ -461,10 +461,12 @@ test-fogcast-server-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/server-sanitize HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-fogcast-server
 
 test-fogcast-main: $(HOST_TEST_DIR)/fogcast_runtime_main_test \
-	$(HOST_TEST_DIR)/fogcast-runtime-host-test $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test
+	$(HOST_TEST_DIR)/fogcast-runtime-host-test $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test \
+	$(HOST_TEST_DIR)/fogcast-runtime-storage-probe
 	perl -e 'alarm 90; exec @ARGV' $(HOST_TEST_DIR)/fogcast_runtime_main_test \
 		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-host-test) \
-		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test)
+		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-unavailable-test) \
+		$(abspath $(HOST_TEST_DIR)/fogcast-runtime-storage-probe)
 
 test-fogcast-main-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/main-sanitize HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' HOST_LINK_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' test-fogcast-main

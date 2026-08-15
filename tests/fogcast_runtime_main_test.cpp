@@ -31,10 +31,37 @@ std::string TemporaryDirectory() {
 	return path;
 }
 
+void WriteRegular(const std::string& path, const std::string& bytes) {
+	const int descriptor = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	assert(descriptor >= 0);
+	assert(write(descriptor, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+	assert(close(descriptor) == 0);
+	assert(chmod(path.c_str(), 0600) == 0);
+}
+
+std::string ReadRegular(const std::string& path) {
+	const int descriptor = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	assert(descriptor >= 0);
+	char bytes[128];
+	const ssize_t count = read(descriptor, bytes, sizeof(bytes));
+	assert(count >= 0 && count < static_cast<ssize_t>(sizeof(bytes)));
+	assert(close(descriptor) == 0);
+	return std::string(bytes, static_cast<size_t>(count));
+}
+
+struct FileIdentity { dev_t device; ino_t inode; };
+
+FileIdentity Identity(const std::string& path) {
+	struct stat info;
+	assert(lstat(path.c_str(), &info) == 0);
+	return {info.st_dev, info.st_ino};
+}
+
 pid_t Spawn(const std::string& binary, const std::vector<std::string>& arguments,
 	const char* failure = 0, const char* platform_failure = 0,
 	const char* launch_marker = 0, const char* launch_release = 0,
-	bool block_drain_signals_before_exec = false) {
+	bool block_drain_signals_before_exec = false,
+	const char* crash_checkpoint = 0) {
 	const pid_t child = fork();
 	assert(child >= 0);
 	if (child == 0) {
@@ -49,6 +76,7 @@ pid_t Spawn(const std::string& binary, const std::vector<std::string>& arguments
 		if (platform_failure) setenv("FOGCAST_TEST_PLATFORM", platform_failure, 1);
 		if (launch_marker) setenv("FOGCAST_TEST_LAUNCH_MARKER", launch_marker, 1);
 		if (launch_release) setenv("FOGCAST_TEST_LAUNCH_RELEASE", launch_release, 1);
+		if (crash_checkpoint) setenv("FOGCAST_TEST_CRASH_AFTER_COMMIT", crash_checkpoint, 1);
 		std::vector<char*> values;
 		values.push_back(const_cast<char*>(binary.c_str()));
 		for (size_t i = 0; i != arguments.size(); ++i)
@@ -84,6 +112,43 @@ CapturedProcess SpawnCaptured(const std::string& binary,
 	close(descriptors[1]);
 	CapturedProcess result = {child, descriptors[0]};
 	return result;
+}
+
+CapturedProcess SpawnProbe(const std::string& binary, const std::vector<std::string>& arguments,
+	const char* mode, const char* marker, const char* release) {
+	int descriptors[2];
+	assert(pipe(descriptors) == 0);
+	const pid_t child = fork();
+	assert(child >= 0);
+	if (child == 0) {
+		close(descriptors[0]);
+		assert(dup2(descriptors[1], STDOUT_FILENO) >= 0);
+		close(descriptors[1]);
+		setenv("FOGCAST_STORAGE_PROBE_MODE", mode, 1);
+		setenv("FOGCAST_STORAGE_PROBE_MARKER", marker, 1);
+		setenv("FOGCAST_STORAGE_PROBE_RELEASE", release, 1);
+		std::vector<char*> values;
+		values.push_back(const_cast<char*>(binary.c_str()));
+		for (size_t i = 0; i != arguments.size(); ++i)
+			values.push_back(const_cast<char*>(arguments[i].c_str()));
+		values.push_back(0);
+		execv(binary.c_str(), values.data());
+		_Exit(127);
+	}
+	close(descriptors[1]);
+	CapturedProcess result = {child, descriptors[0]};
+	return result;
+}
+
+std::string ReadCaptured(int descriptor) {
+	std::string output;
+	char bytes[128];
+	ssize_t count;
+	while ((count = read(descriptor, bytes, sizeof(bytes))) > 0)
+		output.append(bytes, static_cast<size_t>(count));
+	assert(count == 0);
+	assert(close(descriptor) == 0);
+	return output;
 }
 
 int Wait(pid_t child) {
@@ -237,12 +302,202 @@ void CreateFence(const std::string& directory, uint64_t epoch = 1) {
 	assert(fence.Commit(fogcast::BackendFence::Record(1, "native", epoch)) == fogcast::ErrorClass::ok);
 }
 
+void StorageProbeCoordinationTests(const std::string& probe) {
+	const std::string root = TemporaryDirectory();
+	assert(mkdir((root + "/megadrive").c_str(), 0700) == 0);
+	assert(mkdir((root + "/snes").c_str(), 0700) == 0);
+	const std::string digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+	const std::string content = root + "/megadrive/" + digest + ".md";
+	WriteRegular(content, "abc");
+	const std::vector<std::string> probe_arguments = {root, "megadrive", "MegaDrive", digest, "3", "md"};
+	for (const char* mode : {"hold", "after_hash"}) {
+		const std::string marker = root + "/pre-existing-" + mode;
+		const std::string release = root + "/release-" + mode;
+		WriteRegular(marker, "sentinel");
+		const FileIdentity marker_identity = Identity(marker);
+		CapturedProcess process = SpawnProbe(probe, probe_arguments, mode, marker.c_str(), release.c_str());
+		const int status = Wait(process.pid);
+		const std::string output = ReadCaptured(process.output);
+		assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+		assert(output == "io\n");
+		assert(ReadRegular(marker) == "sentinel");
+		const FileIdentity marker_after = Identity(marker);
+		assert(marker_after.device == marker_identity.device && marker_after.inode == marker_identity.inode);
+		assert(unlink(marker.c_str()) == 0);
+	}
+	const std::string size_marker = root + "/pre-existing-size";
+	const std::string size_release = root + "/release-size";
+	WriteRegular(size_marker, "sentinel");
+	const FileIdentity size_marker_identity = Identity(size_marker);
+	std::vector<std::string> size_arguments = probe_arguments;
+	size_arguments[4] = "4";
+	CapturedProcess size_process = SpawnProbe(probe, size_arguments, "after_hash",
+		size_marker.c_str(), size_release.c_str());
+	const int size_status = Wait(size_process.pid);
+	const std::string size_output = ReadCaptured(size_process.output);
+	assert(WIFEXITED(size_status) && WEXITSTATUS(size_status) == 1);
+	assert(size_output == "changed\n");
+	assert(ReadRegular(size_marker) == "sentinel");
+	const FileIdentity size_marker_after = Identity(size_marker);
+	assert(size_marker_after.device == size_marker_identity.device &&
+		size_marker_after.inode == size_marker_identity.inode);
+	assert(unlink(size_marker.c_str()) == 0);
+	const std::string digest_marker = root + "/pre-existing-digest";
+	const std::string digest_release = root + "/release-digest";
+	const std::string wrong_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+	const std::string wrong_content = root + "/megadrive/" + wrong_digest + ".md";
+	WriteRegular(wrong_content, "abc");
+	WriteRegular(digest_marker, "sentinel");
+	const FileIdentity digest_marker_identity = Identity(digest_marker);
+	std::vector<std::string> digest_arguments = probe_arguments;
+	digest_arguments[3] = wrong_digest;
+	CapturedProcess digest_process = SpawnProbe(probe, digest_arguments, "after_hash",
+		digest_marker.c_str(), digest_release.c_str());
+	const int digest_status = Wait(digest_process.pid);
+	const std::string digest_output = ReadCaptured(digest_process.output);
+	assert(WIFEXITED(digest_status) && WEXITSTATUS(digest_status) == 1);
+	assert(digest_output == "digest_mismatch\n");
+	assert(ReadRegular(digest_marker) == "sentinel");
+	const FileIdentity digest_marker_after = Identity(digest_marker);
+	assert(digest_marker_after.device == digest_marker_identity.device &&
+		digest_marker_after.inode == digest_marker_identity.inode);
+	assert(unlink(digest_marker.c_str()) == 0);
+	assert(unlink(wrong_content.c_str()) == 0);
+
+	const std::string marker = root + "/owned-marker";
+	const std::string release = root + "/owned-release";
+	CapturedProcess owned = SpawnProbe(probe, probe_arguments, "hold", marker.c_str(), release.c_str());
+	assert(WaitForPath(marker));
+	WriteRegular(release, "release");
+	const int owned_status = Wait(owned.pid);
+	const std::string owned_output = ReadCaptured(owned.output);
+	assert(WIFEXITED(owned_status) && WEXITSTATUS(owned_status) == 0);
+	assert(owned_output == "ready\nok\n");
+	assert(!Exists(marker));
+	assert(ReadRegular(release) == "release");
+	assert(unlink(release.c_str()) == 0);
+	assert(unlink(content.c_str()) == 0);
+	assert(rmdir((root + "/megadrive").c_str()) == 0);
+	assert(rmdir((root + "/snes").c_str()) == 0);
+	assert(rmdir(root.c_str()) == 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-	assert(argc == 3);
+	assert(argc == 4);
 	const std::string fake = argv[1];
 	const std::string unavailable = argv[2];
+	const std::string probe = argv[3];
+	pid_t child = -1;
+	int client = -1;
+	StorageProbeCoordinationTests(probe);
+
+	// Host-test crash control accepts only the frozen post-commit checkpoint
+	// names. Unknown and compound values must fail before any persistent state
+	// or socket is created.
+	const char* crash_checkpoints[] = {"recorded", "intent", "releasing", "no_owner",
+		"transferred", "active", "unwinding", "failed", "idle", "terminal"};
+	for (const char* checkpoint : {"unknown", "recorded,terminal", "recorded terminal", ""}) {
+		const std::string directory = TemporaryDirectory();
+		CreateFence(directory);
+		AssertExitedNonzero(Spawn(fake, {directory, "1"}, 0, 0, 0, 0, false, checkpoint));
+		assert(!Exists(directory + "/fogcast-runtime.sock"));
+		assert(!Exists(directory + "/fogcast-runtime.lock"));
+		RemoveRuntimeDirectory(directory, true, false);
+	}
+	for (const char* checkpoint : crash_checkpoints) {
+		const std::string directory = TemporaryDirectory();
+		CreateFence(directory);
+		child = Spawn(fake, {directory, "1"}, 0, 0, 0, 0, false, checkpoint);
+		assert(WaitForPath(directory + "/fogcast-runtime.sock"));
+		assert(kill(child, SIGTERM) == 0);
+		const int accepted_status = Wait(child);
+		assert(WIFEXITED(accepted_status) && WEXITSTATUS(accepted_status) == 0);
+		RemoveRuntimeDirectory(directory, true, true);
+	}
+	const std::string recorded_directory = TemporaryDirectory();
+	CreateFence(recorded_directory);
+	child = Spawn(fake, {recorded_directory, "1"}, 0, 0, 0, 0, false, "recorded");
+	assert(WaitForPath(recorded_directory + "/fogcast-runtime.sock"));
+	client = Connect(recorded_directory + "/fogcast-runtime.sock");
+	WriteAll(client, Frame(LaunchRequest(1)));
+	close(client);
+	const int crash_status = Wait(child);
+	assert(WIFEXITED(crash_status) && WEXITSTATUS(crash_status) == 86);
+	assert(Exists(recorded_directory + "/state.json"));
+	int state_file = open((recorded_directory + "/state.json").c_str(), O_RDONLY | O_CLOEXEC);
+	assert(state_file >= 0);
+	char state_bytes[4096];
+	const ssize_t state_count = read(state_file, state_bytes, sizeof(state_bytes) - 1);
+	assert(state_count > 0);
+	state_bytes[state_count] = '\0';
+	assert(close(state_file) == 0);
+	assert(strstr(state_bytes, "\"stage\":\"recorded\"") != nullptr);
+	RemoveRuntimeDirectory(recorded_directory, true, true);
+
+	// An admitted stop with the exact host-test cleanup fault reaches the
+	// durable failed terminal commit, then exits at that post-commit point.
+	const std::string failed_directory = TemporaryDirectory();
+	CreateFence(failed_directory);
+	child = Spawn(fake, {failed_directory, "1"}, 0, "stop_cleanup_incomplete", 0, 0,
+		false, "failed");
+	assert(WaitForPath(failed_directory + "/fogcast-runtime.sock"));
+	client = Connect(failed_directory + "/fogcast-runtime.sock");
+	const std::string launch_response = Exchange(client, LaunchRequest(1));
+	assert(launch_response.find("\"ok\":true") != std::string::npos);
+	const std::string failed_status = Query(client, "status", 11);
+	const uint64_t failed_sequence = SnapshotSequence(failed_status);
+	WriteAll(client, Frame(StopRequest(failed_sequence)));
+	close(client);
+	const int failed_crash_status = Wait(child);
+	assert(WIFEXITED(failed_crash_status) && WEXITSTATUS(failed_crash_status) == 86);
+	int failed_state_file = open((failed_directory + "/state.json").c_str(), O_RDONLY | O_CLOEXEC);
+	assert(failed_state_file >= 0);
+	char failed_state_bytes[8192];
+	const ssize_t failed_state_count = read(failed_state_file, failed_state_bytes,
+		sizeof(failed_state_bytes) - 1);
+	assert(failed_state_count > 0);
+	failed_state_bytes[failed_state_count] = '\0';
+	assert(close(failed_state_file) == 0);
+	assert(strstr(failed_state_bytes, "\"phase\":\"failed\"") != nullptr);
+	assert(strstr(failed_state_bytes, "\"code\":\"RECOVERY_REQUIRED\"") != nullptr);
+	assert(strstr(failed_state_bytes, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") != nullptr);
+	assert(strstr(failed_state_bytes, "\"owner\":{\"session\":\"55555555555555555555555555555555\"") != nullptr);
+	assert(strstr(failed_state_bytes, "22222222222222222222222222222222") != nullptr);
+	assert(unlink((failed_directory + "/fogcast-runtime.sock").c_str()) == 0);
+	child = Spawn(fake, {failed_directory, "1"});
+	assert(WaitForPath(failed_directory + "/fogcast-runtime.sock"));
+	client = Connect(failed_directory + "/fogcast-runtime.sock");
+	assert(Query(client, "status", 21).find("\"phase\":\"failed\"") != std::string::npos);
+	close(client);
+	assert(kill(child, SIGKILL) == 0);
+	const int failed_restart_status = Wait(child);
+	assert(WIFSIGNALED(failed_restart_status) && WTERMSIG(failed_restart_status) == SIGKILL);
+	RemoveRuntimeDirectory(failed_directory, true, true);
+	for (const char* non_fault : {"", "unknown", "stop_cleanup_incomplete,other"}) {
+		const std::string directory = TemporaryDirectory();
+		CreateFence(directory);
+		child = Spawn(fake, {directory, "1"}, 0, non_fault);
+		assert(WaitForPath(directory + "/fogcast-runtime.sock"));
+		client = Connect(directory + "/fogcast-runtime.sock");
+		assert(Exchange(client, LaunchRequest(1)).find("\"ok\":true") != std::string::npos);
+		const uint64_t sequence = SnapshotSequence(Query(client, "status", 2));
+		assert(Exchange(client, StopRequest(sequence)).find("\"ok\":true") != std::string::npos);
+		close(client);
+		assert(kill(child, SIGTERM) == 0);
+		const int normal_fault_status = Wait(child);
+		assert(WIFEXITED(normal_fault_status) && WEXITSTATUS(normal_fault_status) == 0);
+		RemoveRuntimeDirectory(directory, true, true);
+	}
+
+	// The canonical unavailable binary remains production-shaped and ignores
+	// host-test-only crash configuration.
+	const std::string production_directory = TemporaryDirectory();
+	AssertExitedNonzero(Spawn(unavailable, {production_directory, "1"}, 0, 0, 0, 0, false, "recorded"));
+	assert(!Exists(production_directory + "/fogcast-runtime.sock"));
+	assert(!Exists(production_directory + "/state.json"));
+	RemoveRuntimeDirectory(production_directory, false, false);
 
 	// Exact argc and canonical positive uint63 parsing.
 	AssertExitedNonzero(Spawn(fake, std::vector<std::string>()));
@@ -298,9 +553,9 @@ int main(int argc, char** argv) {
 	// inspection, and a signal cannot falsely claim graceful drain.
 	const std::string unavailable_directory = TemporaryDirectory();
 	const std::string unavailable_socket = unavailable_directory + "/fogcast-runtime.sock";
-	pid_t child = Spawn(fake, {unavailable_directory, "1"});
+	child = Spawn(fake, {unavailable_directory, "1"});
 	assert(WaitForPath(unavailable_socket));
-	int client = Connect(unavailable_socket);
+	client = Connect(unavailable_socket);
 	const std::string unavailable_hello = Query(client);
 	assert(unavailable_hello.find("\"ready\":false") != std::string::npos);
 	assert(Query(client, "health", 2).find("\"ready\":false") != std::string::npos);

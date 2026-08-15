@@ -75,6 +75,11 @@ MisterResult Observe(void* context, MisterObservationV2* observation, uint32_t) 
 MisterResult Stop(void* context, uint32_t) {
 	FakeState* state = static_cast<FakeState*>(context);
 	if (!state) return MISTER_RESULT_INVALID_ARGUMENT;
+#ifdef FOGCAST_RUNTIME_HOST_TEST
+	const char* fault = getenv("FOGCAST_TEST_PLATFORM");
+	if (fault && strcmp(fault, "stop_cleanup_incomplete") == 0)
+		return MISTER_RESULT_CLEANUP_INCOMPLETE;
+#endif
 	state->active = false;
 	return MISTER_RESULT_OK;
 }

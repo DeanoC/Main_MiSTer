@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <limits>
@@ -40,6 +41,33 @@ bool Injected(const char* point) {
 	}
 	return false;
 }
+
+bool IsCrashCheckpoint(const char* value) {
+	if (!value || value[0] == '\0') return false;
+	static const char* const checkpoints[] = {
+		"recorded", "intent", "releasing", "no_owner", "transferred",
+		"active", "unwinding", "failed", "idle", "terminal"
+	};
+	for (size_t i = 0; i != sizeof(checkpoints) / sizeof(checkpoints[0]); ++i)
+		if (strcmp(value, checkpoints[i]) == 0) return true;
+	return false;
+}
+
+class HostTestCommitCrashInjector : public fogcast::CommitCrashInjector {
+public:
+	explicit HostTestCommitCrashInjector(const char* checkpoint)
+		: checkpoint_(checkpoint), fired_(false) {}
+	bool AfterCommit(const std::string& phase) override {
+		if (!fired_ && phase == checkpoint_) {
+			fired_ = true;
+			_Exit(86);
+		}
+		return false;
+	}
+private:
+	const char* checkpoint_;
+	bool fired_;
+};
 #else
 bool Injected(const char*) { return false; }
 #endif
@@ -97,6 +125,13 @@ int main(int argc, char** argv) {
 	if (argc != 3) return 2;
 	uint64_t epoch = 0;
 	if (!ParseEpoch(argv[2], &epoch)) return 2;
+	fogcast::CommitCrashInjector* crash_injector = 0;
+#ifdef FOGCAST_RUNTIME_HOST_TEST
+	const char* crash_checkpoint = getenv("FOGCAST_TEST_CRASH_AFTER_COMMIT");
+	if (crash_checkpoint && !IsCrashCheckpoint(crash_checkpoint)) return 2;
+	HostTestCommitCrashInjector host_crash_injector(crash_checkpoint);
+	if (crash_checkpoint) crash_injector = &host_crash_injector;
+#endif
 	const fogcast::RuntimePlatformBinding* binding = fogcast::RuntimePlatform();
 	if (!binding || !binding->abi_v2 || !binding->main_absent) return 2;
 	const uid_t effective_uid = geteuid();
@@ -114,7 +149,7 @@ int main(int argc, char** argv) {
 
 	BoundLifecyclePlatform platform(*binding);
 	fogcast::BackendFence fence(argv[1]);
-	fogcast::Coordinator coordinator(argv[1], &fence, &platform);
+	fogcast::Coordinator coordinator(argv[1], &fence, &platform, crash_injector);
 	(void)coordinator.Initialize(epoch);  // Exactly once; unavailable remains inspectable.
 	fogcast::RuntimeServerConfig config;
 	config.parent_directory = argv[1];
