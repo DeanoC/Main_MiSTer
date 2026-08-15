@@ -1184,6 +1184,79 @@ void TestResolutionFailureInjectionAndEntrySubstitution()
 	RemoveArtifactTree(root, "snes", name);
 }
 
+void ChurnUnrelatedArtifactDirectories(const std::string &root)
+{
+	char sibling[] = "/tmp/fogcast-unrelated-ancestor-churn.XXXXXX";
+	assert(mkdtemp(sibling) != nullptr);
+	assert(rmdir(sibling) == 0);
+	const std::string root_pattern = Join(root, "churn.XXXXXX");
+	std::vector<char> root_child(root_pattern.begin(), root_pattern.end());
+	root_child.push_back('\0');
+	assert(mkdtemp(root_child.data()) != nullptr);
+	assert(rmdir(root_child.data()) == 0);
+	const std::string system_pattern = Join(Join(root, "snes"), "churn.XXXXXX");
+	std::vector<char> system_child(system_pattern.begin(), system_pattern.end());
+	system_child.push_back('\0');
+	assert(mkdtemp(system_child.data()) != nullptr);
+	assert(rmdir(system_child.data()) == 0);
+}
+
+void TestUnrelatedAncestorDirectoryChurnKeepsHeldCoreValid()
+{
+	const std::string root = TemporaryRoot();
+	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+	const std::string name =
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.rbf";
+	WriteFile(Join(Join(root, "snes"), name), "hello");
+	NativePosixFileSystem filesystem;
+	NativeCoreArtifactAdapter adapter(root.c_str(), filesystem);
+	NativeCoreArtifactHandle artifact;
+	assert(ResolveSnesFixtureForTest(adapter, filesystem.NowMs() + 1000,
+		&artifact) == NativeArtifactResult::ok);
+	ChurnUnrelatedArtifactDirectories(root);
+	const uint64_t start = filesystem.NowMs();
+	TestClock clock(start);
+	HardwareBroker broker(clock);
+	PlatformGenerationId generation = 0;
+	assert(broker.EnterFixtureForTest(*FixtureNativeCoreProfile("snes"),
+		&generation) == MISTER_RESULT_OK);
+	std::unique_ptr<OperationLease> lease;
+	assert(broker.Begin(generation, OperationKind::program_fpga, start + 1000,
+		&lease) == MISTER_RESULT_OK);
+	CollectingSink sink;
+	NativeFpgaProgrammer programmer(broker, clock, sink);
+	const NativeFpgaProgrammingReceipt receipt = programmer.Program(*lease,
+		artifact);
+	assert(receipt.result == MISTER_RESULT_OK);
+	assert(std::string(sink.bytes_.begin(), sink.bytes_.end()) == "hello");
+	lease.reset();
+	assert(artifact.Close() == NativeArtifactResult::ok);
+	RemoveArtifactTree(root, "snes", name);
+}
+
+void TestUnrelatedAncestorDirectoryChurnKeepsHeldContentValid()
+{
+	const std::string root = TemporaryRoot();
+	assert(mkdir(Join(root, "snes").c_str(), 0700) == 0);
+	const std::string name =
+		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824.sfc";
+	WriteFile(Join(Join(root, "snes"), name), "hello");
+	NativePosixFileSystem filesystem;
+	NativeContentAdapter content(root.c_str(), filesystem);
+	NativeArtifactAuthority authority = HelloAuthority();
+	authority.extension = "sfc";
+	assert(content.Configure(authority) == MISTER_RESULT_OK);
+	assert(content.RetainContent(filesystem.NowMs() + 1000).result ==
+		MISTER_RESULT_OK);
+	ChurnUnrelatedArtifactDirectories(root);
+	char content_bytes[5] = {};
+	assert(content.ReadRetainedAt(0, content_bytes, sizeof(content_bytes),
+		filesystem.NowMs() + 1000) == MISTER_RESULT_OK);
+	assert(memcmp(content_bytes, "hello", sizeof(content_bytes)) == 0);
+	assert(content.CloseContent(filesystem.NowMs() + 1000) == MISTER_RESULT_OK);
+	RemoveArtifactTree(root, "snes", name);
+}
+
 void TestProgrammingFailureBoundariesRetainAuthority()
 {
 	const std::string root = TemporaryRoot();
@@ -1691,6 +1764,8 @@ void RunAllTests()
 	TestProgrammingRequiresExactActiveProgramLeaseAndDeadline();
 	TestProgrammingAuthorityMatrix();
 	TestResolutionFailureInjectionAndEntrySubstitution();
+	TestUnrelatedAncestorDirectoryChurnKeepsHeldCoreValid();
+	TestUnrelatedAncestorDirectoryChurnKeepsHeldContentValid();
 	TestProgrammingFailureBoundariesRetainAuthority();
 	TestProgrammingRejectsMalformedSessionAndIncompleteFinishEvidence();
 	TestProgrammingReceiptSurvivesLateDeadlineAndBrokerDestruction();

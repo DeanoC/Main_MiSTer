@@ -730,6 +730,8 @@ test-native-linux-v2-context-reachability:
 test-native-linux-v2-context-dependency-invalidation:
 	@probe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/native-v2-context-deps.XXXXXX"); \
 		trap 'rm -r "$$probe_dir"' EXIT; \
+		$(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" \
+			test-native-linux-v2-context >/dev/null || exit 1; \
 		for check in \
 			'runtime/native/linux/native_linux_v2_context.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
 			'runtime/native/hardware_broker.hpp:test-native-linux-v2-context:-c tests/native_linux_v2_context_test.cpp' \
@@ -757,7 +759,6 @@ test-native-linux-v2-context-dependency-invalidation:
 			'runtime/native/native_core_profile.hpp:test-native-linux-v2-context:-c runtime/native/linux/native_linux_v2_context.cpp' \
 			'runtime/mister_runtime.h:test-native-linux-v2-context:-c runtime/native/linux/native_linux_v2_context.cpp'; do \
 			header=$${check%%:*}; rest=$${check#*:}; target=$${rest%%:*}; expected=$${rest#*:}; \
-			$(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" "$$target" >/dev/null || exit 1; \
 			if ! $(MAKE) -f tests/Makefile HOST_TEST_DIR="$$probe_dir" -W "$$header" -n "$$target" | \
 				grep -F -- "$$expected" >/dev/null; then \
 				echo "context dependency invalidation missing: $$header" >&2; exit 1; \

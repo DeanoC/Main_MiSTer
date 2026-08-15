@@ -32,6 +32,14 @@ bool SameMetadata(const struct stat &left, const struct stat &right)
 		left.st_nlink == right.st_nlink && left.st_size == right.st_size;
 }
 
+bool SameDirectoryIdentity(const struct stat &left, const struct stat &right)
+{
+	return S_ISDIR(left.st_mode) && S_ISDIR(right.st_mode) &&
+		left.st_dev == right.st_dev && left.st_ino == right.st_ino &&
+		left.st_mode == right.st_mode && left.st_uid == right.st_uid &&
+		left.st_gid == right.st_gid;
+}
+
 bool ValidComponent(const char *text, size_t length, size_t capacity,
 	bool lowercase_hex)
 {
@@ -446,14 +454,14 @@ NativeArtifactResult NativeHeldFile::Revalidate(
 	struct stat directory_open = {}, file_path = {}, file_open = {};
 	if (root_descriptor_count_ == 0 ||
 		filesystem_->Stat(root_descriptors_[0], &root_open) != 0 ||
-		!SameMetadata(root_identities_[0], root_open))
+		!SameDirectoryIdentity(root_identities_[0], root_open))
 		return NativeArtifactResult::changed;
 	for (size_t index = 1; index < root_descriptor_count_; ++index) {
 		if (filesystem_->StatAt(root_descriptors_[index - 1],
 			root_components_[index], &root_path, AT_SYMLINK_NOFOLLOW) != 0 ||
 			filesystem_->Stat(root_descriptors_[index], &root_open) != 0 ||
-			!SameMetadata(root_identities_[index], root_path) ||
-			!SameMetadata(root_identities_[index], root_open))
+			!SameDirectoryIdentity(root_identities_[index], root_path) ||
+			!SameDirectoryIdentity(root_identities_[index], root_open))
 			return NativeArtifactResult::changed;
 	}
 	const int root_descriptor = root_descriptors_[root_descriptor_count_ - 1];
@@ -464,8 +472,8 @@ NativeArtifactResult NativeHeldFile::Revalidate(
 			AT_SYMLINK_NOFOLLOW) != 0 ||
 		filesystem_->Stat(file_descriptor_, &file_open) != 0)
 		return NativeArtifactResult::changed;
-	if (!SameMetadata(directory_identity_, directory_path) ||
-		!SameMetadata(directory_identity_, directory_open) ||
+	if (!SameDirectoryIdentity(directory_identity_, directory_path) ||
+		!SameDirectoryIdentity(directory_identity_, directory_open) ||
 		!SameMetadata(file_identity_, file_path) ||
 		!SameMetadata(file_identity_, file_open))
 		return NativeArtifactResult::changed;
@@ -599,7 +607,7 @@ NativeArtifactResult NativeCoreArtifactAdapter::ResolveHeld(
 		artifact->root_descriptors_[index] = opened;
 		++artifact->root_descriptor_count_;
 		if (filesystem_.Stat(opened, &open_info) != 0 ||
-			!SameMetadata(path_info, open_info))
+			!SameDirectoryIdentity(path_info, open_info))
 			return NativeArtifactResult::changed;
 		artifact->root_identities_[index] = open_info;
 		root_descriptor = opened;
@@ -616,7 +624,8 @@ NativeArtifactResult NativeCoreArtifactAdapter::ResolveHeld(
 		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0);
 	if (artifact->directory_descriptor_ < 0) return NativeArtifactResult::io;
 	if (filesystem_.Stat(artifact->directory_descriptor_, &open_info) != 0 ||
-		!SameMetadata(path_info, open_info)) return NativeArtifactResult::changed;
+		!SameDirectoryIdentity(path_info, open_info))
+		return NativeArtifactResult::changed;
 	artifact->directory_identity_ = open_info;
 
 	if (filesystem_.StatAt(artifact->directory_descriptor_,

@@ -33,8 +33,10 @@
 #include <unistd.h>
 
 #include <limits>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2745,8 +2747,24 @@ static void TestConcreteSnesActivationThroughCallbacks()
 	launch.content.sha256 = View(
 		"d85093739274b43a1adc2943315e15152f5204414c749d64be5e443105f43ca6");
 	launch.content.size = 32768;
-	assert(platform.load(platform.context, &launch,
-		kConcreteGraphCallbackBudgetMs) == MISTER_RESULT_OK);
+	char churn_path[] = ".fogcast-v2-unrelated-ancestor-churn.XXXXXX";
+	assert(mkdtemp(churn_path) != nullptr);
+	assert(rmdir(churn_path) == 0);
+	std::atomic<bool> stop_churn(false);
+	std::atomic<unsigned> churn_count(0);
+	std::thread churn([&]() {
+		while (!stop_churn.load(std::memory_order_acquire)) {
+			assert(mkdir(churn_path, 0700) == 0);
+			assert(rmdir(churn_path) == 0);
+			churn_count.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+	const MisterResult loaded = platform.load(platform.context, &launch,
+		kConcreteGraphCallbackBudgetMs);
+	stop_churn.store(true, std::memory_order_release);
+	churn.join();
+	assert(churn_count.load(std::memory_order_relaxed) != 0);
+	assert(loaded == MISTER_RESULT_OK);
 	assert(generations.last != nullptr);
 	assert(generations.last->programmed_same_handle());
 	MisterObservationV2 observation = Observation();
