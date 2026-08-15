@@ -43,7 +43,7 @@ static inline uint32_t MisterRuntime_ReadGeneration(const MisterRuntime *runtime
 	return generation;
 }
 
-#if defined(MISTER_RUNTIME_TESTING)
+#if defined(MISTER_RUNTIME_TESTING) || defined(MISTER_NATIVE_PROFILE_TESTING)
 namespace MisterRuntimeTest {
 enum Fault {
 	FAULT_NONE = 0,
@@ -56,6 +56,7 @@ enum Fault {
 };
 void SetFault(Fault fault);
 void ClearFault();
+MisterResult DiscardExitRequired(MisterRuntime **runtime);
 }
 #endif
 

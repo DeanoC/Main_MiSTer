@@ -901,6 +901,8 @@ static void test_stop_result_mapping_and_destroy_retention()
 		MISTER_RESULT_OK, MISTER_RESULT_EXIT_REQUIRED, 0);
 	assert(MisterRuntime_DestroyV2(&runtime) == MISTER_RESULT_INVALID_STATE);
 	assert(runtime != nullptr);
+	assert(MisterRuntimeTest::DiscardExitRequired(&runtime) == MISTER_RESULT_OK);
+	assert(runtime == nullptr);
 }
 
 static MisterRuntime *create_in_state(FakePlatform *fake, uint32_t state)
@@ -945,7 +947,12 @@ static void release_matrix_runtime(FakePlatform *fake, MisterRuntime **runtime)
 	if (*runtime == nullptr) return;
 	MisterStatusV2 status = initialized_status();
 	assert(MisterRuntime_StatusV2(*runtime, &status) == MISTER_RESULT_OK);
-	if (status.state == MISTER_STATE_EXIT_REQUIRED) return;
+	if (status.state == MISTER_STATE_EXIT_REQUIRED) {
+		MisterRuntime *retained = *runtime;
+		assert(MisterRuntimeTest::DiscardExitRequired(runtime) == MISTER_RESULT_OK);
+		assert(*runtime == nullptr && retained != nullptr);
+		return;
+	}
 	if (status.state == MISTER_STATE_CLEANUP_INCOMPLETE) fake->stop_result = MISTER_RESULT_OK;
 	if (status.state != MISTER_STATE_CREATED && status.state != MISTER_STATE_STOPPED) {
 		assert(MisterRuntime_StopV2(*runtime, 1) == MISTER_RESULT_OK);
@@ -1036,6 +1043,8 @@ static void test_legal_and_illegal_state_pairs()
 	assert(MisterRuntime_StatusV2(exit_runtime, &status) == MISTER_RESULT_OK);
 	assert(MisterRuntime_StopV2(exit_runtime, 1) == MISTER_RESULT_INVALID_STATE);
 	assert(MisterRuntime_DestroyV2(&exit_runtime) == MISTER_RESULT_INVALID_STATE);
+	assert(MisterRuntimeTest::DiscardExitRequired(&exit_runtime) == MISTER_RESULT_OK);
+	assert(exit_runtime == nullptr);
 }
 
 static void test_invalid_state_precedes_deadline_and_input_validation()
@@ -1073,6 +1082,8 @@ static void test_invalid_state_precedes_deadline_and_input_validation()
 	expect_status(runtime, MISTER_STATE_EXIT_REQUIRED, MISTER_RESULT_INVALID_STATE,
 		MISTER_RESULT_OK, MISTER_RESULT_EXIT_REQUIRED, 0);
 	assert(MisterRuntime_DestroyV2(&runtime) == MISTER_RESULT_INVALID_STATE);
+	assert(MisterRuntimeTest::DiscardExitRequired(&runtime) == MISTER_RESULT_OK);
+	assert(runtime == nullptr);
 }
 
 static void test_legal_state_zero_deadline_rejects_without_dispatch()
@@ -1256,6 +1267,8 @@ static void test_full_v2_call_state_matrix()
 		if (state == MISTER_STATE_EXIT_REQUIRED) {
 			assert(result == MISTER_RESULT_INVALID_STATE && callback_count(stop_fake) == calls);
 			expect_illegal_state(runtime, before);
+			assert(MisterRuntimeTest::DiscardExitRequired(&runtime) == MISTER_RESULT_OK);
+			assert(runtime == nullptr);
 		} else {
 			assert(result == MISTER_RESULT_OK);
 			expect_callback_delta(before_callbacks, stop_fake, 0, 0, 0, 0,
@@ -1382,6 +1395,46 @@ static void test_recovery_partial_progress_is_monotonic_across_non_ok_results()
 	destroy_stopped(&runtime);
 }
 
+static void test_exit_required_discard_is_test_only_and_exact()
+{
+	assert(MisterRuntimeTest::DiscardExitRequired(nullptr) == MISTER_RESULT_INVALID_STATE);
+	MisterPlatform v1_platform = {MISTER_RUNTIME_ABI_VERSION, sizeof(MisterPlatform), 0, nullptr,
+		v1_start, v1_load, v1_tick, v1_stop};
+	MisterRuntime *v1 = MisterRuntime_Create(&v1_platform);
+	assert(v1 != nullptr);
+	MisterRuntime *v1_retained = v1;
+	assert(MisterRuntimeTest::DiscardExitRequired(&v1) == MISTER_RESULT_INVALID_STATE);
+	assert(v1 == v1_retained);
+	assert(MisterRuntime_Destroy(&v1));
+	FakePlatform fake = make_fake();
+	MisterRuntime *runtime = create(&fake);
+	MisterRuntime *created = runtime;
+	assert(MisterRuntimeTest::DiscardExitRequired(&runtime) == MISTER_RESULT_INVALID_STATE);
+	assert(runtime == created);
+	assert(MisterRuntime_DestroyV2(&runtime) == MISTER_RESULT_OK);
+	assert(runtime == nullptr);
+	fake = make_fake();
+	runtime = create(&fake);
+	assert(MisterRuntime_StopV2(runtime, 1) == MISTER_RESULT_OK);
+	MisterRuntime *stopped = runtime;
+	assert(MisterRuntimeTest::DiscardExitRequired(&runtime) == MISTER_RESULT_INVALID_STATE);
+	assert(runtime == stopped);
+	destroy_stopped(&runtime);
+	fake = make_fake();
+	fake.stop_result = MISTER_RESULT_EXIT_REQUIRED;
+	runtime = create(&fake);
+	assert(MisterRuntime_StartV2(runtime, 1) == MISTER_RESULT_OK);
+	assert(MisterRuntime_StopV2(runtime, 1) == MISTER_RESULT_EXIT_REQUIRED);
+	const unsigned callbacks = callback_count(fake);
+	assert(MisterRuntime_DestroyV2(&runtime) == MISTER_RESULT_INVALID_STATE);
+	assert(runtime != nullptr);
+	assert(MisterRuntimeTest::DiscardExitRequired(&runtime) == MISTER_RESULT_OK);
+	assert(runtime == nullptr && callback_count(fake) == callbacks);
+	assert(MisterRuntime_CreateV2(&fake.platform, &runtime) == MISTER_RESULT_OK);
+	assert(MisterRuntime_StopV2(runtime, 1) == MISTER_RESULT_OK);
+	destroy_stopped(&runtime);
+}
+
 int main()
 {
 	test_create_validation_and_cross_generation_rejection();
@@ -1402,5 +1455,6 @@ int main()
 	test_full_v2_call_state_matrix();
 	test_recovery_is_stateless_and_neutral();
 	test_recovery_partial_progress_is_monotonic_across_non_ok_results();
+	test_exit_required_discard_is_test_only_and_exact();
 	return 0;
 }

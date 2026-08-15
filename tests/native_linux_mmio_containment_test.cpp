@@ -82,6 +82,7 @@ int main()
 #include "runtime/native/native_spi_bus.hpp"
 
 #include <assert.h>
+#include <cstring>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1042,7 +1043,7 @@ BridgeBoundaryResult RunBridgeBoundary(size_t fail_offset, bool expire_adapter,
 	NativePosixFileSystem filesystem;
 	NativeCoreArtifactAdapter artifacts(root.c_str(), filesystem);
 	NativeArtifactAuthority authority = {
-		system, strlen(system),
+		system, std::strlen(system),
 		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
 		64, 5, "rbf", 3};
 	NativeCoreArtifactHandle artifact;

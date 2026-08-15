@@ -581,12 +581,14 @@ ErrorClass ParseFrame(const std::string& bytes, std::string* payload) {
 }
 
 ErrorClass ParseBackendFence(const std::string& bytes, std::string* canonical, std::string* digest) {
-	if(!canonical||!digest)return ErrorClass::schema; canonical->clear();digest->clear();detail::Token root; ErrorClass result=detail::ScanV1Json(bytes,262144,&root);if(result!=ErrorClass::ok)return result;
+	if(!canonical||!digest)return ErrorClass::schema;
+	canonical->clear();digest->clear();detail::Token root; ErrorClass result=detail::ScanV1Json(bytes,262144,&root);if(result!=ErrorClass::ok)return result;
 	const char* const keys[]={"record_version","sequence","state","authority_epoch","sha256"}; if(!ExactKeys(root,keys,5))return ErrorClass::schema;
 	if(!detail::Member(root,"record_version")||detail::Member(root,"record_version")->kind!=detail::Token::Kind::number||detail::Member(root,"record_version")->text!="1")return ErrorClass::schema;
 	result=Number(detail::Member(root,"sequence"),0x7fffffffffffffffULL,true,0);if(result!=ErrorClass::ok)return result;result=Number(detail::Member(root,"authority_epoch"),0x7fffffffffffffffULL,true,0);if(result!=ErrorClass::ok)return result;
 	const detail::Token* state=detail::Member(root,"state");if(!IsString(state)||(state->text!="legacy"&&state->text!="native"&&state->text!="transitioning"&&state->text!="native_quiescing"))return ErrorClass::schema;
-	if(Hex(detail::Member(root,"sha256"),64)!=ErrorClass::ok)return ErrorClass::checksum; detail::Token copy=root;copy.object.pop_back();*canonical=detail::Encode(copy);*digest=Sha256Hex(*canonical);if(*digest!=detail::Member(root,"sha256")->text)return ErrorClass::checksum;return ErrorClass::ok;
+	if(Hex(detail::Member(root,"sha256"),64)!=ErrorClass::ok)return ErrorClass::checksum;
+	detail::Token copy=root;copy.object.pop_back();*canonical=detail::Encode(copy);*digest=Sha256Hex(*canonical);if(*digest!=detail::Member(root,"sha256")->text)return ErrorClass::checksum;return ErrorClass::ok;
 }
 
 BackendFenceTracker::BackendFenceTracker() : present_(false), sequence_(0), epoch_(0) {}

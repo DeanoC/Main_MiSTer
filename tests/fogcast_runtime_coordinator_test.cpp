@@ -204,7 +204,8 @@ struct MutableFenceSyscalls : public fogcast::FenceSyscalls {
 	fogcast::PathProbe Probe(const std::string& path, fogcast::FenceFileInfo* info) override {
 		if (path.find(".tmp") != std::string::npos) { if (temporary_probe == fogcast::PathProbe::present && info) *info = temporary; return temporary_probe; }
 		if (path.find("backend-fence.json") != std::string::npos) { if (file_probe == fogcast::PathProbe::present && info) *info = file; return file_probe; }
-		if (info) *info = directory; return fogcast::PathProbe::present;
+		if (info) *info = directory;
+		return fogcast::PathProbe::present;
 	}
 	int OpenReadNoFollow(const std::string&) override {
 		++read_opens; read_offset = 0;
@@ -228,7 +229,8 @@ struct MutableFenceSyscalls : public fogcast::FenceSyscalls {
 		memcpy(out, bytes.data() + read_offset, count); read_offset += count; return static_cast<std::ptrdiff_t>(count);
 	}
 	std::ptrdiff_t Write(int fd, const char* value, size_t size) override {
-		if (fd != 10) return -1; temporary_bytes.append(value, size); return static_cast<std::ptrdiff_t>(size);
+		if (fd != 10) return -1;
+		temporary_bytes.append(value, size); return static_cast<std::ptrdiff_t>(size);
 	}
 	bool Fchmod(int fd, uint32_t mode) override { if (fd != 10) return false; temporary.permissions = mode; return true; }
 	bool Fsync(int fd) override { return fd == 10 || fd == 11; }
@@ -545,6 +547,7 @@ void TestExactMetadataAndDeadlineBudgets() {
 	AbiV2Fake abi_fake;
 	MisterPlatformV2 abi_platform = abi_fake.Platform();
 	fogcast::AbiV2LifecyclePlatform abi(&abi_platform);
+	assert(!abi.DiscardExitRequiredForTesting());
 	fogcast::LifecycleOwner owner;
 	owner.present = true; owner.session = "0123456789abcdef0123456789abcdef"; owner.generation = 42;
 	fogcast::LaunchMetadata metadata;
@@ -575,6 +578,8 @@ void TestExactMetadataAndDeadlineBudgets() {
 	assert(exiting.live_handle_state() == fogcast::LiveHandleState::exit_required);
 	assert(exiting.Destroy() == fogcast::LifecycleResult::invalid_state);
 	assert(exiting.RecoverStateless(MISTER_RESOURCE_V2_KNOWN, 73) == fogcast::LifecycleResult::invalid_state);
+	assert(exiting.DiscardExitRequiredForTesting());
+	assert(exiting.live_handle_state() == fogcast::LiveHandleState::none);
 
 	char directory[] = "/tmp/fogcast-coordinator-budgets-XXXXXX";
 	assert(mkdtemp(directory) != 0);

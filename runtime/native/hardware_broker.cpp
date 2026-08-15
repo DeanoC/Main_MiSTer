@@ -785,6 +785,20 @@ HardwareBroker::~HardwareBroker()
 			registration->core_protocol_session_state.reset();
 	}
 	core_protocol_session_state_.reset();
+	const std::shared_ptr<PeripheralSessionState> peripheral =
+		peripheral_session_state_.lock();
+	if (peripheral) {
+		peripheral->phase.store(PeripheralSessionPhase::finalized);
+		const std::shared_ptr<OperationRegistration> registration =
+			peripheral->owner_registration.lock();
+		if (peripheral->view) {
+			peripheral->view->registration_.reset();
+			peripheral->view.reset();
+		}
+		if (registration)
+			registration->peripheral_session_state.reset();
+	}
+	peripheral_session_state_.reset();
 	hardware_transaction_active_ = false;
 }
 

@@ -354,6 +354,23 @@ static MisterResult run_observe(MisterRuntime *runtime,
 
 }  // namespace
 
+#if defined(MISTER_RUNTIME_TESTING)
+namespace MisterRuntimeTest {
+MisterResult DiscardExitRequired(MisterRuntime **runtime)
+{
+	if (runtime == nullptr || *runtime == nullptr || !is_v2(*runtime) ||
+		as_v2(*runtime)->v2_state != MISTER_STATE_EXIT_REQUIRED) {
+		return MISTER_RESULT_INVALID_STATE;
+	}
+	void *context = as_v2(*runtime)->platform_v2.context;
+	if (!registry_force_unregister(context, ~0u)) return MISTER_RESULT_PLATFORM;
+	free(*runtime);
+	*runtime = nullptr;
+	return MISTER_RESULT_OK;
+}
+}
+#endif
+
 extern "C" uint32_t MisterRuntime_ABIVersionV2(void)
 {
 	return MISTER_RUNTIME_ABI_VERSION_V2;

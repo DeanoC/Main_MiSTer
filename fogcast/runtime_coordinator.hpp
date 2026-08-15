@@ -137,6 +137,9 @@ public:
 	LifecycleResult RecoverStateless(uint32_t resource_mask, uint32_t deadline_ms) override;
 	LiveHandleState live_handle_state() const override;
 	bool MainAbsent() override;
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+	bool DiscardExitRequiredForTesting();
+#endif
 
 private:
 	LifecycleResult Recover(uint32_t resource_mask, uint32_t deadline_ms);

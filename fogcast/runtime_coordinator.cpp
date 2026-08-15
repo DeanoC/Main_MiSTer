@@ -3,6 +3,10 @@
 
 #include "fogcast/runtime_coordinator.hpp"
 
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+#include "runtime/mister_runtime_internal.hpp"
+#endif
+
 #include <time.h>
 
 namespace fogcast {
@@ -392,6 +396,20 @@ LifecycleResult AbiV2LifecyclePlatform::ProveNeutral(uint32_t resource_mask, uin
 LifecycleResult AbiV2LifecyclePlatform::RecoverStateless(uint32_t resource_mask, uint32_t deadline_ms) { return Recover(resource_mask, deadline_ms); }
 LiveHandleState AbiV2LifecyclePlatform::live_handle_state() const { return LiveHandleState(live_state_, live_owner_); }
 bool AbiV2LifecyclePlatform::MainAbsent() { return false; }
+#if defined(MISTER_NATIVE_PROFILE_TESTING)
+bool AbiV2LifecyclePlatform::DiscardExitRequiredForTesting() {
+	if (!runtime_ || live_state_ != LiveHandleState::exit_required ||
+		runtime_state_ != MISTER_STATE_EXIT_REQUIRED) return false;
+	if (MisterRuntimeTest::DiscardExitRequired(&runtime_) != MISTER_RESULT_OK) return false;
+	live_owner_ = LifecycleOwner();
+	granted_owner_ = LifecycleOwner();
+	live_state_ = LiveHandleState::none;
+	runtime_state_ = MISTER_STATE_CREATED;
+	primary_result_ = MISTER_RESULT_OK;
+	cleanup_result_ = MISTER_RESULT_OK;
+	return true;
+}
+#endif
 
 Coordinator::Coordinator() : store_(std::string()), fence_(0), platform_(0), crash_injector_(0),
 	clock_(&DefaultClock()), operation_deadline_(0), ready_(false), shutdown_(false) {}

@@ -154,6 +154,31 @@ void TestDestroyedCleanupAudioSessionBecomesSameRegistrationRecheckoutable()
 	retried.reset();
 }
 
+void TestAbandonedPeripheralTokenOutlivesBrokerDestruction()
+{
+	std::unique_ptr<CleanupAudioSessionBundle> retained;
+	{
+		FakeClock clock(100);
+		HardwareBroker broker(clock);
+		FakeAvOperations operations;
+		linux_native::NativeAvIoAdapter io(clock, operations);
+		linux_native::NativeAudioAdapter audio(clock, broker, io);
+		const NativeCoreProfile *profile = FixtureNativeCoreProfile("snes");
+		assert(profile != nullptr);
+		PlatformGenerationId generation = 0;
+		assert(broker.EnterFixtureForTest(*profile, &generation) == MISTER_RESULT_OK);
+		assert(broker.Quiesce(generation, 500) == MISTER_RESULT_OK);
+		std::unique_ptr<CleanupEpoch> cleanup;
+		assert(broker.BeginCleanup(generation, 2100, 5100, &cleanup) == MISTER_RESULT_OK);
+		std::unique_ptr<OperationLease> lease;
+		assert(broker.BeginCleanupOperation(*cleanup, OperationKind::audio, &lease) == MISTER_RESULT_OK);
+		assert(PeripheralAuthorityTestPeer::AcquireCleanupAudio(*lease, broker,
+			audio.BackendIdentity(), &retained) == MISTER_RESULT_OK);
+		assert(operations.begin_calls == 0 && operations.finish_calls == 0);
+	}
+	retained.reset();
+}
+
 void TestEveryTypedWrapperAllocationFailureLeavesNoLiveRegistration()
 {
 	const NativeCoreProfile *profile = FixtureNativeCoreProfile("snes");
@@ -1326,6 +1351,7 @@ int main()
 	mister::native::TestTypedAudioVideoSessionsCannotBeForgedOrConverted();
 	mister::native::TestAudioVideoResourcesAreSeparateTypedBoundaries();
 	mister::native::TestDestroyedCleanupAudioSessionBecomesSameRegistrationRecheckoutable();
+	mister::native::TestAbandonedPeripheralTokenOutlivesBrokerDestruction();
 	mister::native::TestEveryTypedWrapperAllocationFailureLeavesNoLiveRegistration();
 	mister::native::TestForeignConsumerCannotUseOrCompleteABoundAudioBundle();
 	mister::native::TestFixtureAudioVideoAndCoupledSessionsUseClosedRecipes();
