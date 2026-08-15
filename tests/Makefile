@@ -139,7 +139,7 @@ LEGACY_HOST_CXX_FLAGS = $(HOST_CXX_FLAGS) -D_GNU_SOURCE $(HOST_TEST_INCLUDE)
 HOST_LIBCO_FLAGS = $(HOST_CXX_FLAGS) -x c++ -D_XOPEN_SOURCE \
 	-Wno-deprecated-declarations -Wno-cpp
 
-.PHONY: clean stage-c0-software-test test-native-link-closure test-compatibility-main-preservation test-stage-c0-native-target-list test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-linux-hardware-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-native-linux-v2-context test-native-linux-v2-context-sanitize test-native-linux-v2-context-tsan test-native-linux-v2-context-concurrent test-native-linux-v2-context-production test-native-linux-v2-context-reachability test-native-linux-v2-context-dependency-invalidation test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
+.PHONY: clean stage-c0-software-test test-native-link-closure test-compatibility-main-preservation test-stage-c0-native-target-list test-runtime-smoke test-runtime test-scheduler test-scheduler-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-native-hardware-broker test-native-hardware-broker-200-cycles test-native-hardware-broker-sanitize test-native-spi-bus test-native-spi-bus-200-cycles test-native-spi-bus-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-snes-content test-native-snes-content-sanitize test-native-core-protocol test-native-core-protocol-sanitize test-native-core-protocol-reachability test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-save-dependency-invalidation test-native-linux-hardware-dependency-invalidation test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-containment test-native-containment-sanitize test-native-recovery test-native-recovery-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-audio-video-adapter-production test-native-save-adapter test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-adapter-production test-native-save-adapter-reachability test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-input-execution test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-input-execution-reachability test-native-linux-core-protocol-io test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-core-protocol-io-reachability test-native-linux-v2-context test-native-linux-v2-context-sanitize test-native-linux-v2-context-tsan test-native-linux-v2-context-concurrent test-native-linux-v2-context-production test-native-linux-v2-context-reachability test-native-linux-v2-context-dependency-invalidation test-runtime-legacy test-runtime-v2 test-runtime-v2-sanitize test-runtime-v2-production-sanitize test-runtime-linux-v2 test-runtime-resource-teardown test-runtime-resource-teardown-sanitize fogcast-runtime-storage-probe test-fogcast-protocol test-fogcast-state test-fogcast-protocol-sanitize test-fogcast-state-sanitize test-fogcast-coordinator test-fogcast-fence test-fogcast-coordinator-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-main test-fogcast-main-sanitize
 
 TASK8_COMPATIBILITY_MANIFEST = tests/fixtures/compatibility-main-984980c.manifest.sha256
 TASK8_COMPATIBILITY_MANIFEST_SHA256 = 54d3411a0916e2df6864f85f8c3d459c1ebf878d64e52a7fbf9b508d758d2785
@@ -152,10 +152,23 @@ test-compatibility-main-preservation:
 		"$(TASK8_COMPATIBILITY_MANIFEST)" "$(TASK8_COMPATIBILITY_MANIFEST_SHA256)"
 
 test-stage-c0-native-target-list:
-	@expected="$(HOST_TEST_DIR)/fogcast-runtime fogcast-runtime-storage-probe test-compatibility-main-preservation test-fogcast-coordinator test-fogcast-coordinator-sanitize test-fogcast-fence test-fogcast-protocol test-fogcast-protocol-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-state test-fogcast-state-sanitize test-native-link-closure test-native-linux-v2-context test-native-linux-v2-context-concurrent test-native-linux-v2-context-dependency-invalidation test-native-linux-v2-context-production test-native-linux-v2-context-sanitize test-runtime-linux-v2 test-runtime-linux-v2-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-runtime-resource-teardown test-runtime-resource-teardown-sanitize test-runtime-v2 test-scheduler test-scheduler-sanitize test-stage-c0-native-target-list"; \
+	@expected="$(HOST_TEST_DIR)/fogcast-runtime fogcast-runtime-storage-probe test-compatibility-main-preservation test-fogcast-coordinator test-fogcast-coordinator-sanitize test-fogcast-fence test-fogcast-protocol test-fogcast-protocol-sanitize test-fogcast-server test-fogcast-server-sanitize test-fogcast-state test-fogcast-state-sanitize test-native-audio-video-adapter test-native-audio-video-adapter-production test-native-audio-video-adapter-sanitize test-native-audio-video-adapter-tsan test-native-containment test-native-containment-sanitize test-native-core-profile test-native-core-profile-sanitize test-native-core-protocol test-native-core-protocol-capability-reachability test-native-core-protocol-dependency-invalidation test-native-core-protocol-reachability test-native-core-protocol-sanitize test-native-hardware-broker test-native-hardware-broker-200-cycles test-native-hardware-broker-sanitize test-native-input test-native-input-sanitize test-native-lifecycle test-native-lifecycle-sanitize test-native-link-closure test-native-linux-artifact-programmer test-native-linux-artifact-programmer-sanitize test-native-linux-core-protocol-io test-native-linux-core-protocol-io-reachability test-native-linux-core-protocol-io-sanitize test-native-linux-core-protocol-io-tsan test-native-linux-hardware-dependency-invalidation test-native-linux-input-execution test-native-linux-input-execution-reachability test-native-linux-input-execution-sanitize test-native-linux-input-execution-tsan test-native-linux-mmio-containment test-native-linux-mmio-containment-sanitize test-native-linux-mmio-reachability test-native-linux-v2-context test-native-linux-v2-context-concurrent test-native-linux-v2-context-dependency-invalidation test-native-linux-v2-context-production test-native-linux-v2-context-reachability test-native-linux-v2-context-sanitize test-native-linux-v2-context-tsan test-native-recovery test-native-recovery-sanitize test-native-save-adapter test-native-save-adapter-production test-native-save-adapter-reachability test-native-save-adapter-sanitize test-native-save-adapter-tsan test-native-save-dependency-invalidation test-native-snes-content test-native-snes-content-sanitize test-native-spi-bus test-native-spi-bus-200-cycles test-native-spi-bus-sanitize test-runtime-linux-v2 test-runtime-linux-v2-sanitize test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize test-runtime-resource-teardown test-runtime-resource-teardown-sanitize test-runtime-v2 test-scheduler test-scheduler-sanitize test-stage-c0-native-target-list"; \
 	actual="$$( $(MAKE) -f tests/Makefile -qp HOST_TEST_DIR=$(HOST_TEST_DIR) 2>/dev/null | \
 		awk '$$1 == "stage-c0-software-test:" { for (i=2; i<=NF; ++i) print $$i }' | \
 		LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $$//' )"; \
+	registered_native="$$( $(MAKE) -f tests/Makefile -qp \
+		HOST_TEST_DIR=$(HOST_TEST_DIR) 2>/dev/null | \
+		awk -F: '/^test-native-[[:alnum:]-]+:/ { print $$1 }' | \
+		LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $$//' )"; \
+	aggregate_native="$$(printf '%s\n' "$$actual" | tr ' ' '\n' | \
+		awk '/^test-native-[[:alnum:]-]+$$/' | LC_ALL=C sort -u | \
+		tr '\n' ' ' | sed 's/ $$//')"; \
+	test "$$aggregate_native" = "$$registered_native" || { \
+		echo "Stage C0 aggregate omits a registered native target" >&2; \
+		printf 'registered: %s\naggregate:  %s\n' \
+			"$$registered_native" "$$aggregate_native" >&2; \
+		exit 1; \
+	}; \
 	test "$$actual" = "$$expected" || { \
 		echo "Stage C0 target list is incomplete" >&2; \
 		printf 'expected: %s\nactual:   %s\n' "$$expected" "$$actual" >&2; \
@@ -365,21 +378,60 @@ test-native-linux-mmio-reachability: $(NATIVE_LINUX_MMIO_PRODUCTION_OBJECT)
 		echo "production object exports raw MMIO symbols" >&2; exit 1; \
 	fi
 
-stage-c0-software-test: test-runtime-v2 test-native-linux-v2-context \
-	test-native-link-closure test-compatibility-main-preservation \
-	test-stage-c0-native-target-list \
-	test-native-linux-v2-context-sanitize test-native-linux-v2-context-concurrent \
-	test-native-linux-v2-context-production \
+stage-c0-software-test: $(HOST_TEST_DIR)/fogcast-runtime \
+	fogcast-runtime-storage-probe test-compatibility-main-preservation \
+	test-fogcast-coordinator test-fogcast-coordinator-sanitize \
+	test-fogcast-fence test-fogcast-protocol test-fogcast-protocol-sanitize \
+	test-fogcast-server test-fogcast-server-sanitize \
+	test-fogcast-state test-fogcast-state-sanitize \
+	test-native-audio-video-adapter \
+	test-native-audio-video-adapter-production \
+	test-native-audio-video-adapter-sanitize \
+	test-native-audio-video-adapter-tsan \
+	test-native-containment test-native-containment-sanitize \
+	test-native-core-profile test-native-core-profile-sanitize \
+	test-native-core-protocol \
+	test-native-core-protocol-capability-reachability \
+	test-native-core-protocol-dependency-invalidation \
+	test-native-core-protocol-reachability \
+	test-native-core-protocol-sanitize \
+	test-native-hardware-broker test-native-hardware-broker-200-cycles \
+	test-native-hardware-broker-sanitize \
+	test-native-input test-native-input-sanitize \
+	test-native-lifecycle test-native-lifecycle-sanitize \
+	test-native-link-closure \
+	test-native-linux-artifact-programmer \
+	test-native-linux-artifact-programmer-sanitize \
+	test-native-linux-core-protocol-io \
+	test-native-linux-core-protocol-io-reachability \
+	test-native-linux-core-protocol-io-sanitize \
+	test-native-linux-core-protocol-io-tsan \
+	test-native-linux-hardware-dependency-invalidation \
+	test-native-linux-input-execution \
+	test-native-linux-input-execution-reachability \
+	test-native-linux-input-execution-sanitize \
+	test-native-linux-input-execution-tsan \
+	test-native-linux-mmio-containment \
+	test-native-linux-mmio-containment-sanitize \
+	test-native-linux-mmio-reachability \
+	test-native-linux-v2-context test-native-linux-v2-context-concurrent \
 	test-native-linux-v2-context-dependency-invalidation \
-	test-fogcast-protocol test-fogcast-state \
-	test-fogcast-coordinator test-fogcast-fence test-fogcast-server \
-	test-runtime-linux-v2 test-runtime-resource-teardown test-scheduler \
-	test-runtime-offload-lifecycle \
-	test-fogcast-protocol-sanitize test-fogcast-state-sanitize \
-	test-fogcast-coordinator-sanitize test-fogcast-server-sanitize \
-	test-runtime-linux-v2-sanitize test-runtime-resource-teardown-sanitize \
-	test-scheduler-sanitize test-runtime-offload-lifecycle-sanitize \
-	fogcast-runtime-storage-probe $(HOST_TEST_DIR)/fogcast-runtime
+	test-native-linux-v2-context-production \
+	test-native-linux-v2-context-reachability \
+	test-native-linux-v2-context-sanitize \
+	test-native-linux-v2-context-tsan \
+	test-native-recovery test-native-recovery-sanitize \
+	test-native-save-adapter test-native-save-adapter-production \
+	test-native-save-adapter-reachability test-native-save-adapter-sanitize \
+	test-native-save-adapter-tsan test-native-save-dependency-invalidation \
+	test-native-snes-content test-native-snes-content-sanitize \
+	test-native-spi-bus test-native-spi-bus-200-cycles \
+	test-native-spi-bus-sanitize \
+	test-runtime-linux-v2 test-runtime-linux-v2-sanitize \
+	test-runtime-offload-lifecycle test-runtime-offload-lifecycle-sanitize \
+	test-runtime-resource-teardown test-runtime-resource-teardown-sanitize \
+	test-runtime-v2 test-scheduler test-scheduler-sanitize \
+	test-stage-c0-native-target-list
 
 test-fogcast-protocol: $(HOST_TEST_DIR)/fogcast_runtime_protocol_test
 	$(HOST_TEST_DIR)/fogcast_runtime_protocol_test
@@ -446,6 +498,12 @@ test-runtime-offload-lifecycle-sanitize:
 test-native-hardware-broker: $(HOST_TEST_DIR)/native_hardware_broker_test
 	$(HOST_TEST_DIR)/native_hardware_broker_test
 
+test-native-hardware-broker-200-cycles: test-native-hardware-broker
+	@cycle=0; while test "$$cycle" -lt 200; do \
+		$(HOST_TEST_DIR)/native_hardware_broker_test || exit 1; \
+		cycle=$$((cycle + 1)); \
+	done
+
 test-native-hardware-broker-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-broker-sanitize \
 		HOST_FLAGS='-Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
@@ -453,6 +511,12 @@ test-native-hardware-broker-sanitize:
 
 test-native-spi-bus: $(HOST_TEST_DIR)/native_spi_bus_test
 	$(HOST_TEST_DIR)/native_spi_bus_test
+
+test-native-spi-bus-200-cycles: test-native-spi-bus
+	@cycle=0; while test "$$cycle" -lt 200; do \
+		$(HOST_TEST_DIR)/native_spi_bus_test || exit 1; \
+		cycle=$$((cycle + 1)); \
+	done
 
 test-native-spi-bus-sanitize:
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(MAKE) -f tests/Makefile HOST_TEST_DIR=$(HOST_TEST_DIR)/native-spi-sanitize \
