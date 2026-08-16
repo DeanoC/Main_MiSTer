@@ -2701,26 +2701,34 @@ static void TestConcreteCommittedAdapterGraphThroughCallbacks()
 	assert(linux_native::CreateFixtureNativeLinuxV2ContextForTest(clock, profiles,
 		generations, recoveries, &context) == MISTER_RESULT_OK);
 	const MisterPlatformV2 &platform = context->platform();
-	assert(platform.start(platform.context, 10) == MISTER_RESULT_OK);
+	clock.Set(host_clock.NowMs());
+	assert(platform.start(platform.context, kConcreteGraphCallbackBudgetMs) ==
+		MISTER_RESULT_OK);
 	MisterLaunchV2 launch = Launch("megadrive", "MegaDrive", "md");
 	launch.content.sha256 = View(
 		"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
 	launch.content.size = 5;
+	clock.Set(host_clock.NowMs());
 	const MisterResult graph_load = platform.load(platform.context, &launch,
 		kConcreteGraphCallbackBudgetMs);
 	assert(graph_load == MISTER_RESULT_OK);
 	assert(generations.last != nullptr && generations.last->programmed_same_handle());
 	MisterObservationV2 observation = Observation();
-	assert(platform.observe(platform.context, &observation, 100) == MISTER_RESULT_OK);
+	clock.Set(host_clock.NowMs());
+	assert(platform.observe(platform.context, &observation,
+		kConcreteGraphCallbackBudgetMs) == MISTER_RESULT_OK);
 	assert(observation.ready == 1);
 	assert(observation.resource_flags == MISTER_RESOURCE_V2_KNOWN);
 	assert(CopyView(observation.observed_core) == "MegaDrive");
-	assert(platform.tick(platform.context, 1000) == MISTER_RESULT_OK);
+	clock.Set(host_clock.NowMs());
+	assert(platform.tick(platform.context, kConcreteGraphCallbackBudgetMs) ==
+		MISTER_RESULT_OK);
 	assert(generations.last->tick_calls() == 1);
 	assert(generations.last->tick_deadline_propagated());
 	MisterResult stopped = MISTER_RESULT_CLEANUP_INCOMPLETE;
 	for (size_t attempt = 0; attempt != 20 && generations.last != nullptr; ++attempt) {
-		stopped = platform.stop(platform.context, 5000);
+		clock.Set(host_clock.NowMs());
+		stopped = platform.stop(platform.context, kConcreteGraphCallbackBudgetMs);
 		assert(stopped == MISTER_RESULT_OK ||
 			stopped == MISTER_RESULT_CLEANUP_INCOMPLETE);
 		if (stopped == MISTER_RESULT_OK) break;
@@ -2742,7 +2750,9 @@ static void TestConcreteSnesActivationThroughCallbacks()
 	assert(linux_native::CreateFixtureNativeLinuxV2ContextForTest(clock, profiles,
 		generations, recoveries, &context) == MISTER_RESULT_OK);
 	const MisterPlatformV2 &platform = context->platform();
-	assert(platform.start(platform.context, 10) == MISTER_RESULT_OK);
+	clock.Set(host_clock.NowMs());
+	assert(platform.start(platform.context, kConcreteGraphCallbackBudgetMs) ==
+		MISTER_RESULT_OK);
 	MisterLaunchV2 launch = Launch("snes", "SNES", "sfc");
 	launch.content.sha256 = View(
 		"d85093739274b43a1adc2943315e15152f5204414c749d64be5e443105f43ca6");
@@ -2759,6 +2769,7 @@ static void TestConcreteSnesActivationThroughCallbacks()
 			churn_count.fetch_add(1, std::memory_order_relaxed);
 		}
 	});
+	clock.Set(host_clock.NowMs());
 	const MisterResult loaded = platform.load(platform.context, &launch,
 		kConcreteGraphCallbackBudgetMs);
 	stop_churn.store(true, std::memory_order_release);
@@ -2768,15 +2779,20 @@ static void TestConcreteSnesActivationThroughCallbacks()
 	assert(generations.last != nullptr);
 	assert(generations.last->programmed_same_handle());
 	MisterObservationV2 observation = Observation();
-	assert(platform.observe(platform.context, &observation, 100) == MISTER_RESULT_OK);
+	clock.Set(host_clock.NowMs());
+	assert(platform.observe(platform.context, &observation,
+		kConcreteGraphCallbackBudgetMs) == MISTER_RESULT_OK);
 	assert(observation.ready == 1);
 	assert(observation.resource_flags == MISTER_RESOURCE_V2_KNOWN);
 	assert(CopyView(observation.observed_core) == "SNES");
-	assert(platform.tick(platform.context, 1000) == MISTER_RESULT_OK);
+	clock.Set(host_clock.NowMs());
+	assert(platform.tick(platform.context, kConcreteGraphCallbackBudgetMs) ==
+		MISTER_RESULT_OK);
 	assert(generations.last->tick_deadline_propagated());
 	MisterResult stopped = MISTER_RESULT_CLEANUP_INCOMPLETE;
 	for (size_t attempt = 0; attempt != 8 && generations.last != nullptr; ++attempt) {
-		stopped = platform.stop(platform.context, 5000);
+		clock.Set(host_clock.NowMs());
+		stopped = platform.stop(platform.context, kConcreteGraphCallbackBudgetMs);
 		assert(stopped == MISTER_RESULT_OK ||
 			stopped == MISTER_RESULT_CLEANUP_INCOMPLETE);
 	}
