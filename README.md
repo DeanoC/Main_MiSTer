@@ -3,9 +3,9 @@
 This is DeanoC's `Main_MiSTer` fork used to understand and support FogCast's
 working Main-compatible target path.
 
-The `recovery/clarity` branch is upstream Main plus the deterministic `VDATE`
-build adjustment at commit `d1a3a4e`. It is not the experimental FogCast
-native coordinator and does not contain that runtime.
+This baseline is upstream Main plus the deterministic `VDATE` build adjustment
+at commit `d1a3a4e`. It is not the experimental FogCast native coordinator and
+does not contain that runtime.
 
 ## How FogCast uses Main
 
